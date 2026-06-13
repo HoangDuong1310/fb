@@ -133,7 +133,10 @@ export async function apiFetch(path, init = {}) {
 
   if (!res.ok) {
     // 401: xoá token TRƯỚC rồi mới gọi handler, đảm bảo handler thấy token = null.
-    if (res.status === 401) {
+    // skipAuthHandler=true: BỎ QUA luồng 401 toàn cục (vd lúc đăng nhập, 401 chỉ
+    // nghĩa là sai thông tin — KHÔNG được xoá token phiên hiện tại hay broadcast
+    // AUTH_REQUIRED). Vẫn ném lỗi như thường để caller tự xử lý.
+    if (res.status === 401 && !init.skipAuthHandler) {
       setToken(null);
       if (unauthorizedHandler) {
         try {

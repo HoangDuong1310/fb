@@ -73,6 +73,11 @@ const AUTH_USER_KEY = "webAuthUser";
 // Cache in-memory thông tin user hiện tại ({ id, email, displayName } | null).
 let authUser = null;
 
+// Promise hoàn tất việc nạp token + user từ storage lúc khởi động SW. Các handler
+// phụ thuộc token (AUTH_STATE/AUTH_LOGIN...) await cái này trước khi đọc token,
+// tránh đua với message đến sớm khi SW vừa được đánh thức (getToken() = null oan).
+let readyPromise = Promise.resolve();
+
 /** Lưu user vào cache + chrome.storage.local (null để xoá). */
 function setAuthUser(user) {
   authUser = user || null;
@@ -658,11 +663,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Token sẽ tự gắn vào mọi apiFetch sau đó.
     case "AUTH_LOGIN": {
       (async () => {
+        await readyPromise;
         const email = String(msg.email || "").trim();
         const password = String(msg.password || "");
+        // skipAuthHandler: 401 lúc đăng nhập = sai thông tin, KHÔNG được kích hoạt
+        // luồng 401 toàn cục (xoá token phiên hiện tại + broadcast AUTH_REQUIRED).
         const data = await API.apiFetch("/api/auth/login", {
           method: "POST",
           body: JSON.stringify({ email, password }),
+          skipAuthHandler: true,
         });
         API.setToken(data && data.token);
         const user = (data && data.user) || null;
@@ -679,15 +688,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
-    // Trạng thái đăng nhập hiện tại (đồng bộ từ cache token + user).
+    // Trạng thái đăng nhập hiện tại (token + user). Await readyPromise trước để
+    // không trả "chưa đăng nhập" oan khi SW vừa được đánh thức bởi message này
+    // mà token trong storage chưa kịp nạp vào cache.
     case "AUTH_STATE": {
-      const token = API.getToken();
-      sendResponse({
-        ok: true,
-        loggedIn: !!token,
-        display_name: (token && authUser && authUser.displayName) || "",
-      });
-      return false;
+      (async () => {
+        await readyPromise;
+        const token = API.getToken();
+        sendResponse({
+          ok: true,
+          loggedIn: !!token,
+          display_name: (token && authUser && authUser.displayName) || "",
+        });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
     }
 
     default:
@@ -704,8 +718,10 @@ try {
     setAuthUser(null);
     broadcast("AUTH_REQUIRED");
   });
-  API.loadToken();
-  loadAuthUser();
+  // Nạp token + user SONG SONG và giữ promise để các handler phụ thuộc token
+  // (AUTH_STATE/AUTH_LOGIN) await trước khi đọc cache — tránh đua với message
+  // đến sớm lúc SW vừa được đánh thức (getToken() trả null oan).
+  readyPromise = Promise.all([API.loadToken(), loadAuthUser()]);
 
   chrome.alarms.create("jobTick", { periodInMinutes: 1 });
   chrome.alarms.onAlarm.addListener((a) => {

@@ -92,6 +92,38 @@ test("apiFetch on 401 invokes onUnauthorized and clears the token before throwin
   assert.equal(getToken(), null, "token must remain cleared after 401");
 });
 
+test("apiFetch with skipAuthHandler on 401 does NOT clear token or call onUnauthorized, but still throws", async () => {
+  setBaseUrl("http://localhost:3300");
+  setToken("tok-login");
+
+  let unauthorizedCalled = false;
+  onUnauthorized(() => {
+    unauthorizedCalled = true;
+  });
+
+  global.fetch = async () => jsonResponse(401, { error: "invalid credentials" });
+
+  await assert.rejects(
+    () => apiFetch("/api/auth/login", { method: "POST", skipAuthHandler: true }),
+    (err) => {
+      assert.ok(err instanceof Error);
+      assert.match(String(err.message), /401/);
+      return true;
+    }
+  );
+
+  assert.equal(
+    unauthorizedCalled,
+    false,
+    "onUnauthorized must NOT run when skipAuthHandler is set"
+  );
+  assert.equal(
+    getToken(),
+    "tok-login",
+    "token must NOT be cleared when skipAuthHandler is set"
+  );
+});
+
 test("apiFetch throws on non-2xx including the status and server error body", async () => {
   setBaseUrl("http://localhost:3300");
   setToken("tok-ok");
