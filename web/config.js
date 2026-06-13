@@ -34,6 +34,17 @@ export const env = {
   port: Number(process.env.PORT || 3300),
 };
 
+export async function ensureDatabase() {
+  const c = parseDatabaseUrl(env.databaseUrl);
+  const conn = await mysql.createConnection({
+    host: c.host, port: c.port, user: c.user, password: c.password,
+  });
+  await conn.query(
+    `CREATE DATABASE IF NOT EXISTS \`${c.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+  );
+  await conn.end();
+}
+
 let _pool = null;
 export function getPool() {
   if (!_pool) {
