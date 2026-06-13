@@ -1,6 +1,6 @@
 import { pathToFileURL } from "node:url";
 import express from "express";
-import { authRouter } from "./routes.js";
+import { authRouter, dataRouter } from "./routes.js";
 import { authRequired } from "./auth.js";
 import { env, ensureDatabase } from "./config.js";
 import { runMigrations } from "./schema.js";
@@ -9,6 +9,9 @@ export function buildApp() {
   const app = express();
   app.use(express.json());
   app.use("/api/auth", authRouter);
+  // All data routes require a valid Bearer token; authRequired sets req.userId
+  // which every data handler relies on for attribution and share-filtering.
+  app.use("/api", authRequired, dataRouter);
   // Debug probe used to exercise authRequired. Gated so it never ships to
   // production; tests do not set NODE_ENV=production, so it stays mounted there.
   if (process.env.NODE_ENV !== "production") {
