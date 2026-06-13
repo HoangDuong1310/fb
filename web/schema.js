@@ -107,6 +107,7 @@ const TABLES = [
     confidence FLOAT,
     crawled_by_user_id INT NULL,
     share_group_prices BOOL DEFAULT 1,
+    UNIQUE KEY uq_gp_line (post_id, name(255), price, seller_name(255)),
     CONSTRAINT fk_gp_post FOREIGN KEY (post_id) REFERENCES posts(post_id),
     CONSTRAINT fk_gp_user FOREIGN KEY (crawled_by_user_id) REFERENCES users(id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,

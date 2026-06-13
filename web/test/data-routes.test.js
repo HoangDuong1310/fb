@@ -104,4 +104,124 @@ test("data routes share-filtering", async (t) => {
     const res = await request(app).get("/api/posts");
     assert.equal(res.status, 401);
   });
+
+  // FIX 1: DELETE /api/products with no source must NOT wipe the shared catalog.
+  await t.test(
+    "DELETE /api/products with no source returns 400 and leaves products intact",
+    async () => {
+      const U = await registerUser(app, "delguard");
+      const productId = `prod_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+
+      const add = await request(app)
+        .post("/api/products")
+        .set("Authorization", `Bearer ${U.token}`)
+        .send({
+          products: [
+            { productId, source: "src_test", name: "Guard Item", price: 100 },
+          ],
+        });
+      assert.equal(add.status, 200);
+
+      const del = await request(app)
+        .delete("/api/products")
+        .set("Authorization", `Bearer ${U.token}`);
+      assert.equal(del.status, 400, "unscoped bulk delete must be rejected");
+      assert.equal(del.body.error, "source required for bulk delete");
+
+      const after = await request(app)
+        .get("/api/products")
+        .set("Authorization", `Bearer ${U.token}`);
+      assert.equal(after.status, 200);
+      assert.ok(
+        after.body.products.some((p) => p.productId === productId),
+        "product must still exist after rejected unscoped delete"
+      );
+    }
+  );
+
+  // FIX 2: POST /api/group-prices must be idempotent on resubmit of the same batch.
+  await t.test(
+    "POST /api/group-prices submitting the same batch twice does not duplicate rows",
+    async () => {
+      const U = await registerUser(app, "gpidem");
+      const postId = `gp_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+      const groupId = `gpg_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+
+      // group_prices FK requires the post to exist first.
+      const savePost = await request(app)
+        .post("/api/posts")
+        .set("Authorization", `Bearer ${U.token}`)
+        .send({
+          posts: [
+            { postId, groupId, groupName: "G", text: "p", timestamp: Date.now() },
+          ],
+        });
+      assert.equal(savePost.status, 200);
+
+      const batch = {
+        groupPrices: [
+          {
+            postId,
+            groupId,
+            name: "iPhone 13",
+            price: 12000000,
+            sellerName: "Seller One",
+            condition: "used",
+          },
+        ],
+      };
+
+      const first = await request(app)
+        .post("/api/group-prices")
+        .set("Authorization", `Bearer ${U.token}`)
+        .send(batch);
+      assert.equal(first.status, 200);
+
+      const second = await request(app)
+        .post("/api/group-prices")
+        .set("Authorization", `Bearer ${U.token}`)
+        .send(batch);
+      assert.equal(second.status, 200);
+
+      const list = await request(app)
+        .get("/api/group-prices")
+        .query({ groupId })
+        .set("Authorization", `Bearer ${U.token}`);
+      assert.equal(list.status, 200);
+      const mine = list.body.groupPrices.filter((g) => g.postId === postId);
+      assert.equal(
+        mine.length,
+        1,
+        "resubmitting the same batch must not create a duplicate row"
+      );
+    }
+  );
+
+  // FIX 3: numeric filter validation on group-prices.
+  await t.test(
+    "GET /api/group-prices with non-numeric priceMin returns 400",
+    async () => {
+      const U = await registerUser(app, "gpnan");
+      const res = await request(app)
+        .get("/api/group-prices")
+        .query({ priceMin: "abc" })
+        .set("Authorization", `Bearer ${U.token}`);
+      assert.equal(res.status, 400);
+      assert.equal(res.body.error, "invalid price filter");
+    }
+  );
+
+  // FIX 3: negative limit on products/search must not throw (clamped to >= 1).
+  await t.test(
+    "GET /api/products/search with negative limit does not error",
+    async () => {
+      const U = await registerUser(app, "srchlimit");
+      const res = await request(app)
+        .get("/api/products/search")
+        .query({ limit: "-5" })
+        .set("Authorization", `Bearer ${U.token}`);
+      assert.equal(res.status, 200);
+      assert.ok(Array.isArray(res.body.products));
+    }
+  );
 });

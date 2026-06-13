@@ -738,7 +738,9 @@ dataRouter.get("/products", asyncHandler(async (req, res) => {
 // shared catalog. Mirrors the old searchProducts opts.
 dataRouter.get("/products/search", asyncHandler(async (req, res) => {
   const { query, minPrice, maxPrice, category, source } = req.query;
-  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  // Clamp the limit into [1, 200]: a non-positive value would yield LIMIT 0/-n
+  // and throw a SQL error, so floor it at 1 while keeping the 200 ceiling.
+  const limit = Math.min(Math.max(Math.floor(Number(req.query.limit) || 50), 1), 200);
   const where = [];
   const params = { limit };
   if (source) {
@@ -750,12 +752,20 @@ dataRouter.get("/products/search", asyncHandler(async (req, res) => {
     params.category = category;
   }
   if (minPrice !== undefined && minPrice !== "") {
+    const v = Number(minPrice);
+    if (Number.isNaN(v)) {
+      return res.status(400).json({ error: "invalid price filter" });
+    }
     where.push("price >= :minPrice");
-    params.minPrice = Number(minPrice);
+    params.minPrice = v;
   }
   if (maxPrice !== undefined && maxPrice !== "") {
+    const v = Number(maxPrice);
+    if (Number.isNaN(v)) {
+      return res.status(400).json({ error: "invalid price filter" });
+    }
     where.push("price <= :maxPrice");
-    params.maxPrice = Number(maxPrice);
+    params.maxPrice = v;
   }
   if (query) {
     where.push("(LOWER(name) LIKE :q OR LOWER(category) LIKE :q)");
@@ -828,15 +838,15 @@ dataRouter.delete("/products/:id", asyncHandler(async (req, res) => {
 
 dataRouter.delete("/products", asyncHandler(async (req, res) => {
   const { source } = req.query;
-  const where = [];
-  const params = {};
-  if (source) {
-    where.push("source = :source");
-    params.source = source;
+  // Guard: an absent source would produce an unqualified DELETE FROM products,
+  // wiping the entire shared catalog for every user. Require an explicit scope.
+  if (source === undefined || source === "") {
+    return res.status(400).json({ error: "source required for bulk delete" });
   }
-  const sql =
-    "DELETE FROM products" + (where.length ? ` WHERE ${where.join(" AND ")}` : "");
-  const [result] = await getPool().query(sql, params);
+  const [result] = await getPool().query(
+    "DELETE FROM products WHERE source = :source",
+    { source }
+  );
   res.json({ deleted: result.affectedRows });
 }));
 
@@ -1006,12 +1016,20 @@ dataRouter.get("/group-prices", asyncHandler(async (req, res) => {
     params.condition = condition;
   }
   if (priceMin !== undefined && priceMin !== "") {
+    const v = Number(priceMin);
+    if (Number.isNaN(v)) {
+      return res.status(400).json({ error: "invalid price filter" });
+    }
     where.push("price >= :priceMin");
-    params.priceMin = Number(priceMin);
+    params.priceMin = v;
   }
   if (priceMax !== undefined && priceMax !== "") {
+    const v = Number(priceMax);
+    if (Number.isNaN(v)) {
+      return res.status(400).json({ error: "invalid price filter" });
+    }
     where.push("price <= :priceMax");
-    params.priceMax = Number(priceMax);
+    params.priceMax = v;
   }
   const [rows] = await getPool().query(
     `SELECT * FROM group_prices WHERE ${where.join(" AND ")} ORDER BY price ASC`,
@@ -1036,6 +1054,9 @@ dataRouter.post("/group-prices", asyncHandler(async (req, res) => {
     for (const it of items) {
       if (!it) continue;
       await conn.query(
+        // ON DUPLICATE KEY UPDATE makes re-submits idempotent against the
+        // uq_gp_line natural key (post_id, name, price, seller_name): a retry
+        // refreshes the parse metadata instead of inserting a duplicate row.
         `INSERT INTO group_prices
            (post_id, name, price, \`condition\`, warranty, category, seller_name,
             seller_profile, group_id, posted_at, parsed_at, parser, confidence,
@@ -1043,7 +1064,19 @@ dataRouter.post("/group-prices", asyncHandler(async (req, res) => {
          VALUES
            (:postId, :name, :price, :condition, :warranty, :category, :sellerName,
             :sellerProfile, :groupId, :postedAt, NOW(), :parser, :confidence,
-            :userId, :shareGroupPrices)`,
+            :userId, :shareGroupPrices)
+         ON DUPLICATE KEY UPDATE
+           \`condition\` = VALUES(\`condition\`),
+           warranty = VALUES(warranty),
+           category = VALUES(category),
+           seller_profile = VALUES(seller_profile),
+           group_id = VALUES(group_id),
+           posted_at = VALUES(posted_at),
+           parsed_at = NOW(),
+           parser = VALUES(parser),
+           confidence = VALUES(confidence),
+           crawled_by_user_id = VALUES(crawled_by_user_id),
+           share_group_prices = VALUES(share_group_prices)`,
         {
           postId: it.postId ?? null,
           name: it.name ?? null,
