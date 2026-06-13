@@ -59,6 +59,23 @@ test("auth routes", async (t) => {
     assert.equal(second.status, 409);
   });
 
+  // Proves the ER_DUP_ENTRY -> 409 translation. The DB UNIQUE constraint on
+  // users.email is the source of truth: re-registering an existing email must
+  // yield a clean 409 with the shared error body, never a 500 or a hung request
+  // (which is what happened before the asyncHandler + INSERT-catch were added).
+  await t.test("duplicate registration yields clean 409 body", async () => {
+    const email = `dupbody${Date.now()}@t.io`;
+    const first = await request(app)
+      .post("/api/auth/register")
+      .send({ email, password: "secret123", displayName: "U" });
+    assert.equal(first.status, 200);
+    const second = await request(app)
+      .post("/api/auth/register")
+      .send({ email, password: "secret123", displayName: "U" });
+    assert.equal(second.status, 409);
+    assert.equal(second.body.error, "email already registered");
+  });
+
   await t.test("login with wrong password returns 401", async () => {
     const email = `wp${Date.now()}@t.io`;
     await request(app)

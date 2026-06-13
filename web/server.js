@@ -12,6 +12,15 @@ export function buildApp() {
   app.get("/api/_whoami", authRequired, (req, res) => {
     res.json({ userId: req.userId });
   });
+  // Terminal error-handling middleware. Mounted AFTER all routers so that any
+  // error forwarded via next(err) (e.g. from asyncHandler-wrapped async route
+  // handlers) produces a clean 500 instead of an unhandled rejection / hung
+  // request. Internals are logged server-side and never leaked to the client.
+  // eslint-disable-next-line no-unused-vars
+  app.use((err, req, res, next) => {
+    console.error(err);
+    res.status(500).json({ error: "internal error" });
+  });
   return app;
 }
 
