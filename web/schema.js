@@ -1,4 +1,4 @@
-import { getPool } from "./config.js";
+import { ensureDatabase, getPool } from "./config.js";
 
 const TABLES = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -134,6 +134,7 @@ const SELL_SIGNALS = [
 ];
 
 export async function runMigrations() {
+  await ensureDatabase();
   const pool = getPool();
   for (const sql of TABLES) {
     await pool.query(sql);
