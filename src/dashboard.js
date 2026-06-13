@@ -1,0 +1,573 @@
+/**
+ * dashboard.js — Điểm vào (entry) của trang dashboard, dạng ES module.
+ *
+ * File này KHÔNG còn chứa logic nghiệp vụ: toàn bộ đã được tách theo domain vào
+ * thư mục src/dashboard/ (core, prefs, nav) và src/dashboard/views/* (overview,
+ * groups, posts, jobs, ai, products, mystore, build, advisory).
+ *
+ * Nhiệm vụ của entry:
+ *   1) bindEvents(): gắn toàn bộ event listener cho UI (event delegation qua
+ *      data-act/data-* — KHÔNG dùng inline onclick, nên các hàm view nằm ở module
+ *      scope vẫn an toàn).
+ *   2) Lắng nghe message realtime từ service worker (CRAWL_PROGRESS, CRAWL_DONE,
+ *      SYNC_PROGRESS, BUILD_PROGRESS, JOB_UPDATE).
+ *   3) init(): khôi phục tùy chọn đã lưu, nạp nhóm, mở view Tổng quan.
+ */
+
+import { $, store, toast, modal, syncToasts } from "./dashboard/core.js";
+import { switchView } from "./dashboard/nav.js";
+import {
+  CRAWL_FIELDS,
+  saveCrawlSettings,
+  loadCrawlSettings,
+  loadUIPrefs,
+} from "./dashboard/prefs.js";
+import { bg } from "./dashboard/core.js";
+import { renderOverview } from "./dashboard/views/overview.js";
+import {
+  loadGroups,
+  renderGroups,
+  scanGroups,
+  addGroupManual,
+  crawlGroup,
+  setCrawlStatus,
+  saveAutoCrawl,
+  loadAutoCrawl,
+  updateSelCount,
+  toggleSelectAll,
+  updateBatchStatus,
+  startBatchCrawl,
+  onWorkerDone,
+  stopBatchCrawl,
+} from "./dashboard/views/groups.js";
+import {
+  loadPosts,
+  renderPosts,
+  exportPosts,
+  clearGroupPosts,
+  analyzePostUI,
+  applyLeadMode,
+  suggestKeywordsUI,
+} from "./dashboard/views/posts.js";
+import { loadLeadKeywords } from "./dashboard/leadfilter.js";
+import {
+  loadJobs,
+  preparePost,
+  createCommentJob,
+  addPostImages,
+  addCmtImages,
+  updatePostGroupCount,
+  togglePostSelectAll,
+  filterPostGroups,
+} from "./dashboard/views/jobs.js";
+import {
+  saveAIConfig,
+  reloadModels,
+  discoverSelectors,
+  viewSelectors,
+  clearSelectors,
+} from "./dashboard/views/ai.js";
+import {
+  productStore,
+  syncAllSources,
+  applyProductFilter,
+  clearAllProducts,
+  onSourceAction,
+  saveAutoSync,
+  renderProducts,
+} from "./dashboard/views/products.js";
+import {
+  myStore,
+  loadSheetTabs,
+  importSheet,
+  clearMyStore,
+  applyMyStoreFilter,
+  compareMine,
+} from "./dashboard/views/mystore.js";
+import {
+  buildAI,
+  syncBuildBudget,
+  runBuildConfig,
+} from "./dashboard/views/build.js";
+import {
+  advisoryStore,
+  syncAdvTabs,
+  reloadAdvisories,
+  genAdvisories,
+  clearAdvisoriesUI,
+  approveAdvisoryUI,
+  editAdvisory,
+  rejectAdvisoryUI,
+  deleteAdvisoryUI,
+} from "./dashboard/views/advisory.js";
+import {
+  conversationStore,
+  syncConvTabs,
+  reloadConversations,
+  loadConversationsView,
+  saveWatchConfig,
+  watchNow,
+  trackConversationUI,
+  draftConvReplyUI,
+  approveConvReplyUI,
+  toggleConvClose,
+  deleteConvUI,
+} from "./dashboard/views/conversations.js";
+import {
+  exportAllPosts,
+  clearAllPosts,
+  clearAllAdvisories,
+  clearAllPrices,
+  clearMyStoreData,
+} from "./dashboard/views/settings.js";
+
+/* ============================ SỰ KIỆN UI ============================== */
+function bindEvents() {
+  document.querySelectorAll(".nav-item").forEach((b) =>
+    b.addEventListener("click", () => switchView(b.dataset.view))
+  );
+  $("btnGlobalRefresh").addEventListener("click", () => {
+    const active = document.querySelector(".nav-item.active");
+    loadGroups().then(() => switchView(active ? active.dataset.view : "overview"));
+    toast("Đã làm mới.", "info", 1500);
+  });
+
+  // Nhóm
+  $("btnScanGroups").addEventListener("click", scanGroups);
+  $("btnAddGroup").addEventListener("click", addGroupManual);
+  $("groupSearch").addEventListener("input", renderGroups);
+  // Cấu hình crawl: tự lưu mỗi khi thay đổi (giữ nguyên sau F5)
+  CRAWL_FIELDS.forEach((id) => {
+    if ($(id)) $(id).addEventListener("change", saveCrawlSettings);
+  });
+  if ($("crawlSafe")) $("crawlSafe").addEventListener("change", saveCrawlSettings);
+  // Tự động crawl nền theo chu kỳ
+  if ($("autoCrawlEnabled"))
+    $("autoCrawlEnabled").addEventListener("change", saveAutoCrawl);
+  if ($("autoCrawlInterval"))
+    $("autoCrawlInterval").addEventListener("change", saveAutoCrawl);
+  // Crawl hàng loạt
+  $("chkSelectAll").addEventListener("change", toggleSelectAll);
+  $("btnCrawlSelected").addEventListener("click", startBatchCrawl);
+  $("btnStopBatch").addEventListener("click", stopBatchCrawl);
+  $("groupsWrap").addEventListener("click", (e) => {
+    const card = e.target.closest(".group-card");
+    if (!card) return;
+    const id = card.dataset.id;
+    if (e.target.closest("[data-sel]")) {
+      if (store.selected.has(id)) store.selected.delete(id);
+      else store.selected.add(id);
+      card.classList.toggle("selected", store.selected.has(id));
+      updateSelCount();
+      return;
+    }
+    const act = e.target.closest("[data-act]") && e.target.closest("[data-act]").dataset.act;
+    if (act === "crawl") crawlGroup(id);
+    else if (act === "open") window.open("https://www.facebook.com/groups/" + id + "/", "_blank");
+    else if (act === "del") {
+      modal({
+        title: "Xóa nhóm",
+        bodyHTML: `<p>Xóa nhóm khỏi danh sách theo dõi? (Bài đã crawl vẫn được giữ.)</p>`,
+        confirmText: "Xóa",
+        danger: true,
+        onConfirm: async () => {
+          await bg("DELETE_GROUP", { groupId: id });
+          await loadGroups();
+          renderGroups();
+          toast("Đã xóa nhóm.", "ok");
+        },
+      });
+    }
+  });
+
+  // Bài viết
+  $("postsGroupFilter").addEventListener("change", loadPosts);
+  $("postSearch").addEventListener("input", renderPosts);
+  if ($("postsLeadToggle"))
+    $("postsLeadToggle").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-lead]");
+      if (btn) applyLeadMode(btn.dataset.lead);
+    });
+  if ($("btnSuggestKeywords"))
+    $("btnSuggestKeywords").addEventListener("click", suggestKeywordsUI);
+  $("btnExportJson").addEventListener("click", () => exportPosts("json"));
+  $("btnExportCsv").addEventListener("click", () => exportPosts("csv"));
+  $("btnClearPosts").addEventListener("click", clearGroupPosts);
+  $("postsWrap").addEventListener("click", (e) => {
+    const tog = e.target.closest("[data-toggle]");
+    if (tog) {
+      const card = tog.closest(".post-card");
+      const body = card && card.querySelector(".pc-text");
+      if (body) {
+        const expanded = body.classList.toggle("expanded");
+        body.classList.toggle("clamp", !expanded);
+        tog.textContent = expanded ? "Xem bớt" : "Xem thêm";
+      }
+      return;
+    }
+    const ana = e.target.closest("[data-analyze]");
+    if (ana) {
+      analyzePostUI(ana.dataset.analyze, ana);
+      return;
+    }
+    const btn = e.target.closest("[data-cmt]");
+    if (btn) createCommentJob(btn.dataset.cmt);
+  });
+
+  // Đăng bài (đa nhóm + trang cá nhân, AI xào nấu, ảnh đính kèm)
+  if ($("btnPreparePost")) $("btnPreparePost").addEventListener("click", preparePost);
+  if ($("btnPostAddImg"))
+    $("btnPostAddImg").addEventListener("click", () => $("postImages").click());
+  if ($("postImages"))
+    $("postImages").addEventListener("change", (e) => {
+      addPostImages(e.target.files);
+      e.target.value = "";
+    });
+  if ($("postGroupSearch"))
+    $("postGroupSearch").addEventListener("input", (e) => filterPostGroups(e.target.value));
+  if ($("btnPostSelectAll"))
+    $("btnPostSelectAll").addEventListener("click", () => togglePostSelectAll(true));
+  if ($("btnPostSelectNone"))
+    $("btnPostSelectNone").addEventListener("click", () => togglePostSelectAll(false));
+  if ($("postGroupList"))
+    $("postGroupList").addEventListener("change", (e) => {
+      if (e.target.closest("input.gcl-check")) updatePostGroupCount();
+    });
+  $("btnClearPostJobs").addEventListener("click", async () => {
+    await bg("CLEAR_FINISHED_JOBS");
+    loadJobs("post");
+  });
+  $("postJobs").addEventListener("click", (e) => onJobAction(e, "post"));
+
+  // Bình luận
+  $("btnCreateCmtJob").addEventListener("click", () => createCommentJob());
+  if ($("btnCmtAddImg"))
+    $("btnCmtAddImg").addEventListener("click", () => $("cmtImages").click());
+  if ($("cmtImages"))
+    $("cmtImages").addEventListener("change", (e) => {
+      addCmtImages(e.target.files);
+      e.target.value = "";
+    });
+  $("btnClearCmtJobs").addEventListener("click", async () => {
+    await bg("CLEAR_FINISHED_JOBS");
+    loadJobs("comment");
+  });
+  $("cmtJobs").addEventListener("click", (e) => onJobAction(e, "comment"));
+
+  // AI
+  $("btnSaveAI").addEventListener("click", () => saveAIConfig());
+  // Tự lưu cấu hình AI khi đổi giá trị (giống các mục khác). Dùng silent để
+  // không bắn toast/đồng bộ dropdown làm gián đoạn lúc đang gõ.
+  ["aiApiBase", "aiApiKey", "aiModelCustom"].forEach((id) => {
+    if ($(id)) $(id).addEventListener("change", () => saveAIConfig({ silent: true }));
+  });
+  if ($("aiModel"))
+    $("aiModel").addEventListener("change", () => saveAIConfig({ silent: true }));
+  if ($("btnReloadModels")) $("btnReloadModels").addEventListener("click", () => reloadModels(false));
+  $("btnDiscover").addEventListener("click", discoverSelectors);
+  $("btnViewSelectors").addEventListener("click", viewSelectors);
+  $("btnClearSelectors").addEventListener("click", clearSelectors);
+
+  // Sản phẩm / Giá
+  if ($("btnSyncAllSources"))
+    $("btnSyncAllSources").addEventListener("click", syncAllSources);
+  // Tìm kiếm lọc ngay trên dữ liệu đã nạp (productStore.all), không nạp lại kho.
+  if ($("btnSearchProducts"))
+    $("btnSearchProducts").addEventListener("click", () => applyProductFilter());
+  if ($("productSearch"))
+    $("productSearch").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") applyProductFilter();
+    });
+  if ($("btnClearProducts"))
+    $("btnClearProducts").addEventListener("click", clearAllProducts);
+  if ($("sourceList"))
+    $("sourceList").addEventListener("click", onSourceAction);
+  if ($("autoSyncEnabled"))
+    $("autoSyncEnabled").addEventListener("change", saveAutoSync);
+  if ($("autoSyncInterval"))
+    $("autoSyncInterval").addEventListener("change", saveAutoSync);
+  // Phân trang danh sách sản phẩm: bắt nút Trước/Sau (chỉ đổi trang, không nạp lại kho).
+  if ($("productList"))
+    $("productList").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-pg]");
+      if (!btn || btn.disabled) return;
+      if (btn.dataset.pg === "prev") productStore.page -= 1;
+      else if (btn.dataset.pg === "next") productStore.page += 1;
+      renderProducts();
+      const wrap = $("productList");
+      if (wrap) wrap.scrollIntoView({ block: "start", behavior: "smooth" });
+    });
+  // Chuyển chế độ hiển thị: so sánh cửa hàng / danh sách phẳng.
+  if ($("prodModeToggle"))
+    $("prodModeToggle").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-mode]");
+      if (!btn) return;
+      productStore.mode = btn.dataset.mode;
+      productStore.page = 1; // đổi chế độ -> về trang đầu
+      $("prodModeToggle")
+        .querySelectorAll("[data-mode]")
+        .forEach((b) => b.classList.toggle("active", b === btn));
+      renderProducts();
+    });
+
+  // Kho của tôi
+  if ($("btnLoadSheet")) $("btnLoadSheet").addEventListener("click", loadSheetTabs);
+  if ($("sheetUrl"))
+    $("sheetUrl").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") loadSheetTabs();
+    });
+  if ($("btnImportSheet")) $("btnImportSheet").addEventListener("click", importSheet);
+  if ($("btnClearMystore")) $("btnClearMystore").addEventListener("click", clearMyStore);
+  if ($("mystoreSearch"))
+    $("mystoreSearch").addEventListener("input", applyMyStoreFilter);
+  if ($("mystoreCatFilter"))
+    $("mystoreCatFilter").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-cat]");
+      if (!btn) return;
+      myStore.cat = btn.dataset.cat;
+      $("mystoreCatFilter")
+        .querySelectorAll("[data-cat]")
+        .forEach((b) => b.classList.toggle("active", b === btn));
+      applyMyStoreFilter();
+    });
+  if ($("mystoreList"))
+    $("mystoreList").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-cmp]");
+      if (btn) compareMine(btn.dataset.cmp);
+    });
+
+  // Build cấu hình bằng AI
+  if ($("buildBudget"))
+    $("buildBudget").addEventListener("input", () => syncBuildBudget(false));
+  if ($("buildBudgetRange"))
+    $("buildBudgetRange").addEventListener("input", () => syncBuildBudget(true));
+  if ($("buildNeeds"))
+    $("buildNeeds").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-need]");
+      if (!btn) return;
+      const key = btn.dataset.need;
+      if (buildAI.needs.has(key)) buildAI.needs.delete(key);
+      else buildAI.needs.add(key);
+      btn.classList.toggle("active", buildAI.needs.has(key));
+    });
+  // Dùng sự kiện "change" của checkbox: chỉ bắn 1 lần với trạng thái cuối cùng,
+  // tránh double-toggle khi click trúng label (label tự lật checkbox bên trong).
+  if ($("buildCats"))
+    $("buildCats").addEventListener("change", (e) => {
+      const cb = e.target.closest("input[type=checkbox]");
+      if (!cb) return;
+      const label = cb.closest("label[data-cat]");
+      if (!label) return;
+      const cat = label.dataset.cat;
+      if (cb.checked) buildAI.selected.add(cat);
+      else buildAI.selected.delete(cat);
+      label.classList.toggle("on", cb.checked);
+    });
+  if ($("btnBuildConfig"))
+    $("btnBuildConfig").addEventListener("click", runBuildConfig);
+
+  // Tư vấn AI
+  if ($("btnGenAdvisories"))
+    $("btnGenAdvisories").addEventListener("click", genAdvisories);
+  if ($("btnClearAdvisories"))
+    $("btnClearAdvisories").addEventListener("click", clearAdvisoriesUI);
+  if ($("advStatusTabs"))
+    $("advStatusTabs").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-status]");
+      if (!btn) return;
+      advisoryStore.status = btn.dataset.status;
+      syncAdvTabs();
+      reloadAdvisories();
+    });
+  if ($("advisoryList"))
+    $("advisoryList").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-adv-act]");
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const act = btn.dataset.advAct;
+      if (act === "approve") approveAdvisoryUI(id);
+      else if (act === "edit") editAdvisory(id);
+      else if (act === "reject") rejectAdvisoryUI(id);
+      else if (act === "del") deleteAdvisoryUI(id);
+    });
+
+  // Hội thoại (theo dõi reply + AI soạn nháp)
+  if ($("convStatusTabs"))
+    $("convStatusTabs").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-status]");
+      if (!btn) return;
+      conversationStore.status = btn.dataset.status;
+      syncConvTabs();
+      reloadConversations();
+    });
+  if ($("watchEnabled")) $("watchEnabled").addEventListener("change", saveWatchConfig);
+  if ($("watchInterval")) $("watchInterval").addEventListener("change", saveWatchConfig);
+  if ($("btnWatchNow")) $("btnWatchNow").addEventListener("click", watchNow);
+  if ($("btnTrackConv")) $("btnTrackConv").addEventListener("click", trackConversationUI);
+  if ($("conversationList"))
+    $("conversationList").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-cv-act]");
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const act = btn.dataset.cvAct;
+      if (act === "draft") draftConvReplyUI(id);
+      else if (act === "approve") approveConvReplyUI(id);
+      else if (act === "close") toggleConvClose(id);
+      else if (act === "del") deleteConvUI(id);
+    });
+
+  // Cài đặt — quản lý dữ liệu
+  if ($("setExportPostsJson"))
+    $("setExportPostsJson").addEventListener("click", () => exportAllPosts("json"));
+  if ($("setExportPostsCsv"))
+    $("setExportPostsCsv").addEventListener("click", () => exportAllPosts("csv"));
+  if ($("setClearPosts"))
+    $("setClearPosts").addEventListener("click", clearAllPosts);
+  if ($("setClearProducts"))
+    $("setClearProducts").addEventListener("click", clearAllPrices);
+  if ($("setClearMystore"))
+    $("setClearMystore").addEventListener("click", clearMyStoreData);
+  if ($("setClearAdvisories"))
+    $("setClearAdvisories").addEventListener("click", clearAllAdvisories);
+}
+
+async function onJobAction(e, type) {
+  const card = e.target.closest(".job-card");
+  if (!card) return;
+  const id = Number(card.dataset.id);
+  const act = e.target.closest("[data-act]") && e.target.closest("[data-act]").dataset.act;
+  if (act === "del") {
+    const job = (store.jobs || []).find((j) => j.id === id);
+    const postUrl = job && job.result && job.result.postUrl;
+    // Với việc ĐĂNG BÀI: luôn hiện hộp xác nhận để người dùng chủ động chọn,
+    // không bao giờ xoá im lặng. Nếu đã bắt được link bài thì cho phép xoá
+    // luôn trên Facebook; nếu chưa có link thì nói rõ lý do.
+    if (type === "post") {
+      if (postUrl) {
+        modal({
+          title: "Xóa việc đăng bài",
+          bodyHTML:
+            `<p>Bạn muốn xóa việc này khỏi ứng dụng, hay xóa luôn cả bài viết trên Facebook?</p>` +
+            `<p style="color:var(--red)">Xóa trên Facebook là thao tác không thể hoàn tác.</p>`,
+          confirmText: "Xóa cả bài trên Facebook",
+          danger: true,
+          onConfirm: async () => {
+            toast("Đang xóa bài trên Facebook...", "info", 4000);
+            const res = await bg("DELETE_JOB", { id, deleteRemote: true, postUrl });
+            if (res && res.remote && !res.remote.ok) {
+              toast("Đã xóa khỏi app, nhưng xóa trên FB lỗi: " + (res.remote.error || ""), "err", 6000);
+            } else {
+              toast("Đã xóa việc và bài trên Facebook.", "ok");
+            }
+            loadJobs(type);
+          },
+          extraText: "Chỉ xóa trong app",
+          onExtra: async () => {
+            await bg("DELETE_JOB", { id });
+            toast("Đã xóa việc khỏi app (bài trên FB vẫn còn).", "ok");
+            loadJobs(type);
+          },
+        });
+      } else {
+        // Chưa có link bài (job cũ đăng trước khi có tính năng bắt link, hoặc
+        // lúc đăng không bắt được permalink). Không thể tự mở đúng bài để xoá.
+        modal({
+          title: "Xóa việc đăng bài",
+          bodyHTML:
+            `<p>Việc này chưa lưu được link bài trên Facebook nên app không thể tự xóa bài thật.</p>` +
+            `<p>Hãy xóa thủ công trên Facebook. Bài đăng mới từ giờ sẽ tự lưu link để xóa được trực tiếp.</p>`,
+          confirmText: "Xóa việc khỏi app",
+          danger: true,
+          onConfirm: async () => {
+            await bg("DELETE_JOB", { id });
+            toast("Đã xóa việc khỏi app.", "ok");
+            loadJobs(type);
+          },
+        });
+      }
+      return;
+    }
+    await bg("DELETE_JOB", { id });
+    loadJobs(type);
+  } else if (act === "run") {
+    toast("Đang chạy việc...", "info", 3000);
+    const res = await bg("RUN_JOB_NOW", { id });
+    if (res && res.ok) toast("Việc đã chạy xong.", "ok");
+    else toast((res && res.error) || "Việc thất bại.", "err", 5000);
+    loadJobs(type);
+  }
+}
+
+/* =========================== REALTIME LISTENER ========================= */
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || !msg.type) return;
+  if (msg.type === "CRAWL_PROGRESS" && msg.progress) {
+    const p = msg.progress;
+    const name = p.groupName || p.groupId || "";
+    if (p.status === "started") {
+      setCrawlStatus(`Bắt đầu crawl "${name}"...`, true);
+    } else if (p.status === "crawling") {
+      const last = p.lastAuthor ? ` · mới nhất: ${p.lastAuthor}` : "";
+      setCrawlStatus(
+        `Đang crawl "${name}": +${p.newCount || 0} bài mới · đã cuộn ${p.scrolls || 0} lần${last}`,
+        true
+      );
+    } else if (p.status === "stopped_known") {
+      setCrawlStatus(`"${name}": đã gặp đủ bài cũ liên tiếp, đang kết thúc...`, true);
+    }
+  }
+  if (msg.type === "CRAWL_DONE" && msg.result) {
+    // Đang crawl hàng loạt (pool song song): nhả slot rồi lấp nhóm kế tiếp
+    if (store.batch) {
+      updateBatchStatus(`vừa xong +${msg.result.newCount} bài mới`);
+      onWorkerDone();
+      return;
+    }
+    setCrawlStatus(`Xong: +${msg.result.newCount} bài mới. ${msg.result.reason || ""}`, false);
+    toast(`Crawl xong: +${msg.result.newCount} bài. ${msg.result.reason || ""}`, "ok", 4500);
+    loadGroups().then(() => {
+      const active = document.querySelector(".nav-item.active");
+      if (active && ["posts", "overview", "groups"].includes(active.dataset.view)) {
+        switchView(active.dataset.view);
+      }
+    });
+  }
+  if (msg.type === "SYNC_PROGRESS") {
+    const handle = syncToasts[msg.id];
+    if (handle) {
+      const totalTxt = msg.total != null ? `/${msg.total}` : "";
+      handle.update(
+        `Đang đồng bộ "${msg.name || msg.id}": trang ${msg.page} · đã lấy ${msg.fetched}${totalTxt} SP...`,
+        "info"
+      );
+    }
+  }
+  if (msg.type === "BUILD_PROGRESS") {
+    // Cập nhật dòng chữ tiến trình trong khung loading (nếu đang build).
+    if (buildAI.running) {
+      const el = $("buildProgressText");
+      if (el && msg.text) el.textContent = msg.text;
+    }
+  }
+  if (msg.type === "JOB_UPDATE") {
+    const active = document.querySelector(".nav-item.active");
+    if (active && active.dataset.view === "autopost") loadJobs("post");
+    if (active && active.dataset.view === "autocomment") loadJobs("comment");
+    if (active && active.dataset.view === "overview") renderOverview();
+  }
+  if (msg.type === "CONVERSATION_UPDATE") {
+    const active = document.querySelector(".nav-item.active");
+    if (active && active.dataset.view === "conversations") reloadConversations();
+  }
+});
+
+/* =============================== KHỞI ĐỘNG ============================= */
+(async function init() {
+  bindEvents();
+  await loadUIPrefs();
+  await loadLeadKeywords();
+  await loadCrawlSettings();
+  await loadAutoCrawl();
+  await loadGroups();
+  switchView("overview");
+})();

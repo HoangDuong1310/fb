@@ -1,0 +1,846 @@
+/**
+ * content.js — Chạy trên trang nhóm Facebook.
+ *
+ * Nhiệm vụ:
+ *  - Cuộn feed nhóm để tải thêm bài.
+ *  - Bóc tách dữ liệu từng bài viết (DOM).
+ *  - Crawl TĂNG DẦN: bỏ qua bài đã có trong IndexedDB; dừng sớm khi gặp nhiều
+ *    bài đã biết liên tiếp (feed sắp theo thời gian => phần sau toàn bài cũ).
+ *
+ * Lưu ý quan trọng về độ bền:
+ *  - Facebook random hoá class => KHÔNG bám class. Chỉ bám các "mỏ neo" ổn định:
+ *    role="article", mẫu URL permalink, role="img", thẻ a chứa thời gian...
+ *  - Mỗi bước bóc tách bọc try/catch để 1 bài lỗi không làm hỏng cả phiên.
+ */
+
+(() => {
+  // Tránh nạp 2 lần (manifest + executeScript).
+  if (window.__FB_GROUP_CRAWLER_LOADED__) return;
+  window.__FB_GROUP_CRAWLER_LOADED__ = true;
+
+  const state = {
+    running: false,
+    stopRequested: false,
+  };
+
+  // ---- Tiện ích ----------------------------------------------------------
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function send(type, payload) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type, ...payload }, (res) => {
+          // Bỏ qua lỗi "no receiver" khi popup đóng.
+          void chrome.runtime.lastError;
+          resolve(res);
+        });
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+
+  function getGroupInfo() {
+    const m = location.pathname.match(/\/groups\/([^/?#]+)/);
+    const groupId = m ? m[1] : "unknown";
+    let groupName = groupId;
+    // Tiêu đề trang thường có dạng "Tên nhóm | Facebook".
+    if (document.title) {
+      groupName = document.title.replace(/\s*\|\s*Facebook\s*$/i, "").trim() || groupId;
+    }
+    // Thử lấy tên nhóm chính xác hơn từ heading đầu trang.
+    const h = document.querySelector('h1');
+    if (h && h.textContent && h.textContent.trim().length > 0) {
+      groupName = h.textContent.trim();
+    }
+    return { groupId, groupName };
+  }
+
+  // ---- Trích postId & permalink -----------------------------------------
+
+  const POST_ID_PATTERNS = [
+    /\/groups\/[^/]+\/posts\/(\d+)/,
+    /\/groups\/[^/]+\/permalink\/(\d+)/,
+    /multi_permalinks?=(\d+)/,
+    /[?&]story_fbid=(\d+)/,
+    /\/permalink\/(\d+)/,
+    /\/posts\/(\d+)/,
+  ];
+
+  function extractPostIdFromUrl(url) {
+    if (!url) return null;
+    for (const re of POST_ID_PATTERNS) {
+      const m = url.match(re);
+      if (m && m[1]) return m[1];
+    }
+    return null;
+  }
+
+  /** Tìm permalink + postId trong 1 article. */
+  function findPermalink(article) {
+    const anchors = article.querySelectorAll('a[href*="/groups/"], a[href*="story_fbid"], a[href*="permalink"], a[href*="/posts/"]');
+    for (const a of anchors) {
+      const href = a.href || a.getAttribute("href") || "";
+      // QUAN TRỌNG: bỏ link BÌNH LUẬN (chứa comment_id). Link bình luận vẫn chứa
+      // postId của BÀI CHA; nếu không lọc sẽ tưởng nhầm mỗi bình luận là 1 "bài"
+      // và lưu đè dưới cùng postId => data ra toàn bình luận.
+      if (/comment_id=|reply_comment_id=/i.test(href)) continue;
+      const id = extractPostIdFromUrl(href);
+      if (id) {
+        // Chuẩn hoá về URL tuyệt đối, bỏ tham số rác.
+        let clean = href;
+        try {
+          const u = new URL(href, location.origin);
+          clean = u.origin + u.pathname;
+        } catch (e) {}
+        return { postId: id, permalink: clean };
+      }
+    }
+    return { postId: null, permalink: null };
+  }
+
+  /** Lấy postId của BÀI từ bất kỳ link nào trong container (kể cả link bình luận,
+   *  vì link bình luận vẫn chứa postId của BÀI CHA). */
+  function getPostIdFrom(root) {
+    if (!root || !root.querySelectorAll) return null;
+    const anchors = root.querySelectorAll(
+      'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="multi_permalink"]'
+    );
+    for (const a of anchors) {
+      const href = a.href || a.getAttribute("href") || "";
+      const id = extractPostIdFromUrl(href);
+      if (id) return id;
+    }
+    return null;
+  }
+
+  /** Dựng permalink chuẩn của bài từ groupId + postId. */
+  function buildPermalink(groupId, postId) {
+    return location.origin + "/groups/" + groupId + "/posts/" + postId + "/";
+  }
+
+  /**
+   * Tìm danh sách "ô bài viết" trong feed.
+   * QUAN TRỌNG (theo cấu trúc THỰC TẾ của nhóm này): BÀI VIẾT là MỘT Ô CON của
+   * [role="feed"] (thẻ DIV), KHÔNG phải [role="article"]. Ngược lại, BÌNH LUẬN
+   * mới là [role="article"] và nằm LỒNG bên trong ô bài. Vì vậy phải duyệt theo
+   * feed-child rồi loại vùng bình luận, thay vì duyệt [role="article"].
+   */
+  function findPostContainers() {
+    const feed = document.querySelector('[role="feed"]');
+    if (feed) {
+      const kids = [...feed.children].filter((c) => c && getPostIdFrom(c));
+      if (kids.length) return kids;
+    }
+    // Fallback layout cũ: một số nhóm render BÀI bằng [role="article"] cấp cao nhất.
+    return [...document.querySelectorAll('[role="article"]')].filter(
+      (a) => !(a.parentElement && a.parentElement.closest('[role="article"]')) && getPostIdFrom(a)
+    );
+  }
+
+  // ---- Trích các trường dữ liệu -----------------------------------------
+
+  function extractAuthor(article) {
+    // Tác giả thường là link profile đầu tiên có chữ in đậm/strong nằm gần đầu bài.
+    const candidates = article.querySelectorAll(
+      'a[href*="/user/"], a[href*="/profile.php"], a[role="link"][href*="facebook.com"], strong a, h2 a, h3 a, h4 a'
+    );
+    for (const a of candidates) {
+      if (belongsToComment(a, article)) continue; // bỏ tác giả của bình luận
+      const text = (a.textContent || "").trim();
+      const href = a.href || "";
+      if (text && text.length > 1 && !/^https?:/i.test(text)) {
+        let profile = href;
+        try {
+          const u = new URL(href, location.origin);
+          profile = u.origin + u.pathname + (u.search.includes("id=") ? u.search : "");
+        } catch (e) {}
+        return { authorName: text, authorProfile: profile };
+      }
+    }
+    return { authorName: null, authorProfile: null };
+  }
+
+  // Quy đổi text thời gian FB (tương đối hoặc tuyệt đối) -> epoch ms.
+  // Tính theo MỐC HIỆN TẠI (lúc crawl) vì FB hiển thị thời gian tương đối.
+  // Trả null nếu không nhận dạng được (vẫn giữ timeText để người dùng đọc).
+  function parseRelativeTime(text) {
+    if (!text) return null;
+    const s = String(text).trim().toLowerCase();
+    const now = Date.now();
+    let m;
+    if (/vừa xong|just now/.test(s)) return now;
+    if ((m = s.match(/(\d+)\s*(giây|giay|sec|s\b)/))) return now - Number(m[1]) * 1000;
+    if ((m = s.match(/(\d+)\s*(phút|phut|min|m\b)/))) return now - Number(m[1]) * 60000;
+    if ((m = s.match(/(\d+)\s*(giờ|gio|hour|h\b)/))) return now - Number(m[1]) * 3600000;
+    if ((m = s.match(/(\d+)\s*(tuần|tuan|week|w\b)/))) return now - Number(m[1]) * 604800000;
+    if (/hôm qua|yesterday/.test(s)) return now - 86400000;
+    if ((m = s.match(/(\d+)\s*(ngày|ngay|day|d\b)/))) return now - Number(m[1]) * 86400000;
+    // Dạng tuyệt đối: "12 tháng 6" (ngày Tháng tháng), có thể kèm ", 2024" và "lúc 14:05".
+    if ((m = s.match(/(\d{1,2})\s*tháng\s*(\d{1,2})(?:\s*,?\s*(\d{4}))?/))) {
+      const day = Number(m[1]);
+      const month = Number(m[2]) - 1;
+      const year = m[3] ? Number(m[3]) : new Date().getFullYear();
+      const tm = s.match(/(?:lúc|at)\s*(\d{1,2}):(\d{2})/);
+      let ts = tm
+        ? new Date(year, month, day, Number(tm[1]), Number(tm[2])).getTime()
+        : new Date(year, month, day).getTime();
+      // Nếu suy ra ngày trong tương lai (do mặc định năm hiện tại) -> lùi 1 năm.
+      if (ts > now + 86400000) ts = new Date(year - 1, month, day).getTime();
+      return ts;
+    }
+    return null;
+  }
+
+  function extractTimestamp(article) {
+    // FB hiện không dùng <abbr>. Thời gian đăng nằm trong CHÍNH link permalink
+    // của bài (ví dụ "5 giờ", "12 Tháng 6"). Ưu tiên đọc text của link đó.
+    const TIME_RE =
+      /(\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm)|hôm qua|vừa xong|\d{1,2}\s*tháng|just now|yesterday|\d+\s*(s|m|h|d|w|y)\b|hour|min|day|week|month|year)/i;
+
+    // Trường hợp cũ còn <abbr>.
+    const abbr = article.querySelector("abbr[data-utime], abbr[title]");
+    if (abbr) {
+      const utime = abbr.getAttribute("data-utime");
+      if (utime) return { timestamp: Number(utime) * 1000, timeText: abbr.getAttribute("title") || abbr.textContent || "" };
+    }
+
+    // Ưu tiên LINK THỜI GIAN CỦA CHÍNH BÀI: href chứa postId nhưng KHÔNG có
+    // comment_id (link thời gian của bình luận luôn kèm comment_id).
+    const postId = getPostIdFrom(article);
+    const all = Array.from(
+      article.querySelectorAll(
+        'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[role="link"]'
+      )
+    );
+    const own = [];
+    const rest = [];
+    for (const a of all) {
+      const href = a.getAttribute("href") || "";
+      if (postId && href.indexOf(postId) !== -1 && !/comment_id/.test(href)) own.push(a);
+      else rest.push(a);
+    }
+
+    for (const a of own.concat(rest)) {
+      if (belongsToComment(a, article)) continue; // bỏ link thời gian của bình luận
+      const aria = (a.getAttribute("aria-label") || "").trim();
+      if (aria && TIME_RE.test(aria)) return { timestamp: parseRelativeTime(aria), timeText: aria };
+      const t = (a.innerText || a.textContent || "").trim();
+      if (t && t.length <= 40 && TIME_RE.test(t)) return { timestamp: parseRelativeTime(t), timeText: t };
+    }
+    return { timestamp: null, timeText: null };
+  }
+
+  async function expandSeeMore(article) {
+    // Bấm "Xem thêm" / "See more" của NỘI DUNG BÀI để lấy đủ text.
+    // Khớp mềm (endsWith) vì FB hay nối "...Xem thêm" liền nội dung.
+    // Bỏ qua nút thuộc bình luận lồng nhau và nút "Xem thêm bình luận".
+    try {
+      const buttons = article.querySelectorAll('div[role="button"], span[role="button"]');
+      for (const s of buttons) {
+        if (belongsToComment(s, article)) continue; // nút "Xem thêm" của bình luận
+
+        const t = (s.textContent || "").trim().toLowerCase();
+        if (!t) continue;
+
+        const isSeeMore =
+          t === "xem thêm" ||
+          t === "see more" ||
+          t.endsWith("xem thêm") ||
+          t.endsWith("see more");
+        const isComments =
+          t.includes("bình luận") ||
+          t.includes("comment") ||
+          t.includes("trả lời") ||
+          t.includes("repl");
+
+        if (isSeeMore && !isComments) {
+          try {
+            s.click();
+          } catch (e) {}
+          await sleep(150);
+        }
+      }
+    } catch (e) {}
+  }
+
+  function extractText(article) {
+    // Ưu tiên "mỏ neo" đánh dấu phần NỘI DUNG bài (chất lượng cao, ít nhiễu UI).
+    const messageSelectors = [
+      '[data-ad-comet-preview="message"]',
+      '[data-ad-preview="message"]',
+      '[data-ad-rendering-role="story_message"]',
+      'div[data-testid="post_message"]',
+    ];
+    for (const sel of messageSelectors) {
+      for (const el of article.querySelectorAll(sel)) {
+        if (belongsToComment(el, article)) continue; // bỏ mỏ neo thuộc bình luận
+        const t = (el.innerText || el.textContent || "").trim();
+        if (t) return t;
+      }
+    }
+
+    // Fallback: gom text thuộc CHÍNH bài này (bỏ bình luận = article lồng nhau).
+    // Bao gồm cả TIÊU ĐỀ h1/h2/h3 và [role="heading"]: Facebook render bài CHỈ CÓ
+    // CHỮ NGẮN vào <h3><strong> chứ không phải div[dir="auto"] => phải bắt cả 2 kiểu.
+    // KHÔNG lọc theo role="button": FB bọc nội dung bài trong phần tử clickable,
+    // lọc nhầm sẽ làm RỖNG toàn bộ text (chính là lỗi trước đó).
+    let best = "";
+    const blocks = article.querySelectorAll(
+      'div[dir="auto"], span[dir="auto"], h1, h2, h3, [role="heading"]'
+    );
+    for (const b of blocks) {
+      if (belongsToComment(b, article)) continue; // bỏ text thuộc bình luận
+      const t = (b.innerText || b.textContent || "").trim();
+      if (t.length > best.length) best = t;
+    }
+    if (best) return best;
+
+    // Cuối cùng: lấy toàn bộ innerText của bài (nhiều nhiễu nhưng không rỗng nếu
+    // bài có nội dung hiển thị).
+    return (article.innerText || article.textContent || "").trim();
+  }
+
+  function extractImages(article) {
+    const urls = new Set();
+    // Ảnh dạng <img> trong bài (bỏ ảnh thuộc bình luận = article lồng nhau).
+    article.querySelectorAll("img").forEach((el) => {
+      if (belongsToComment(el, article)) return;
+      const src =
+        el.currentSrc ||
+        el.getAttribute("src") ||
+        el.getAttribute("data-src") ||
+        "";
+      if (src && /scontent|fbcdn/i.test(src)) urls.add(src);
+    });
+    // Ảnh dạng background-image trên div.
+    article.querySelectorAll('[style*="background-image"]').forEach((el) => {
+      if (belongsToComment(el, article)) return;
+      const style = el.getAttribute("style") || "";
+      const m = style.match(/url\(["']?(.*?)["']?\)/);
+      if (m && /scontent|fbcdn/i.test(m[1])) urls.add(m[1]);
+    });
+    return Array.from(urls);
+  }
+
+  function extractVideos(article) {
+    const urls = new Set();
+    article.querySelectorAll("video").forEach((v) => {
+      if (v.src) urls.add(v.src);
+      const source = v.querySelector("source");
+      if (source && source.src) urls.add(source.src);
+    });
+    return Array.from(urls);
+  }
+
+  function extractExternalLinks(article, ownPermalink) {
+    const links = new Set();
+    article.querySelectorAll('a[href^="http"]').forEach((a) => {
+      const href = a.href || "";
+      // Bỏ link nội bộ facebook và chính permalink của bài.
+      if (/facebook\.com|fb\.com|fbcdn|fb\.watch/i.test(href)) return;
+      if (href === ownPermalink) return;
+      links.add(href);
+    });
+    return Array.from(links);
+  }
+
+  function extractCounts(article) {
+    let reactions = null;
+    let comments = null;
+    // Reaction: phần tử có aria-label dạng "120 lượt thích" / "120 reactions".
+    const reactEl = article.querySelector('[aria-label*="action"], [aria-label*="cảm xúc"], [aria-label*="thích"]');
+    if (reactEl) {
+      const n = (reactEl.getAttribute("aria-label") || "").match(/[\d.,]+/);
+      if (n) reactions = parseCount(n[0]);
+    }
+    // Comment: tìm text "bình luận" / "comments".
+    const all = article.querySelectorAll("span, div");
+    for (const el of all) {
+      const t = (el.textContent || "").trim().toLowerCase();
+      if (/\b\d[\d.,]*\s*(bình luận|comments?)\b/.test(t)) {
+        const n = t.match(/[\d.,]+/);
+        if (n) {
+          comments = parseCount(n[0]);
+          break;
+        }
+      }
+    }
+    return { reactions, comments };
+  }
+
+  function parseCount(s) {
+    if (!s) return null;
+    const clean = String(s).replace(/\./g, "").replace(/,/g, "");
+    const n = parseInt(clean, 10);
+    return Number.isNaN(n) ? null : n;
+  }
+
+  // ---- Crawl theo selector do AI khám phá (nếu có) -----------------------
+
+  function readValue(el, attr) {
+    if (!el) return null;
+    if (!attr || attr === "text" || attr === "innerText" || attr === "textContent") {
+      return (el.innerText || el.textContent || "").trim() || null;
+    }
+    if (attr === "href" && el.href) return el.href;
+    if (attr === "src") return el.currentSrc || el.src || el.getAttribute("src") || null;
+    const v = el.getAttribute(attr);
+    return v ? v.trim() : null;
+  }
+
+  /** Lấy danh sách CSS selector ứng viên từ 1 spec (chấp nhận mảng hoặc chuỗi). */
+  function specSelectors(spec) {
+    if (!spec) return [];
+    if (Array.isArray(spec.selectors)) return spec.selectors.filter(Boolean);
+    if (typeof spec.selector === "string" && spec.selector) return [spec.selector];
+    return [];
+  }
+
+  /**
+   * True nếu phần tử nằm trong VÙNG BÌNH LUẬN (không thuộc thân bài đang xét).
+   * Facebook render bình luận theo nhiều kiểu khác nhau giữa các nhóm:
+   *   1) article lồng nhau ([role="article"] con).
+   *   2) DANH SÁCH <ul> mà mỗi item chứa link comment_id (kiểu của nhóm này -
+   *      lý do trước đây "toàn lấy comment" vì bộ lọc cũ chỉ bắt kiểu (1)).
+   *   3) Ô soạn bình luận (role="textbox" / contenteditable).
+   */
+  function belongsToComment(el, article) {
+    const owner = el.closest('[role="article"]');
+    if (owner && owner !== article) return true;
+    let node = el;
+    while (node && node !== article) {
+      if (
+        node.tagName === "UL" &&
+        node.querySelector('a[href*="comment_id"], a[href*="reply_comment_id"]')
+      ) {
+        return true;
+      }
+      if (node.getAttribute) {
+        if (node.getAttribute("role") === "textbox") return true;
+        if (node.getAttribute("contenteditable") === "true") return true;
+      }
+      node = node.parentElement;
+    }
+    return false;
+  }
+
+  /**
+   * Áp bộ selector (do AI bóc ra) lên 1 article rồi DÙNG SELECTOR ĐỂ LẤY DATA.
+   * AI chỉ cung cấp selector; phần đọc giá trị hoàn toàn do code làm ở đây.
+   * - Thử lần lượt từng selector ứng viên, lấy giá trị hợp lệ đầu tiên.
+   * - Bỏ qua phần tử thuộc bình luận lồng nhau (tránh "toàn lấy comment").
+   */
+  function extractBySelectors(article, sel) {
+    const out = {};
+    if (!sel || typeof sel !== "object") return out;
+
+    const one = (spec) => {
+      for (const cssSel of specSelectors(spec)) {
+        try {
+          const els = article.querySelectorAll(cssSel);
+          for (const el of els) {
+            if (belongsToComment(el, article)) continue;
+            const v = readValue(el, spec.attr);
+            if (v) return v;
+          }
+        } catch (e) {}
+      }
+      return null;
+    };
+    const many = (spec) => {
+      const arr = [];
+      const seen = new Set();
+      for (const cssSel of specSelectors(spec)) {
+        try {
+          article.querySelectorAll(cssSel).forEach((el) => {
+            if (belongsToComment(el, article)) return;
+            const v = readValue(el, spec.attr);
+            if (v && !seen.has(v)) {
+              seen.add(v);
+              arr.push(v);
+            }
+          });
+        } catch (e) {}
+      }
+      return arr;
+    };
+
+    if (sel.text) out.text = one(sel.text);
+    if (sel.authorName) out.authorName = one(sel.authorName);
+    if (sel.authorProfile) out.authorProfile = one(sel.authorProfile);
+    if (sel.time) out.timeText = one(sel.time);
+    if (sel.images) out.images = many(sel.images);
+    if (sel.videos) out.videos = many(sel.videos);
+    if (sel.reactions) out.reactions = parseCount(one(sel.reactions));
+    if (sel.comments) out.comments = parseCount(one(sel.comments));
+    return out;
+  }
+
+  function loadSelectors() {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get("fbSelectors", (r) => {
+          void chrome.runtime.lastError;
+          resolve((r && r.fbSelectors) || null);
+        });
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+
+  /** Tìm Ô BÀI VIẾT đầu tiên (feed-child) để làm HTML mẫu cho AI. */
+  function findFirstPostContainer() {
+    const containers = findPostContainers();
+    if (containers.length) return containers[0];
+    // Trang chi tiết bài (URL đã chứa postId): dùng article top-level đầu tiên.
+    if (extractPostIdFromUrl(location.href)) {
+      const arts = [...document.querySelectorAll('[role="article"]')].filter(
+        (a) => !(a.parentElement && a.parentElement.closest('[role="article"]'))
+      );
+      if (arts.length) return arts[0];
+    }
+    return null;
+  }
+
+  /**
+   * Tạo HTML mẫu SẠCH để gửi AI: bỏ bình luận lồng nhau (article con) và các thẻ
+   * nhiễu (script/style/svg/iframe/noscript). Nhờ vậy 50KB chứa đúng phần thân
+   * bài + media + thanh reaction/comment, tránh việc AI chọn nhầm link bình luận.
+   */
+  function buildCleanSample(article) {
+    let clone;
+    try {
+      clone = article.cloneNode(true);
+    } catch (e) {
+      return article.outerHTML;
+    }
+    // Bỏ mọi article con (bình luận lồng nhau - kiểu 1).
+    clone.querySelectorAll('[role="article"]').forEach((el) => el.remove());
+    // Bỏ DANH SÁCH BÌNH LUẬN dạng <ul> (kiểu 2 - nhóm này): mỗi <ul> bình luận
+    // chứa link comment_id. <ul> liệt kê thường (bullet trong thân bài) KHÔNG có
+    // link comment_id nên vẫn được giữ lại => không mất nội dung bài.
+    clone.querySelectorAll("ul").forEach((ul) => {
+      if (ul.querySelector('a[href*="comment_id"], a[href*="reply_comment_id"]')) {
+        ul.remove();
+      }
+    });
+    // Bỏ ô soạn bình luận (kiểu 3) để AI không suy nhầm selector.
+    clone
+      .querySelectorAll('[role="textbox"], [contenteditable="true"]')
+      .forEach((el) => el.remove());
+    // Bỏ thẻ nhiễu không cần cho việc suy selector.
+    clone.querySelectorAll("script, style, svg, noscript, iframe, link").forEach((el) => el.remove());
+    return clone.outerHTML;
+  }
+
+  // Kiểm tra một chuỗi có "giống thời gian đăng" không (để chặn selector AI sai,
+  // ví dụ AI trả về link bình luận chứa comment_id).
+  const TIME_TEXT_RE =
+    /(\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm)|hôm qua|vừa xong|just now|yesterday|\d{1,2}\s*tháng|\bhour|\bmin|\bday|\bweek|\bmonth|\byear|\d+\s*[smhdwy]\b)/i;
+
+  function looksLikeTime(t) {
+    if (!t) return false;
+    const s = String(t).trim();
+    if (s.length > 40) return false;
+    if (/comment_id|reply/i.test(s)) return false;
+    return TIME_TEXT_RE.test(s);
+  }
+
+  // ---- Bóc tách 1 article thành object bài viết --------------------------
+
+  async function extractPost(article, groupInfo, selectors) {
+    const postId = getPostIdFrom(article);
+    if (!postId) return null;
+    const permalink = buildPermalink(groupInfo.groupId, postId);
+
+    // QUAN TRỌNG: feed Facebook render lười. Bài ngoài tầm nhìn chỉ có phần
+    // header (link tác giả/permalink), thân bài (text, ảnh) chưa render =>
+    // mọi trường rỗng. Cuộn bài vào giữa màn hình và chờ render trước khi bóc tách.
+    try {
+      article.scrollIntoView({ block: "center" });
+    } catch (e) {}
+    await sleep(450);
+
+    await expandSeeMore(article);
+    await sleep(120);
+
+    // Heuristic làm nền (luôn chạy, để không bao giờ rỗng nếu DOM có nội dung).
+    const author = extractAuthor(article);
+    const time = extractTimestamp(article);
+    const counts = extractCounts(article);
+    const base = {
+      authorName: author.authorName,
+      authorProfile: author.authorProfile,
+      timeText: time.timeText,
+      text: extractText(article),
+      images: extractImages(article),
+      videos: extractVideos(article),
+      reactions: counts.reactions,
+      comments: counts.comments,
+    };
+
+    // Selector AI GHI ĐÈ khi có giá trị (ưu tiên "crawl theo phần tử").
+    const ai = extractBySelectors(article, selectors);
+    const pick = (a, b) => (a !== null && a !== undefined && a !== "" ? a : b);
+    const pickArr = (a, b) => (Array.isArray(a) && a.length ? a : b);
+
+    // Chặn selector thời gian sai (vd link bình luận): chỉ nhận khi giống thời gian.
+    const aiTimeText = looksLikeTime(ai.timeText) ? ai.timeText : null;
+
+    return {
+      postId,
+      groupId: groupInfo.groupId,
+      groupName: groupInfo.groupName,
+      permalink,
+      authorName: pick(ai.authorName, base.authorName),
+      authorProfile: pick(ai.authorProfile, base.authorProfile),
+      timestamp: time.timestamp,
+      timeText: pick(aiTimeText, base.timeText),
+      text: pick(ai.text, base.text),
+      images: pickArr(ai.images, base.images),
+      videos: pickArr(ai.videos, base.videos),
+      links: extractExternalLinks(article, permalink),
+      reactions: pick(ai.reactions, base.reactions),
+      comments: pick(ai.comments, base.comments),
+      crawledAt: Date.now(),
+    };
+  }
+
+  // ---- Vòng lặp crawl chính ---------------------------------------------
+
+  async function runCrawl(options) {
+    if (state.running) return { ok: false, error: "Đang chạy crawl rồi." };
+    state.running = true;
+    state.stopRequested = false;
+
+    const opts = {
+      maxNewPosts: options.maxNewPosts || 100,      // dừng khi đủ N bài mới
+      stopAfterKnown: options.stopAfterKnown || 8,  // dừng sau N bài đã biết liên tiếp
+      maxScrolls: options.maxScrolls || 200,        // chặn vô hạn
+      scrollDelay: options.scrollDelay || 1500,     // ms chờ tải sau mỗi lần cuộn
+      safeMode: options.safeMode !== false,         // bật mô phỏng người dùng để tránh spam/checkpoint
+      fromTs: options.fromTs || 0,                  // chỉ lấy bài từ mốc thời gian này trở đi (0 = không giới hạn)
+      ...options,
+    };
+
+    // Số ngẫu nhiên trong [min, max].
+    const rand = (min, max) => min + Math.random() * (max - min);
+    // Độ trễ có nhiễu: dao động quanh base để không đều như máy.
+    const jitterDelay = (base) => {
+      if (!opts.safeMode) return base;
+      const factor = rand(0.7, 1.6);            // 70%..160% so với base
+      return Math.round(base * factor);
+    };
+    // Cuộn từng đoạn như người thật thay vì nhảy thẳng xuống đáy.
+    const humanScroll = async () => {
+      if (!opts.safeMode) {
+        window.scrollTo(0, document.body.scrollHeight);
+        return;
+      }
+      const steps = Math.floor(rand(2, 5));     // 2..4 nhịp cuộn nhỏ
+      for (let i = 0; i < steps; i++) {
+        if (state.stopRequested) break;
+        const dy = Math.round(rand(0.5, 0.9) * window.innerHeight);
+        window.scrollBy(0, dy);
+        await sleep(Math.round(rand(180, 520)));
+      }
+      // Đảm bảo chạm đáy để trigger tải thêm.
+      window.scrollTo(0, document.body.scrollHeight);
+    };
+    // Thỉnh thoảng "nghỉ" lâu hơn như người dùng dừng đọc.
+    let nextRestAt = Math.floor(rand(6, 11));   // sau 6..10 lần cuộn sẽ nghỉ
+
+    const groupInfo = getGroupInfo();
+
+    // Lấy tập ID đã biết để lọc bài mới.
+    const knownRes = await send("GET_KNOWN_IDS", { groupId: groupInfo.groupId });
+    const known = new Set((knownRes && knownRes.ok && knownRes.ids) || []);
+
+    // Nạp bộ selector AI một lần cho cả phiên (nếu đã khám phá trước đó).
+    const selectors = await loadSelectors();
+
+    const seenThisRun = new Set();
+    let newCount = 0;
+    let consecutiveKnown = 0;
+    let consecutiveOld = 0; // số bài cũ hơn "fromTs" gặp liên tiếp (feed mới->cũ)
+    let scrolls = 0;
+    let batch = [];
+
+    const flush = async () => {
+      if (batch.length === 0) return;
+      const toSave = batch;
+      batch = [];
+      await send("SAVE_POSTS", { posts: toSave });
+    };
+
+    const reportProgress = (extra = {}) => {
+      send("CRAWL_PROGRESS", {
+        progress: {
+          groupId: groupInfo.groupId,
+          groupName: groupInfo.groupName,
+          newCount,
+          scrolls,
+          knownHits: consecutiveKnown,
+          ...extra,
+        },
+      });
+    };
+
+    reportProgress({ status: "started" });
+
+    try {
+      while (!state.stopRequested && scrolls < opts.maxScrolls && newCount < opts.maxNewPosts) {
+        const containers = findPostContainers();
+
+        for (const article of containers) {
+          if (state.stopRequested || newCount >= opts.maxNewPosts) break;
+
+          // Lấy nhanh postId để quyết định trước khi bóc tách nặng.
+          const postId = getPostIdFrom(article);
+          if (!postId) continue;
+          if (seenThisRun.has(postId)) continue;
+          seenThisRun.add(postId);
+
+          if (known.has(postId)) {
+            consecutiveKnown += 1;
+            if (consecutiveKnown >= opts.stopAfterKnown) {
+              await flush();
+              reportProgress({ status: "stopped_known" });
+              state.running = false;
+              send("CRAWL_DONE", {
+                result: { newCount, reason: "Đã gặp đủ bài cũ liên tiếp — coi như hết bài mới." },
+              });
+              return { ok: true, newCount, reason: "known_limit" };
+            }
+            continue;
+          }
+
+          // Bài MỚI -> reset chuỗi known, bóc tách đầy đủ.
+          consecutiveKnown = 0;
+          try {
+            const post = await extractPost(article, groupInfo, selectors);
+            if (post && post.postId) {
+              // Lọc theo "Crawl từ ngày": feed mới->cũ nên khi gặp đủ bài cũ
+              // hơn mốc liên tiếp thì coi như đã vượt qua khoảng cần lấy -> dừng.
+              // Bài không xác định được thời gian (timestamp rỗng) vẫn được giữ.
+              if (opts.fromTs && post.timestamp && post.timestamp < opts.fromTs) {
+                consecutiveOld += 1;
+                if (consecutiveOld >= opts.stopAfterKnown) {
+                  await flush();
+                  reportProgress({ status: "stopped_old" });
+                  state.running = false;
+                  send("CRAWL_DONE", {
+                    result: { newCount, reason: "Đã tới bài cũ hơn ngày bắt đầu — dừng theo bộ lọc ngày." },
+                  });
+                  return { ok: true, newCount, reason: "date_limit" };
+                }
+                continue; // bỏ qua bài cũ hơn mốc, không lưu
+              }
+              consecutiveOld = 0;
+              batch.push(post);
+              newCount += 1;
+              if (batch.length >= 10) await flush();
+              reportProgress({ status: "crawling", lastAuthor: post.authorName });
+            }
+          } catch (e) {
+            // Bỏ qua bài lỗi.
+          }
+        }
+
+        await flush();
+
+        // Cuộn để tải thêm bài — mô phỏng thao tác người dùng khi bật safeMode.
+        const beforeH = document.body.scrollHeight;
+        await humanScroll();
+        scrolls += 1;
+        await sleep(jitterDelay(opts.scrollDelay));
+
+        // Thỉnh thoảng nghỉ lâu hơn như người thật dừng đọc => giảm rủi ro spam/checkpoint.
+        if (opts.safeMode && scrolls >= nextRestAt) {
+          reportProgress({ status: "resting" });
+          await sleep(jitterDelay(Math.round(opts.scrollDelay * rand(2.5, 4))));
+          nextRestAt = scrolls + Math.floor(rand(6, 11)); // hẹn lần nghỉ kế tiếp
+        }
+
+        // Nếu trang không cao thêm sau vài lần => có thể đã hết feed.
+        const afterH = document.body.scrollHeight;
+        if (afterH <= beforeH) {
+          await sleep(jitterDelay(opts.scrollDelay)); // chờ thêm 1 nhịp phòng tải chậm
+          if (document.body.scrollHeight <= beforeH) {
+            // Hết bài để tải.
+            if (scrolls > 2) break;
+          }
+        }
+      }
+
+      await flush();
+      const reason = state.stopRequested
+        ? "Đã dừng theo yêu cầu."
+        : newCount >= opts.maxNewPosts
+        ? "Đã đạt giới hạn số bài mới."
+        : "Đã cuộn hết feed khả dụng.";
+
+      reportProgress({ status: "done" });
+      send("CRAWL_DONE", { result: { newCount, reason } });
+      state.running = false;
+      return { ok: true, newCount, reason };
+    } catch (err) {
+      await flush();
+      state.running = false;
+      send("CRAWL_DONE", { result: { newCount, reason: "Lỗi: " + String(err) } });
+      return { ok: false, error: String(err), newCount };
+    }
+  }
+
+  // ---- Lắng nghe lệnh từ background/popup --------------------------------
+
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || !msg.type) return false;
+
+    if (msg.type === "START_CRAWL") {
+      // Trả lời ngay rằng đã nhận; tiến độ gửi qua CRAWL_PROGRESS.
+      runCrawl(msg.options || {});
+      sendResponse({ ok: true, started: true });
+      return false;
+    }
+
+    if (msg.type === "STOP_CRAWL") {
+      state.stopRequested = true;
+      sendResponse({ ok: true, stopping: true });
+      return false;
+    }
+
+    if (msg.type === "GET_SAMPLE_HTML") {
+      // Trả outerHTML của 1 bài mẫu (đã cuộn vào tầm nhìn + mở "Xem thêm")
+      // để background gửi cho AI khám phá selector.
+      (async () => {
+        const article = findFirstPostContainer();
+        if (!article) {
+          sendResponse({ ok: false, error: "Không tìm thấy bài viết nào trên trang. Hãy cuộn tới phần feed của nhóm." });
+          return;
+        }
+        try {
+          article.scrollIntoView({ block: "center" });
+        } catch (e) {}
+        await sleep(700);
+        await expandSeeMore(article);
+        await sleep(250);
+        const groupInfo = getGroupInfo();
+        const postId = getPostIdFrom(article);
+        const permalink = postId ? buildPermalink(groupInfo.groupId, postId) : null;
+        sendResponse({ ok: true, html: buildCleanSample(article), postId, permalink });
+      })();
+      return true; // giữ kênh mở cho phản hồi bất đồng bộ
+    }
+
+    if (msg.type === "PING") {
+      sendResponse({ ok: true, running: state.running });
+      return false;
+    }
+
+    return false;
+  });
+})();

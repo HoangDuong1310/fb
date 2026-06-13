@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FB Group New Posts Crawler</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --fg: #1c1e21;
+        --muted: #65676b;
+        --primary: #1877f2;
+        --primary-hover: #166fe0;
+        --danger: #e4144c;
+        --border: #dddfe2;
+        --soft: #f0f2f5;
+        --ok: #1f8a4c;
+      }
+      * { box-sizing: border-box; }
+      body {
+        width: 360px;
+        margin: 0;
+        font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        font-size: 13px;
+      }
+      header {
+        background: var(--primary);
+        color: #fff;
+        padding: 12px 14px;
+      }
+      header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+      header p { margin: 4px 0 0; font-size: 11px; opacity: 0.9; }
+      .section { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .row + .row { margin-top: 8px; }
+      label { color: var(--muted); flex: 1; }
+      input[type="number"] {
+        width: 72px; padding: 5px 7px; border: 1px solid var(--border);
+        border-radius: 6px; font-size: 13px;
+      }
+      input.full {
+        width: 100%; padding: 6px 8px; border: 1px solid var(--border);
+        border-radius: 6px; font-size: 12px; font-family: inherit;
+      }
+      button {
+        border: none; border-radius: 6px; padding: 9px 12px;
+        font-size: 13px; font-weight: 600; cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .btn-primary { background: var(--primary); color: #fff; flex: 1; }
+      .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+      .btn-soft { background: var(--soft); color: var(--fg); }
+      .btn-danger { background: #fde8ee; color: var(--danger); }
+      .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .status {
+        background: var(--soft); border-radius: 8px; padding: 10px;
+        font-size: 12px; min-height: 38px; white-space: pre-wrap;
+      }
+      .status.ok { color: var(--ok); }
+      .status.err { color: var(--danger); }
+      .stat-line { display: flex; justify-content: space-between; padding: 3px 0; }
+      .stat-line b { font-weight: 600; }
+      .muted { color: var(--muted); font-size: 11px; }
+      .groups { max-height: 110px; overflow: auto; margin-top: 6px; }
+      .group-item {
+        display: flex; justify-content: space-between; padding: 4px 0;
+        border-top: 1px dashed var(--border);
+      }
+      h2 { font-size: 12px; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>FB Group — Crawl bài viết mới</h1>
+      <p>Chỉ lấy bài MỚI từ nhóm đang mở • lưu IndexedDB</p>
+    </header>
+
+    <div class="section">
+      <button id="btnDashboard" class="btn-primary" style="width: 100%; padding: 12px;">
+        📊 Mở bảng quản lý
+      </button>
+      <p class="muted" style="margin: 8px 0 0;">
+        Quản lý nhóm, crawl theo nhóm, bài viết đã lưu, tự động đăng &amp; bình luận.
+      </p>
+    </div>
+
+    <div class="section">
+      <h2>Tuỳ chọn crawl</h2>
+      <div class="row">
+        <label for="maxNewPosts">Tối đa số bài mới</label>
+        <input type="number" id="maxNewPosts" value="100" min="1" max="2000" />
+      </div>
+      <div class="row">
+        <label for="stopAfterKnown">Dừng sau N bài cũ liên tiếp</label>
+        <input type="number" id="stopAfterKnown" value="8" min="1" max="100" />
+      </div>
+      <div class="row">
+        <label for="scrollDelay">Chờ sau mỗi lần cuộn (ms)</label>
+        <input type="number" id="scrollDelay" value="1500" min="400" max="8000" step="100" />
+      </div>
+      <div class="row" style="margin-top: 10px;">
+        <button id="btnStart" class="btn-primary">Bắt đầu crawl</button>
+        <button id="btnStop" class="btn-soft" disabled>Dừng</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Trạng thái</h2>
+      <div id="status" class="status">Mở trang nhóm Facebook rồi bấm "Bắt đầu crawl".</div>
+    </div>
+
+    <div class="section">
+      <h2>Dữ liệu đã lưu</h2>
+      <div class="stat-line"><span>Tổng số bài</span><b id="totalCount">0</b></div>
+      <div id="groupList" class="groups"></div>
+    </div>
+
+    <div class="section">
+      <h2>Selector AI (crawl theo phần tử)</h2>
+      <div class="row">
+        <label for="aiApiBase">API Base URL</label>
+      </div>
+      <input type="text" id="aiApiBase" class="full" placeholder="https://danglamgiau.com/v1" />
+      <div class="row" style="margin-top: 8px;">
+        <label for="aiApiKey">API Key</label>
+      </div>
+      <input type="password" id="aiApiKey" class="full" placeholder="Bearer key của bạn" />
+      <div class="row" style="margin-top: 8px;">
+        <label for="aiModel">Model</label>
+      </div>
+      <input type="text" id="aiModel" class="full" placeholder="gpt-5.5" />
+      <div class="grid2" style="margin-top: 10px;">
+        <button id="btnSaveAI" class="btn-soft">Lưu cấu hình</button>
+        <button id="btnDiscover" class="btn-primary">Khám phá selector</button>
+      </div>
+      <div class="grid2" style="margin-top: 8px;">
+        <button id="btnViewSelectors" class="btn-soft">Xem selector</button>
+        <button id="btnClearSelectors" class="btn-danger">Xoá selector</button>
+      </div>
+      <div id="selectorBox" class="status" style="margin-top: 8px;">Chưa có selector. Mở 1 bài trong nhóm rồi bấm "Khám phá selector".</div>
+      <p class="muted" style="margin: 8px 0 0;">
+        AI chỉ gọi 1 lần để tạo selector. Khi Facebook đổi giao diện, bấm khám phá lại.
+      </p>
+    </div>
+
+    <div class="section">
+      <h2>Xuất & quản lý</h2>
+      <div class="grid2">
+        <button id="btnExportJson" class="btn-soft">Xuất JSON</button>
+        <button id="btnExportCsv" class="btn-soft">Xuất CSV</button>
+      </div>
+      <div class="grid2" style="margin-top: 8px;">
+        <button id="btnRefresh" class="btn-soft">Làm mới số liệu</button>
+        <button id="btnClear" class="btn-danger">Xoá toàn bộ</button>
+      </div>
+      <p class="muted" style="margin: 10px 0 0;">
+        Mẹo: đặt nhóm về chế độ "Bài viết mới / Hoạt động gần đây" để crawl bài mới chính xác.
+      </p>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

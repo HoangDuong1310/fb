@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "FB Group New Posts Crawler",
+  "version": "1.0.0",
+  "description": "Crawl chỉ các bài viết MỚI từ nhóm Facebook đã tham gia và lưu dữ liệu đầy đủ (IndexedDB + xuất JSON/CSV).",
+  "permissions": ["storage", "tabs", "scripting", "activeTab", "alarms"],
+  "host_permissions": [
+    "https://www.facebook.com/*",
+    "https://web.facebook.com/*",
+    "https://m.facebook.com/*",
+    "https://danglamgiau.com/*",
+    "https://*.hoanghapc.vn/*",
+    "https://*.hacom.vn/*",
+    "https://*.nguyencongpc.vn/*",
+    "https://*.anphatpc.com.vn/*",
+    "https://docs.google.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "FB Group New Posts Crawler",
+    "default_popup": "src/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.facebook.com/groups/*",
+        "https://web.facebook.com/groups/*"
+      ],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

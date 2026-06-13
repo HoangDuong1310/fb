@@ -1,0 +1,7 @@
+{
+  "name": "fb-group-crawler-extension",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cấu hình ESM cho extension. Chỉ phục vụ node --check kiểm tra cú pháp module; extension nạp trực tiếp từ trình duyệt."
+}
