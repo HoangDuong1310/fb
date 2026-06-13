@@ -10,41 +10,68 @@ export function asyncHandler(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 }
 
-authRouter.post("/register", asyncHandler(async (req, res) => {
-  const { email, password, displayName } = req.body || {};
+// Validates the register request body. Returns an error message string when the
+// input is invalid, or null when it is acceptable. Kept small and pure so the
+// route handler stays focused on persistence concerns.
+export function validateRegisterInput(body) {
+  const { email, password } = body || {};
   if (typeof email !== "string" || !email.trim() ||
-      typeof password !== "string" || password.length < 6) {
-    return res.status(400).json({ error: "email and password (>=6 chars) required" });
+      typeof password !== "string" || password.length < 6 ||
+      password.length > 72) {
+    // bcrypt silently truncates input past 72 bytes, so an upper bound is a
+    // security requirement, not just hygiene: two long passwords sharing a
+    // 72-byte prefix would otherwise authenticate interchangeably.
+    if (typeof password === "string" &&
+        (password.length < 6 || password.length > 72)) {
+      return "password must be 6-72 characters";
+    }
+    return "email and password (>=6 chars) required";
   }
-  const pool = getPool();
-  // Fast-path pre-check; the DB UNIQUE constraint is the source of truth.
-  const [existing] = await pool.query(
-    "SELECT id FROM users WHERE email = :email",
-    { email }
-  );
-  if (existing.length) {
-    return res.status(409).json({ error: "email already registered" });
+  // Simple structural email check; the DB UNIQUE constraint enforces identity.
+  if (!/.+@.+\..+/.test(email)) {
+    return "invalid email";
   }
+  return null;
+}
+
+authRouter.post("/register", asyncHandler(async (req, res) => {
+  const validationError = validateRegisterInput(req.body);
+  if (validationError) {
+    return res.status(400).json({ error: validationError });
+  }
+  const { email, password, displayName } = req.body;
   const password_hash = await hashPassword(password);
+
+  // Both inserts must succeed or fail atomically: an orphaned users row with no
+  // matching user_share_prefs row breaks every later feature that reads share
+  // defaults through the FK. Wrap them in a single transaction on one connection.
+  const conn = await getPool().getConnection();
   let userId;
   try {
-    const [result] = await pool.query(
+    await conn.beginTransaction();
+    const [result] = await conn.query(
       "INSERT INTO users (email, password_hash, display_name) VALUES (:email, :password_hash, :display_name)",
       { email, password_hash, display_name: displayName ?? null }
     );
     userId = result.insertId;
+    await conn.query(
+      "INSERT INTO user_share_prefs (user_id) VALUES (:userId)",
+      { userId }
+    );
+    await conn.commit();
   } catch (err) {
-    // Race path: a concurrent registration inserted the same email between the
-    // pre-check SELECT and this INSERT. Translate the UNIQUE violation to 409.
+    await conn.rollback();
+    // The DB UNIQUE constraint on users.email is the source of truth. Translate
+    // the violation (including the concurrent-registration race) into a 409.
     if (err && err.code === "ER_DUP_ENTRY") {
       return res.status(409).json({ error: "email already registered" });
     }
+    // Any other error propagates to the terminal middleware as a 500.
     throw err;
+  } finally {
+    conn.release();
   }
-  await pool.query(
-    "INSERT INTO user_share_prefs (user_id) VALUES (:userId)",
-    { userId }
-  );
+
   const token = signToken({ userId });
   return res.status(200).json({
     token,

@@ -47,6 +47,30 @@ test("auth routes", async (t) => {
     assert.equal(res.status, 400);
   });
 
+  await t.test("register with too-short password is rejected", async () => {
+    const res = await request(app)
+      .post("/api/auth/register")
+      .send({ email: `short${Date.now()}@t.io`, password: "abc" });
+    assert.equal(res.status, 400);
+  });
+
+  // bcrypt silently truncates input past 72 bytes, so the upper bound is a
+  // security requirement: two long passwords sharing a 72-byte prefix would
+  // otherwise authenticate interchangeably.
+  await t.test("register with over-72-char password is rejected", async () => {
+    const res = await request(app)
+      .post("/api/auth/register")
+      .send({ email: `long${Date.now()}@t.io`, password: "a".repeat(73) });
+    assert.equal(res.status, 400);
+  });
+
+  await t.test("register with invalid email format is rejected", async () => {
+    const res = await request(app)
+      .post("/api/auth/register")
+      .send({ email: "notanemail", password: "secret123" });
+    assert.equal(res.status, 400);
+  });
+
   await t.test("register with duplicate email is rejected", async () => {
     const email = `dup${Date.now()}@t.io`;
     const first = await request(app)
