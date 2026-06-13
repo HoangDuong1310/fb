@@ -1,0 +1,19 @@
+{
+  "name": "fb-crawler-web",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "bcrypt": "5.1.1",
+    "dotenv": "16.4.5",
+    "express": "4.19.2",
+    "jsonwebtoken": "9.0.2",
+    "mysql2": "3.11.0"
+  },
+  "devDependencies": {
+    "supertest": "7.0.0"
+  }
+}
