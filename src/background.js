@@ -21,6 +21,7 @@
 
 import * as DB from "./db.js";
 import { openDashboard, broadcast } from "./util.js";
+import * as API from "./api.js";
 import {
   syncSource,
   syncAllSources,
@@ -63,6 +64,51 @@ import {
   processReplyWatch,
   initReplyWatch,
 } from "./crawl.js";
+
+/* ----------------------- XÁC THỰC WEB BACKEND (state) ------------------ */
+
+// Khoá lưu thông tin user đăng nhập (để AUTH_STATE trả display_name qua restart).
+const AUTH_USER_KEY = "webAuthUser";
+
+// Cache in-memory thông tin user hiện tại ({ id, email, displayName } | null).
+let authUser = null;
+
+/** Lưu user vào cache + chrome.storage.local (null để xoá). */
+function setAuthUser(user) {
+  authUser = user || null;
+  return new Promise((resolve) => {
+    try {
+      if (authUser) {
+        chrome.storage.local.set({ [AUTH_USER_KEY]: authUser }, () => {
+          void chrome.runtime.lastError;
+          resolve();
+        });
+      } else {
+        chrome.storage.local.remove(AUTH_USER_KEY, () => {
+          void chrome.runtime.lastError;
+          resolve();
+        });
+      }
+    } catch (e) {
+      resolve();
+    }
+  });
+}
+
+/** Nạp user đã lưu vào cache in-memory (gọi lúc khởi động SW). */
+function loadAuthUser() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(AUTH_USER_KEY, (r) => {
+        void chrome.runtime.lastError;
+        authUser = (r && r[AUTH_USER_KEY]) || null;
+        resolve(authUser);
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
 
 // Xử lý message bất đồng bộ: trả true để giữ kênh sendResponse mở.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -606,6 +652,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true; // giữ SW sống tới khi đóng tab xong
     }
 
+    // ----------------------- XÁC THỰC WEB BACKEND (JWT) ------------------
+    // Đăng nhập: gọi POST /api/auth/login, lưu token vào api.js (persist storage),
+    // nhớ display_name để AUTH_STATE trả lại, rồi trả về user để UI hiển thị.
+    // Token sẽ tự gắn vào mọi apiFetch sau đó.
+    case "AUTH_LOGIN": {
+      (async () => {
+        const email = String(msg.email || "").trim();
+        const password = String(msg.password || "");
+        const data = await API.apiFetch("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email, password }),
+        });
+        API.setToken(data && data.token);
+        const user = (data && data.user) || null;
+        await setAuthUser(user);
+        sendResponse({ ok: true, user });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Đăng xuất: xoá token (cả cache in-memory lẫn chrome.storage.local) + user.
+    case "AUTH_LOGOUT": {
+      API.setToken(null);
+      setAuthUser(null).finally(() => sendResponse({ ok: true }));
+      return true;
+    }
+
+    // Trạng thái đăng nhập hiện tại (đồng bộ từ cache token + user).
+    case "AUTH_STATE": {
+      const token = API.getToken();
+      sendResponse({
+        ok: true,
+        loggedIn: !!token,
+        display_name: (token && authUser && authUser.displayName) || "",
+      });
+      return false;
+    }
+
     default:
       return false;
   }
@@ -614,6 +698,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 /* ----------------------- KHỞI TẠO: alarms + seed ----------------------- */
 
 try {
+  // Khởi tạo client xác thực web backend: nạp token + user đã lưu vào cache,
+  // và đăng ký handler 401 -> xoá token và báo UI cần đăng nhập lại.
+  API.onUnauthorized(() => {
+    setAuthUser(null);
+    broadcast("AUTH_REQUIRED");
+  });
+  API.loadToken();
+  loadAuthUser();
+
   chrome.alarms.create("jobTick", { periodInMinutes: 1 });
   chrome.alarms.onAlarm.addListener((a) => {
     if (!a) return;
