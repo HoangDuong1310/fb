@@ -127,7 +127,6 @@ async function deleteGroup(groupId) {
 // Job = trạng thái tự động hoá CỤC BỘ của thiết bị. KHÔNG gọi API. Lưu trong
 // chrome.storage.local; ngoài extension thì dùng store in-memory để test chạy
 // được mà không cần `chrome`.
-
 const JOBS_KEY = "localJobs";
 
 // Store in-memory dự phòng (khi không có chrome.storage). { seq, jobs:[] }.
@@ -181,6 +180,12 @@ function writeJobs(store) {
   });
 }
 
+// CONCURRENCY CAVEAT (single-writer assumption): the job mutators below
+// (createJob / updateJob / deleteJob / clearFinishedJobs) run a
+// read-modify-write cycle over the whole store. They assume a single writer
+// per device (the background service worker). Two overlapping writers could
+// race on read/write and lose an update or reuse a seq. This is acceptable for
+// device-local automation state and is NOT redesigned here.
 /** Tạo một job (đăng bài / bình luận). Trả về job đã lưu (kèm id). */
 async function createJob(job) {
   const j = job || {};
@@ -207,7 +212,14 @@ async function updateJob(id, patch) {
   const store = await readJobs();
   const idx = store.jobs.findIndex((j) => j.id === id);
   if (idx < 0) return null;
-  const merged = { ...store.jobs[idx], ...patch, updatedAt: Date.now() };
+  // Pin `id` last so a caller-supplied `{ id: ... }` in patch cannot rewrite
+  // the primary key (symmetric with createJob, which also pins id last).
+  const merged = {
+    ...store.jobs[idx],
+    ...patch,
+    updatedAt: Date.now(),
+    id: store.jobs[idx].id,
+  };
   store.jobs[idx] = merged;
   await writeJobs(store);
   return merged;
