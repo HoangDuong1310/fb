@@ -224,4 +224,69 @@ test("data routes share-filtering", async (t) => {
       assert.ok(Array.isArray(res.body.products));
     }
   );
+
+  // FOLLOW-UP: PATCH /api/posts/:id persists parsedAt so the group-price funnel
+  // (Tier 2) can skip already-parsed posts on later runs. Scoped to the owner.
+  await t.test(
+    "PATCH /api/posts/:id sets parsedAt on the caller's own post; foreign post is untouched",
+    async () => {
+      const A = await registerUser(app, "patchA");
+      const B = await registerUser(app, "patchB");
+      const postId = `pp_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+      const groupId = `ppg_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+
+      const save = await request(app)
+        .post("/api/posts")
+        .set("Authorization", `Bearer ${A.token}`)
+        .send({
+          posts: [
+            { postId, groupId, groupName: "G", text: "p", timestamp: Date.now() },
+          ],
+        });
+      assert.equal(save.status, 200);
+
+      // A marks their own post parsed.
+      const iso = new Date().toISOString();
+      const patch = await request(app)
+        .patch(`/api/posts/${encodeURIComponent(postId)}`)
+        .set("Authorization", `Bearer ${A.token}`)
+        .send({ parsedAt: iso });
+      assert.equal(patch.status, 200);
+      assert.equal(patch.body.updated, 1, "owner patch should affect exactly one row");
+
+      const aList = await request(app)
+        .get("/api/posts")
+        .query({ groupId })
+        .set("Authorization", `Bearer ${A.token}`);
+      assert.equal(aList.status, 200);
+      const aRow = aList.body.posts.find((p) => p.postId === postId);
+      assert.ok(aRow, "A should see their post");
+      assert.ok(aRow.parsedAt, "parsedAt should be persisted and returned");
+
+      // B (not the owner) cannot mark A's post: ownership scope yields 0 rows.
+      const foreign = await request(app)
+        .patch(`/api/posts/${encodeURIComponent(postId)}`)
+        .set("Authorization", `Bearer ${B.token}`)
+        .send({ parsedAt: new Date().toISOString() });
+      assert.equal(foreign.status, 200);
+      assert.equal(foreign.body.updated, 0, "non-owner must not update the row");
+    }
+  );
+
+  // Invalid parsedAt is rejected with 400 rather than writing a bad datetime.
+  await t.test("PATCH /api/posts/:id with invalid parsedAt returns 400", async () => {
+    const U = await registerUser(app, "patchbad");
+    const postId = `pb_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    await request(app)
+      .post("/api/posts")
+      .set("Authorization", `Bearer ${U.token}`)
+      .send({ posts: [{ postId, groupId: "g", text: "p", timestamp: Date.now() }] });
+
+    const res = await request(app)
+      .patch(`/api/posts/${encodeURIComponent(postId)}`)
+      .set("Authorization", `Bearer ${U.token}`)
+      .send({ parsedAt: "not-a-date" });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error, "invalid parsedAt");
+  });
 });

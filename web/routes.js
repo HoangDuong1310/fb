@@ -305,6 +305,35 @@ dataRouter.delete("/posts", asyncHandler(async (req, res) => {
   res.json({ deleted: result.affectedRows });
 }));
 
+// PATCH /api/posts/:id — update operational fields on the caller's OWN post.
+// Currently only parsedAt: the group-price funnel (Tier 2) skips posts that
+// already carry parsed_at so they are not re-sent to the AI on every run.
+// Scoped to crawled_by_user_id = :userId (same ownership rule as DELETE): a
+// caller may only mark their own rows. Posts shared in from other users are
+// still re-evaluated by that non-owner — harmless because group_prices inserts
+// are idempotent (uq_gp_line), just not token-optimal for the non-owner case.
+dataRouter.patch("/posts/:id", asyncHandler(async (req, res) => {
+  const userId = req.userId;
+  const patch = req.body || {};
+  const sets = [];
+  const params = { postId: req.params.id, userId };
+  if (patch.parsedAt !== undefined) {
+    // Accept an ISO string to set, or null to clear. MySQL parses the ISO
+    // string into the DATETIME column; null leaves the post eligible again.
+    sets.push("parsed_at = :parsedAt");
+    params.parsedAt = patch.parsedAt === null ? null : new Date(patch.parsedAt);
+    if (params.parsedAt instanceof Date && Number.isNaN(params.parsedAt.getTime())) {
+      return res.status(400).json({ error: "invalid parsedAt" });
+    }
+  }
+  if (!sets.length) return res.json({ updated: 0 });
+  const [result] = await getPool().query(
+    `UPDATE posts SET ${sets.join(", ")} WHERE post_id = :postId AND crawled_by_user_id = :userId`,
+    params
+  );
+  res.json({ updated: result.affectedRows });
+}));
+
 /* ------------------------------- GROUPS -------------------------------- */
 
 // GET /api/groups — all groups (shared pool, no per-row share flag), newest
