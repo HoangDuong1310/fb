@@ -65,7 +65,8 @@ function linkCell(rawUrl, label) {
     a.href = url;
     a.textContent = text || url;
     a.target = "_blank";
-    a.rel = "noopener";
+    // noreferrer cũng loại bỏ header Referer khi mở link ngoài lấy từ dữ liệu crawl.
+    a.rel = "noopener noreferrer";
     td.appendChild(a);
   } else {
     // URL không hợp lệ -> hiển thị nhãn (hoặc rỗng) dưới dạng text thuần.
@@ -81,6 +82,7 @@ function buildTable(headers, rowCells) {
   const htr = document.createElement("tr");
   for (const h of headers) {
     const th = document.createElement("th");
+    th.scope = "col"; // hỗ trợ trình đọc màn hình điều hướng bảng theo cột.
     th.textContent = h;
     htr.appendChild(th);
   }
@@ -285,7 +287,23 @@ async function handleLogin(event) {
       status.className = "status error";
       return;
     }
-    const data = await res.json();
+    // Tách riêng việc parse JSON: nếu thân phản hồi 2xx không phải JSON hợp lệ,
+    // báo "đăng nhập thất bại" thay vì rơi xuống catch và báo nhầm lỗi kết nối.
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      status.textContent = "Đăng nhập thất bại. Thử lại sau.";
+      status.className = "status error";
+      return;
+    }
+    // Hợp đồng đảm bảo có token khi 200; chặn lưu "undefined" thành chuỗi
+    // (sẽ thành "Bearer undefined" cho tới lần 401 đầu tiên).
+    if (!data.token) {
+      status.textContent = "Đăng nhập thất bại. Thử lại sau.";
+      status.className = "status error";
+      return;
+    }
     const userEmail = (data.user && data.user.email) || email;
     localStorage.setItem(TOKEN_KEY, data.token);
     localStorage.setItem(EMAIL_KEY, userEmail);
