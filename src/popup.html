@@ -69,6 +69,12 @@
         border-top: 1px dashed var(--border);
       }
       h2 { font-size: 12px; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+      .authbar {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 8px 14px; background: var(--soft); border-bottom: 1px solid var(--border);
+      }
+      .authbar .name { font-weight: 600; }
+      .auth-actions { margin-top: 10px; }
     </style>
   </head>
   <body>
@@ -77,6 +83,22 @@
       <p>Chỉ lấy bài MỚI từ nhóm đang mở • lưu IndexedDB</p>
     </header>
 
+    <div id="authBar" class="authbar" hidden>
+      <span id="authName" class="name"></span>
+      <button id="btnLogout" class="btn-soft">Đăng xuất</button>
+    </div>
+
+    <div id="loginSection" class="section" hidden>
+      <h2>Đăng nhập</h2>
+      <input type="email" id="loginEmail" class="full" placeholder="Email" autocomplete="username" />
+      <input type="password" id="loginPassword" class="full" placeholder="Mật khẩu" autocomplete="current-password" style="margin-top: 8px;" />
+      <div class="auth-actions row">
+        <button id="btnLogin" class="btn-primary">Đăng nhập</button>
+      </div>
+      <div id="loginError" class="status err" style="margin-top: 8px;" hidden></div>
+    </div>
+
+    <div id="appSection" hidden>
     <div class="section">
       <button id="btnDashboard" class="btn-primary" style="width: 100%; padding: 12px;">
         📊 Mở bảng quản lý
@@ -158,6 +180,7 @@
       <p class="muted" style="margin: 10px 0 0;">
         Mẹo: đặt nhóm về chế độ "Bài viết mới / Hoạt động gần đây" để crawl bài mới chính xác.
       </p>
+    </div>
     </div>
 
     <script src="popup.js"></script>

@@ -1,6 +1,7 @@
 /**
  * popup.js — Điều khiển giao diện popup.
  *
+ * - Đăng nhập / đăng xuất qua background (AUTH_STATE / AUTH_LOGIN / AUTH_LOGOUT).
  * - Gửi START_CRAWL / STOP_CRAWL tới background (background chuyển tiếp cho content).
  * - Lắng nghe CRAWL_PROGRESS / CRAWL_DONE để cập nhật trạng thái realtime.
  * - GET_STATS để hiển thị số bài đã lưu theo nhóm.
@@ -31,6 +32,16 @@ const els = {
   btnClearSelectors: $("btnClearSelectors"),
   selectorBox: $("selectorBox"),
   btnDashboard: $("btnDashboard"),
+  // ---- Đăng nhập / trạng thái auth ----
+  loginSection: $("loginSection"),
+  loginEmail: $("loginEmail"),
+  loginPassword: $("loginPassword"),
+  btnLogin: $("btnLogin"),
+  loginError: $("loginError"),
+  authBar: $("authBar"),
+  authName: $("authName"),
+  btnLogout: $("btnLogout"),
+  appSection: $("appSection"),
 };
 
 // ---- Helper gửi message tới background -----------------------------------
@@ -55,6 +66,80 @@ function setRunning(running) {
   els.maxNewPosts.disabled = running;
   els.stopAfterKnown.disabled = running;
   els.scrollDelay.disabled = running;
+}
+
+// ---- Đăng nhập / trạng thái auth -----------------------------------------
+
+// Hiện/ẩn dòng lỗi đăng nhập.
+function setLoginError(text) {
+  if (!text) {
+    els.loginError.textContent = "";
+    els.loginError.hidden = true;
+    return;
+  }
+  els.loginError.textContent = text;
+  els.loginError.hidden = false;
+}
+
+// Hiện giao diện đã đăng nhập: ẩn form login, hiện appSection + thanh authBar.
+function showLoggedIn(displayName) {
+  els.authName.textContent = displayName || "";
+  els.authBar.hidden = false;
+  els.loginSection.hidden = true;
+  els.appSection.hidden = false;
+  setLoginError("");
+}
+
+// Hiện form đăng nhập: ẩn appSection + authBar. note = thông báo tuỳ chọn.
+function showLoggedOut(note) {
+  els.authBar.hidden = true;
+  els.appSection.hidden = true;
+  els.loginSection.hidden = false;
+  els.authName.textContent = "";
+  setLoginError(note || "");
+}
+
+// Hỏi background trạng thái đăng nhập rồi định tuyến giao diện.
+async function refreshAuth() {
+  const res = await bg("AUTH_STATE");
+  if (res && res.ok && res.loggedIn) {
+    showLoggedIn(res.display_name);
+    // Đã đăng nhập: tải dữ liệu phụ thuộc API.
+    loadStats();
+    viewSelectors();
+  } else {
+    showLoggedOut();
+  }
+}
+
+// Xử lý đăng nhập: kiểm tra rỗng, gửi AUTH_LOGIN, định tuyến theo kết quả.
+async function doLogin() {
+  const email = els.loginEmail.value.trim();
+  const password = els.loginPassword.value.trim();
+  if (!email || !password) {
+    setLoginError("Nhập email và mật khẩu");
+    return;
+  }
+  els.btnLogin.disabled = true;
+  try {
+    const res = await bg("AUTH_LOGIN", { email, password });
+    if (res && res.ok) {
+      els.loginPassword.value = "";
+      showLoggedIn(res.user && res.user.display_name);
+      loadStats();
+      viewSelectors();
+    } else {
+      setLoginError((res && res.error) || "Đăng nhập thất bại.");
+    }
+  } finally {
+    els.btnLogin.disabled = false;
+  }
+}
+
+// Xử lý đăng xuất: gửi AUTH_LOGOUT rồi quay về form đăng nhập.
+async function doLogout() {
+  await bg("AUTH_LOGOUT");
+  showLoggedOut();
 }
 
 // ---- Tải & hiển thị thống kê ---------------------------------------------
@@ -118,10 +203,15 @@ function clampInt(v, min, max, fallback) {
   return Math.min(max, Math.max(min, n));
 }
 
-// ---- Lắng nghe tiến độ từ content ----------------------------------------
+// ---- Lắng nghe tiến độ từ content & broadcast auth -----------------------
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.type) return;
+
+  if (msg.type === "AUTH_REQUIRED") {
+    showLoggedOut("Phiên đăng nhập hết hạn, vui lòng đăng nhập lại.");
+    return;
+  }
 
   if (msg.type === "CRAWL_PROGRESS" && msg.progress) {
     const p = msg.progress;
@@ -235,8 +325,6 @@ async function clearAll() {
   }
 }
 
-// ---- Gắn sự kiện & khởi tạo -----------------------------------------------
-
 // ---- Cấu hình AI & khám phá selector -------------------------------------
 
 function setSelectorBox(text) {
@@ -313,6 +401,14 @@ els.btnDashboard.addEventListener("click", () => {
   window.close();
 });
 
+// ---- Sự kiện đăng nhập / đăng xuất ----
+els.btnLogin.addEventListener("click", doLogin);
+els.loginPassword.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") doLogin();
+});
+els.btnLogout.addEventListener("click", doLogout);
+
+// Khởi tạo: cấu hình AI là cục bộ nên tải ngay; dữ liệu phụ thuộc API chỉ
+// chạy sau khi xác nhận đã đăng nhập (trong refreshAuth).
 loadAIConfig();
-viewSelectors();
-loadStats();
+refreshAuth();
