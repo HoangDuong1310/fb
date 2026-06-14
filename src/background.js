@@ -715,7 +715,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             keyword: msg.keyword,
             type: msg.type || "sell",
             addedBy: "user",
-            enabled: msg.enabled === false ? false : true,
+            enabled: msg.enabled !== false,
           }),
         });
         sendResponse({ ok: true });

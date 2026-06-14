@@ -9,13 +9,13 @@
  * Đường dữ liệu: KHÔNG gọi HTTP trực tiếp từ dashboard (JWT ở service worker).
  * Mọi thao tác đi qua bg() -> handler ở background.js -> API.apiFetch. Message:
  *   - GET_KEYWORDS    { type? }                 -> { ok, keywords }
- *   - ADD_KEYWORD     { keyword, type, enabled } -> { ok, keyword }
+ *   - ADD_KEYWORD     { keyword, type, enabled } -> { ok }
  *   - UPDATE_KEYWORD  { id, patch }              -> { ok }
  *   - DELETE_KEYWORD  { id }                     -> { ok }
  */
 import { $, bg, esc, emptyState, toast, timeAgo } from "../core.js";
 
-// State riêng cho view. type = "" nghĩa là tất cả loại.
+// State riêng cho view. Hiện chỉ quản lý từ khóa loại "sell" (chưa có UI đổi loại).
 export const keywordStore = {
   list: [],
   type: "sell",

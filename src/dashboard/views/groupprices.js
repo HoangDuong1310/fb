@@ -28,9 +28,16 @@ import { fmtPrice } from "./products.js";
 export const groupPriceStore = {
   rows: [],        // toàn bộ dòng giá đã nạp (sau lọc phía server theo mineOnly)
   groups: [],      // danh sách nhóm (để dựng dropdown + tra tên theo groupId)
-  filters: {},     // bộ lọc client hiện tại
   mineOnly: false, // cờ "Chỉ của tôi"
 };
+
+// Chỉ cho phép http/https khi dựng <a href> từ dữ liệu AI/crawl (ít tin cậy):
+// chặn javascript:/data: và các scheme nguy hiểm. Trả "" nếu không hợp lệ.
+function safeHttpUrl(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!/^https?:\/\//i.test(s)) return "";
+  return s;
+}
 
 /* ============================ LOGIC THUẦN ============================== */
 
@@ -250,11 +257,17 @@ function renderProductGroup(g) {
 
 // Render một thẻ dòng giá.
 function renderPriceCard(r) {
-  const cond = r.condition ? `<span class="gp-cond gp-cond-${esc(r.condition)}">${esc(COND_LABEL[r.condition] || r.condition)}</span>` : "";
+  // Class hậu tố chỉ giữ chữ-số (esc không escape dấu nháy nên không thể nhét
+  // trực tiếp giá trị AI/crawl vào thuộc tính class).
+  const condSlug = String(r.condition || "").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const cond = r.condition ? `<span class="gp-cond gp-cond-${condSlug}">${esc(COND_LABEL[r.condition] || r.condition)}</span>` : "";
   const warranty = r.warranty ? `<span class="gp-warranty">BH: ${esc(r.warranty)}</span>` : "";
   const seller = r.sellerName || "Ẩn danh";
-  const sellerLink = r.sellerProfile
-    ? `<a href="${esc(r.sellerProfile)}" target="_blank" rel="noopener">${esc(seller)}</a>`
+  // Chỉ render <a> khi sellerProfile là http(s) hợp lệ; chặn javascript:/data:
+  // và breakout attribute do dữ liệu AI/crawl không tin cậy.
+  const safeProfile = safeHttpUrl(r.sellerProfile);
+  const sellerLink = safeProfile
+    ? `<a href="${esc(safeProfile)}" target="_blank" rel="noopener">${esc(seller)}</a>`
     : esc(seller);
   const gname = groupName(r.groupId);
   const when = r.postedAt ? timeAgo(typeof r.postedAt === "number" ? r.postedAt : Date.parse(r.postedAt)) : "";
@@ -279,7 +292,7 @@ function renderPriceCard(r) {
           ${r.category ? `<span class="gp-cat">${esc(r.category)}</span>` : ""}
         </div>
         <div class="gp-sub muted">
-          ${av} ${sellerLink} · ${esc(gname)} ${when ? "· " + esc(when) : ""} ${sourceLink}
+          ${av} ${sellerLink} · ${esc(gname)} ${when ? "· " + when : ""} ${sourceLink}
         </div>
       </div>
       <div class="gp-price">${fmtPrice(r.price)}</div>
