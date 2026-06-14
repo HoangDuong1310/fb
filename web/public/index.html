@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FB Group Crawler — Bảng dữ liệu</title>
+  <style>
+    :root {
+      --primary: #6366F1;
+      --bg: #F5F3FF;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      background: var(--bg);
+      color: #1f2937;
+      line-height: 1.45;
+    }
+    header.topbar {
+      background: var(--primary);
+      color: #fff;
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    header.topbar h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+    }
+    .userbox {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 14px;
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    section {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 16px 18px;
+      margin-bottom: 20px;
+    }
+    section h2 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      color: var(--primary);
+    }
+    label {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 4px;
+      font-weight: 500;
+    }
+    input[type="email"],
+    input[type="password"] {
+      width: 100%;
+      padding: 9px 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      font-size: 14px;
+      margin-bottom: 12px;
+    }
+    button {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 9px 16px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    button:hover { opacity: 0.92; }
+    button.secondary {
+      background: #fff;
+      color: var(--primary);
+      border: 1px solid #fff;
+    }
+    #login-card {
+      max-width: 380px;
+      margin: 40px auto;
+    }
+    .status {
+      font-size: 14px;
+      min-height: 18px;
+      margin-top: 8px;
+    }
+    .status.error { color: #dc2626; }
+    .status.info { color: #6b7280; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      border: 1px solid #e5e7eb;
+      padding: 7px 9px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: var(--bg);
+      font-weight: 600;
+    }
+    tbody tr:nth-child(even) { background: #fafafa; }
+    .total-line {
+      font-size: 14px;
+      margin-bottom: 10px;
+      font-weight: 500;
+    }
+    .hidden { display: none; }
+    a { color: var(--primary); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>FB Group Crawler — Bảng dữ liệu</h1>
+    <div id="userbox" class="userbox hidden">
+      <span id="user-email"></span>
+      <button id="logout-btn" class="secondary" type="button">Đăng xuất</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Login -->
+    <section id="login-card">
+      <h2>Đăng nhập</h2>
+      <form id="login-form">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username" required />
+        <label for="password">Mật khẩu</label>
+        <input id="password" type="password" autocomplete="current-password" required />
+        <button type="submit">Đăng nhập</button>
+      </form>
+      <div id="login-status" class="status"></div>
+    </section>
+
+    <!-- Dashboard (hidden until logged in) -->
+    <div id="dashboard" class="hidden">
+      <section>
+        <h2>Thống kê</h2>
+        <div id="stats-status" class="status info"></div>
+        <div id="stats-total" class="total-line"></div>
+        <div id="stats-table"></div>
+      </section>
+
+      <section>
+        <h2>Giá Group</h2>
+        <div id="prices-status" class="status info"></div>
+        <div id="prices-table"></div>
+      </section>
+
+      <section>
+        <h2>Bài viết</h2>
+        <div id="posts-status" class="status info"></div>
+        <div id="posts-table"></div>
+      </section>
+    </div>
+  </main>
+
+  <script src="app.js" type="module"></script>
+</body>
+</html>
