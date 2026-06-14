@@ -440,6 +440,19 @@ dataRouter.post("/comments", asyncHandler(async (req, res) => {
 
 /* ---------------------------- CONVERSATIONS ---------------------------- */
 
+// Parses a JSON column that mysql2 may hand back either already-parsed (JSON
+// column type) or as a raw string (depending on driver/column flavor). Returns
+// null when empty/invalid so the client always sees a clean object-or-null.
+function parseJsonColumn(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "object") return v;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return null;
+  }
+}
+
 function mapConversationRow(r) {
   return {
     id: r.id,
@@ -448,6 +461,15 @@ function mapConversationRow(r) {
     commentPermalink: r.comment_permalink,
     replies: r.replies ?? [],
     status: r.status,
+    postUrl: r.post_url,
+    groupId: r.group_id,
+    groupName: r.group_name,
+    myComment: r.my_comment,
+    myCommentUrl: r.my_comment_url,
+    postText: r.post_text,
+    draft: parseJsonColumn(r.draft),
+    jobId: r.job_id,
+    lastWatchedAt: r.last_watched_at,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -471,42 +493,79 @@ dataRouter.get("/conversations", asyncHandler(async (req, res) => {
   res.json({ conversations: rows.map(mapConversationRow) });
 }));
 
-// POST /api/conversations — create a conversation owned by the caller.
+// POST /api/conversations — create a conversation owned by the caller. The full
+// rich record the client builds (post context, the user's own comment, the AI
+// draft, watch/job bookkeeping) is persisted so a later GET round-trips it back
+// intact; only the four original fields used to survive.
 dataRouter.post("/conversations", asyncHandler(async (req, res) => {
   const userId = req.userId;
   const c = req.body || {};
   const [result] = await getPool().query(
     `INSERT INTO conversations
-       (post_id, user_id, comment_permalink, replies, status, created_at, updated_at)
-     VALUES (:postId, :userId, :commentPermalink, :replies, :status, NOW(), NOW())`,
+       (post_id, user_id, comment_permalink, replies, status,
+        post_url, group_id, group_name, my_comment, my_comment_url, post_text,
+        draft, job_id, last_watched_at, created_at, updated_at)
+     VALUES
+       (:postId, :userId, :commentPermalink, :replies, :status,
+        :postUrl, :groupId, :groupName, :myComment, :myCommentUrl, :postText,
+        :draft, :jobId, :lastWatchedAt, NOW(), NOW())`,
     {
       postId: c.postId ?? null,
       userId,
       commentPermalink: c.commentPermalink ?? null,
       replies: JSON.stringify(Array.isArray(c.replies) ? c.replies : []),
       status: c.status ?? "watching",
+      postUrl: c.postUrl ?? null,
+      groupId: c.groupId ?? null,
+      groupName: c.groupName ?? null,
+      myComment: c.myComment ?? null,
+      myCommentUrl: c.myCommentUrl ?? null,
+      postText: c.postText ?? null,
+      // draft is an object on the wire; store it as JSON text (null when absent).
+      draft: c.draft != null ? JSON.stringify(c.draft) : null,
+      jobId: c.jobId ?? null,
+      lastWatchedAt: c.lastWatchedAt ?? null,
     }
   );
   res.json({ id: result.insertId });
 }));
 
 // PATCH /api/conversations/:id — merge-update fields on the caller's own row.
+//
+// Updatable columns come from this fixed allow-list (never arbitrary keys from
+// the request body), mirroring the share-prefs/advisories patch handlers. Each
+// entry maps the camelCase wire field to its column and an optional transform
+// for JSON-encoded columns, so adding a field is one table entry.
+const CONVERSATION_PATCH_FIELDS = [
+  { key: "status", col: "status" },
+  { key: "commentPermalink", col: "comment_permalink" },
+  { key: "replies", col: "replies", json: true },
+  { key: "postUrl", col: "post_url" },
+  { key: "groupId", col: "group_id" },
+  { key: "groupName", col: "group_name" },
+  { key: "myComment", col: "my_comment" },
+  { key: "myCommentUrl", col: "my_comment_url" },
+  { key: "postText", col: "post_text" },
+  { key: "draft", col: "draft", json: true },
+  { key: "jobId", col: "job_id" },
+  { key: "lastWatchedAt", col: "last_watched_at" },
+];
+
 dataRouter.patch("/conversations/:id", asyncHandler(async (req, res) => {
   const userId = req.userId;
   const patch = req.body || {};
   const sets = ["updated_at = NOW()"];
   const params = { id: req.params.id, userId };
-  if (patch.status !== undefined) {
-    sets.push("status = :status");
-    params.status = patch.status;
-  }
-  if (patch.commentPermalink !== undefined) {
-    sets.push("comment_permalink = :commentPermalink");
-    params.commentPermalink = patch.commentPermalink;
-  }
-  if (patch.replies !== undefined) {
-    sets.push("replies = :replies");
-    params.replies = JSON.stringify(patch.replies);
+  // Column names here come from the fixed allow-list above, never user input, so
+  // interpolating the SET clause is safe; values stay bound via placeholders.
+  for (const f of CONVERSATION_PATCH_FIELDS) {
+    if (patch[f.key] === undefined) continue;
+    sets.push(`${f.col} = :${f.key}`);
+    if (f.json) {
+      params[f.key] = patch[f.key] != null ? JSON.stringify(patch[f.key]) : null;
+    } else {
+      params[f.key] = patch[f.key];
+    }
   }
   const [result] = await getPool().query(
     `UPDATE conversations SET ${sets.join(", ")} WHERE id = :id AND user_id = :userId`,

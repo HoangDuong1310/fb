@@ -460,6 +460,18 @@ async function createConversation(conv) {
       commentPermalink: record.commentPermalink ?? record.myCommentUrl,
       replies: record.replies,
       status: record.status,
+      // Rich context fields must reach the server too, otherwise getConversations
+      // / getConversation drop them and callers (dashboard, advisory, background)
+      // lose myComment / postText / draft / etc. on round-trip.
+      postUrl: record.postUrl,
+      groupId: record.groupId,
+      groupName: record.groupName,
+      myComment: record.myComment,
+      myCommentUrl: record.myCommentUrl,
+      postText: record.postText,
+      draft: record.draft,
+      jobId: record.jobId,
+      lastWatchedAt: record.lastWatchedAt,
     }),
   });
   return { ...record, id: body?.id };
