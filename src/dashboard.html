@@ -63,6 +63,18 @@
             <svg viewBox="0 0 24 24"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM7 9h10v2H7V9zm0 4h7v2H7v-2z"/></svg>
             <span>Tư vấn AI</span>
           </button>
+          <button class="nav-item" data-view="groupprices">
+            <svg viewBox="0 0 24 24"><path d="M3 3h2v18H3V3zm4 10h2v8H7v-8zm4-6h2v14h-2V7zm4 3h2v11h-2V10zm4-5h2v16h-2V5z"/></svg>
+            <span>Giá Group</span>
+          </button>
+          <button class="nav-item" data-view="keywords">
+            <svg viewBox="0 0 24 24"><path d="M12.65 10A5.99 5.99 0 0 0 7 6c-3.31 0-6 2.69-6 6s2.69 6 6 6a5.99 5.99 0 0 0 5.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>
+            <span>Từ khóa học</span>
+          </button>
+          <button class="nav-item" data-view="sharing">
+            <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>
+            <span>Cài đặt chia sẻ</span>
+          </button>
           <button class="nav-item" data-view="settings">
             <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
             <span>Cài đặt</span>
@@ -493,6 +505,105 @@
             </div>
             <p class="hint">An toàn: AI chỉ soạn NHÁP phản hồi. Bạn duyệt thì mới đăng lên Facebook.</p>
             <div id="conversationList" class="conversation-list"></div>
+          </div>
+        </section>
+
+        <!-- ============ GIÁ GROUP ============ -->
+        <section class="view" data-view="groupprices">
+          <div class="panel">
+            <div class="panel-head">
+              <div class="adv-head-left">
+                <h2>Mặt bằng giá trích từ group</h2>
+              </div>
+              <button id="btnExtractPrices" class="btn primary">Trích xuất giá</button>
+            </div>
+            <div class="adv-controls">
+              <label class="field">
+                <span>Nhóm</span>
+                <select id="gpGroupFilter" class="select"><option value="">Tất cả nhóm</option></select>
+              </label>
+              <label class="field">
+                <span>Danh mục</span>
+                <input id="gpCatFilter" type="text" placeholder="Tất cả danh mục" />
+              </label>
+              <label class="field">
+                <span>Tình trạng</span>
+                <select id="gpCondFilter" class="select">
+                  <option value="">Tất cả</option>
+                  <option value="mới">Mới</option>
+                  <option value="cũ">Cũ</option>
+                  <option value="likenew">Like new</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Giá từ</span>
+                <input id="gpPriceMin" type="number" min="0" step="1000" placeholder="0" />
+              </label>
+              <label class="field">
+                <span>Giá đến</span>
+                <input id="gpPriceMax" type="number" min="0" step="1000" placeholder="∞" />
+              </label>
+              <div class="seg" id="gpMineToggle">
+                <button class="seg-btn active" data-mine="0">Tất cả (chung)</button>
+                <button class="seg-btn" data-mine="1">Chỉ của tôi</button>
+              </div>
+            </div>
+            <p class="hint">
+              Giá được AI trích từ các bài rao bán đã crawl, gom theo sản phẩm và sắp xếp thấp→cao.
+              Icon 🌐/🔒 chỉ hiển thị trạng thái chia sẻ — chỉnh ở tab "Cài đặt chia sẻ".
+            </p>
+            <div id="groupPriceList" class="gp-list"></div>
+          </div>
+        </section>
+
+        <!-- ============ TỪ KHÓA HỌC ============ -->
+        <section class="view" data-view="keywords">
+          <div class="panel">
+            <div class="panel-head">
+              <div class="adv-head-left">
+                <h2>Từ khóa học</h2>
+              </div>
+            </div>
+            <div class="adv-controls">
+              <label class="field">
+                <span>Thêm từ khóa "bán"</span>
+                <input id="kwNewWord" type="text" placeholder="ví dụ: thanh lý, cần bán, pass lại" />
+              </label>
+              <button id="btnAddKeyword" class="btn primary">Thêm từ khóa</button>
+            </div>
+            <p class="hint">
+              Từ khóa "bán" giúp lọc bài rao bán ở phễu trích giá. AI có thể tự học thêm từ khóa mới
+              (gắn nhãn "mới bởi AI") trong lúc trích xuất; bạn có thể bật/tắt hoặc xóa.
+            </p>
+            <div id="keywordList" class="kw-list"></div>
+          </div>
+        </section>
+
+        <!-- ============ CÀI ĐẶT CHIA SẺ ============ -->
+        <section class="view" data-view="sharing">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Cài đặt chia sẻ</h2>
+            </div>
+            <p id="sharingAuthHint" class="hint" hidden></p>
+            <div class="form">
+              <label class="switch-row" for="shareCrawled">
+                <input type="checkbox" id="shareCrawled" />
+                <span class="switch-text"><b>Chia sẻ bài đã crawl</b><small>Cho người dùng khác xem các bài bạn đã crawl được. Tắt để giữ riêng tư.</small></span>
+              </label>
+              <label class="switch-row" for="shareCommented">
+                <input type="checkbox" id="shareCommented" />
+                <span class="switch-text"><b>Chia sẻ bài/bình luận của tôi</b><small>Cho người khác xem các bài và bình luận do bạn tạo. Tắt để giữ riêng tư.</small></span>
+              </label>
+              <label class="switch-row" for="shareGroupPrices">
+                <input type="checkbox" id="shareGroupPrices" />
+                <span class="switch-text"><b>Chia sẻ giá trích từ group</b><small>Đóng góp dòng giá bạn trích được vào mặt bằng giá chung. Tắt để giữ riêng tư.</small></span>
+              </label>
+            </div>
+            <p class="hint">
+              Mỗi công tắc khi đổi sẽ áp dụng cho CẢ dữ liệu hiện có (không chỉ dữ liệu mới).
+              Đây là nơi duy nhất chỉnh chế độ chia sẻ.
+            </p>
           </div>
         </section>
 

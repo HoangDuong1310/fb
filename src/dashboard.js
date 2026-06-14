@@ -120,6 +120,20 @@ import {
   clearAllPrices,
   clearMyStoreData,
 } from "./dashboard/views/settings.js";
+import {
+  reloadGroupPrices,
+  applyGroupPriceFilter,
+  setGroupPriceMine,
+  runExtraction,
+  explainShareIcon,
+} from "./dashboard/views/groupprices.js";
+import {
+  reloadKeywords,
+  addKeywordUI,
+  toggleKeyword,
+  deleteKeyword,
+} from "./dashboard/views/keywords.js";
+import { loadSharingView, saveSharePref } from "./dashboard/views/sharing.js";
 
 /* ============================ SỰ KIỆN UI ============================== */
 function bindEvents() {
@@ -429,6 +443,58 @@ function bindEvents() {
     $("setClearMystore").addEventListener("click", clearMyStoreData);
   if ($("setClearAdvisories"))
     $("setClearAdvisories").addEventListener("click", clearAllAdvisories);
+
+  // Giá Group: trích xuất, lọc, toggle "Chỉ của tôi", icon chia sẻ (read-only).
+  if ($("btnExtractPrices"))
+    $("btnExtractPrices").addEventListener("click", runExtraction);
+  if ($("gpGroupFilter"))
+    $("gpGroupFilter").addEventListener("change", applyGroupPriceFilter);
+  if ($("gpCatFilter"))
+    $("gpCatFilter").addEventListener("input", applyGroupPriceFilter);
+  if ($("gpCondFilter"))
+    $("gpCondFilter").addEventListener("change", applyGroupPriceFilter);
+  if ($("gpPriceMin"))
+    $("gpPriceMin").addEventListener("input", applyGroupPriceFilter);
+  if ($("gpPriceMax"))
+    $("gpPriceMax").addEventListener("input", applyGroupPriceFilter);
+  if ($("gpMineToggle"))
+    $("gpMineToggle").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-mine]");
+      if (!btn) return;
+      setGroupPriceMine(btn.dataset.mine === "1");
+    });
+  if ($("groupPriceList"))
+    $("groupPriceList").addEventListener("click", (e) => {
+      // Icon 🌐/🔒 chỉ hiển thị trạng thái — bấm thì nhắc chỗ chỉnh chia sẻ.
+      if (e.target.closest("[data-share-info]")) explainShareIcon();
+    });
+
+  // Từ khóa học: thêm thủ công + bật/tắt + xóa (event delegation trên bảng).
+  if ($("btnAddKeyword"))
+    $("btnAddKeyword").addEventListener("click", addKeywordUI);
+  if ($("kwNewWord"))
+    $("kwNewWord").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") addKeywordUI();
+    });
+  if ($("keywordList")) {
+    $("keywordList").addEventListener("change", (e) => {
+      const tog = e.target.closest("[data-kw-toggle]");
+      if (!tog) return;
+      const tr = tog.closest("tr[data-id]");
+      if (tr) toggleKeyword(tr.dataset.id, tog.checked);
+    });
+    $("keywordList").addEventListener("click", (e) => {
+      const del = e.target.closest("[data-kw-del]");
+      if (!del) return;
+      const tr = del.closest("tr[data-id]");
+      if (tr) deleteKeyword(tr.dataset.id);
+    });
+  }
+
+  // Cài đặt chia sẻ: mỗi công tắc lưu riêng khi đổi.
+  ["shareCrawled", "shareCommented", "shareGroupPrices"].forEach((id) => {
+    if ($(id)) $(id).addEventListener("change", () => saveSharePref(id));
+  });
 }
 
 async function onJobAction(e, type) {
@@ -558,6 +624,15 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "CONVERSATION_UPDATE") {
     const active = document.querySelector(".nav-item.active");
     if (active && active.dataset.view === "conversations") reloadConversations();
+  }
+  // Service worker báo 401 (hết phiên / chưa đăng nhập): nạp lại view web hiện
+  // hành để hiện trạng thái "Cần đăng nhập" thay vì dữ liệu trống gây hiểu nhầm.
+  if (msg.type === "AUTH_REQUIRED") {
+    const active = document.querySelector(".nav-item.active");
+    const view = active && active.dataset.view;
+    if (view === "groupprices") reloadGroupPrices();
+    else if (view === "keywords") reloadKeywords();
+    else if (view === "sharing") loadSharingView();
   }
 });
 

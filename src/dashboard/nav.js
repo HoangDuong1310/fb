@@ -17,6 +17,9 @@ import { loadAdvisoryView } from "./views/advisory.js";
 import { loadConversationsView } from "./views/conversations.js";
 import { loadAIConfig } from "./views/ai.js";
 import { loadSettings } from "./views/settings.js";
+import { loadGroupPricesView } from "./views/groupprices.js";
+import { loadKeywordsView } from "./views/keywords.js";
+import { loadSharingView } from "./views/sharing.js";
 
 export const VIEW_META = {
   overview: ["Tổng quan", "Theo dõi hiệu quả khai thác nhóm của bạn."],
@@ -30,6 +33,9 @@ export const VIEW_META = {
   build: ["Build AI", "Nhập ngân sách + nhu cầu, AI dựng cấu hình tốt nhất từ kho của bạn."],
   advisory: ["Tư vấn AI", "Tạo nháp chào giá/hỗ trợ khách từ bài đã crawl. Bạn duyệt thì mới gửi."],
   conversations: ["Hội thoại", "Theo dõi phản hồi dưới bình luận của bạn, AI soạn nháp trả lời. Bạn duyệt thì mới đăng."],
+  groupprices: ["Giá Group", "Mặt bằng giá trích từ bài rao bán trong nhóm, gom theo sản phẩm thấp→cao."],
+  keywords: ["Từ khóa học", "Quản lý từ khóa AI đã học để lọc bài rao bán khi trích giá group."],
+  sharing: ["Cài đặt chia sẻ", "Bật/tắt chia sẻ dữ liệu của bạn cho người dùng khác xem."],
   settings: ["Cài đặt", "Quản lý cấu hình crawl, tự động, AI và dữ liệu của tiện ích."],
 };
 
@@ -53,5 +59,8 @@ export function switchView(view) {
   if (view === "build") loadBuildView();
   if (view === "advisory") loadAdvisoryView();
   if (view === "conversations") loadConversationsView();
+  if (view === "groupprices") loadGroupPricesView();
+  if (view === "keywords") loadKeywordsView();
+  if (view === "sharing") loadSharingView();
   if (view === "settings") loadSettings();
 }

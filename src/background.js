@@ -64,6 +64,7 @@ import {
   processReplyWatch,
   initReplyWatch,
 } from "./crawl.js";
+import { runGroupPriceExtraction } from "./group-prices.js";
 
 /* ----------------------- XÁC THỰC WEB BACKEND (state) ------------------ */
 
@@ -655,6 +656,119 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         })
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true; // giữ SW sống tới khi đóng tab xong
+    }
+
+    // ------------------- GIÁ GROUP / TỪ KHÓA / CHIA SẺ (web backend) ------
+    // Tất cả đi qua API.apiFetch (token JWT chỉ sống ở service worker này).
+    // Backend trả JSON KHÔNG bọc {ok}, nên ta tự gắn ok:true + trộn dữ liệu.
+    // 401 -> apiFetch tự kích hoạt luồng AUTH_REQUIRED; ở đây trả ok:false.
+
+    // Danh sách dòng giá group đã trích (lọc chia sẻ phía server theo người gọi).
+    // filters.mineOnly = 1 -> chỉ của tôi; mặc định gồm cả dòng người khác chia sẻ.
+    case "GET_GROUP_PRICES": {
+      (async () => {
+        await readyPromise;
+        const f = (msg.filters && typeof msg.filters === "object") ? msg.filters : {};
+        const qs = new URLSearchParams();
+        if (f.mineOnly) qs.set("mineOnly", "1");
+        if (f.groupId) qs.set("groupId", String(f.groupId));
+        if (f.category) qs.set("category", String(f.category));
+        if (f.condition) qs.set("condition", String(f.condition));
+        if (f.priceMin != null) qs.set("priceMin", String(f.priceMin));
+        if (f.priceMax != null) qs.set("priceMax", String(f.priceMax));
+        const q = qs.toString();
+        const data = await API.apiFetch("/api/group-prices" + (q ? "?" + q : ""));
+        sendResponse({ ok: true, groupPrices: (data && data.groupPrices) || [] });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Chạy phễu trích giá (nạp keywords + posts + AI + lưu) — toàn bộ ở SW vì
+    // cần token + IndexedDB. Trả về { processed, inserted, newKeywords }.
+    case "RUN_GROUP_PRICE_EXTRACTION": {
+      (async () => {
+        await readyPromise;
+        const result = await runGroupPriceExtraction();
+        sendResponse({ ok: true, ...result });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Danh sách từ khóa đã học (lọc theo type nếu có).
+    case "GET_KEYWORDS": {
+      (async () => {
+        await readyPromise;
+        const type = String(msg.type || "").trim();
+        const data = await API.apiFetch("/api/keywords" + (type ? "?type=" + encodeURIComponent(type) : ""));
+        sendResponse({ ok: true, keywords: (data && data.keywords) || [] });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Thêm từ khóa thủ công (idempotent ở backend theo UNIQUE(keyword,type)).
+    case "ADD_KEYWORD": {
+      (async () => {
+        await readyPromise;
+        await API.apiFetch("/api/keywords", {
+          method: "POST",
+          body: JSON.stringify({
+            keyword: msg.keyword,
+            type: msg.type || "sell",
+            addedBy: "user",
+            enabled: msg.enabled === false ? false : true,
+          }),
+        });
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Bật/tắt hoặc đổi tên một từ khóa.
+    case "UPDATE_KEYWORD": {
+      (async () => {
+        await readyPromise;
+        await API.apiFetch("/api/keywords/" + encodeURIComponent(msg.id), {
+          method: "PATCH",
+          body: JSON.stringify(msg.patch || {}),
+        });
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Xóa một từ khóa.
+    case "DELETE_KEYWORD": {
+      (async () => {
+        await readyPromise;
+        await API.apiFetch("/api/keywords/" + encodeURIComponent(msg.id), {
+          method: "DELETE",
+        });
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Ba công tắc chia sẻ tổng của người gọi.
+    case "GET_SHARE_PREFS": {
+      (async () => {
+        await readyPromise;
+        const data = await API.apiFetch("/api/me/share-prefs");
+        sendResponse({ ok: true, ...(data || {}) });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Đổi một/nhiều công tắc chia sẻ (backend cascade xuống dòng hiện có).
+    case "SET_SHARE_PREFS": {
+      (async () => {
+        await readyPromise;
+        const data = await API.apiFetch("/api/me/share-prefs", {
+          method: "PATCH",
+          body: JSON.stringify(msg.patch || {}),
+        });
+        sendResponse({ ok: true, ...(data || {}) });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
     }
 
     // ----------------------- XÁC THỰC WEB BACKEND (JWT) ------------------
