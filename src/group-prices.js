@@ -116,14 +116,25 @@ export function verifyExtraction(post, items) {
   // Tập giá trị VND xuất hiện trong text bài (chuẩn để so khớp).
   const postVnd = new Set(extractMoneyFigures(text));
   if (postVnd.size === 0) return [];
-  return items.filter((it) => {
-    if (!it) return false;
+  const out = [];
+  for (const it of items) {
+    if (!it) continue;
     const candidates = priceToVndSet(it.price);
+    let matched = null;
     for (const v of candidates) {
-      if (postVnd.has(v)) return true;
+      if (postVnd.has(v)) {
+        matched = v;
+        break;
+      }
     }
-    return false;
-  });
+    if (matched != null) {
+      // QUAN TRỌNG: trả GIÁ TRỊ VND đã chuẩn hóa (số nguyên) thay vì chuỗi thô
+      // AI trả về. Cột group_prices.price là BIGINT; nếu ghi "5.000.000" MySQL
+      // sẽ cắt còn 5, phá vỡ ORDER BY/lọc giá và khóa idempotent uq_gp_line.
+      out.push({ ...it, price: matched });
+    }
+  }
+  return out;
 }
 
 /* =============================== TẦNG 3 ================================== */

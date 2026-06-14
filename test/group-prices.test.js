@@ -261,6 +261,10 @@ test("runGroupPriceExtraction: end-to-end with injected mocks, verification appl
   assert.equal(row.postId, "p1");
   assert.equal(row.name, "Laptop Dell");
   assert.equal(row.parser, "ai");
+  // price must be the normalized VND INTEGER (not the raw "5.000.000" string),
+  // so it stores correctly in the BIGINT column and keys uq_gp_line correctly.
+  assert.strictEqual(row.price, 5000000, "price persisted as VND integer");
+  assert.equal(typeof row.price, "number", "price is a number, not a string");
 
   // New keyword learned with addedBy:'ai', enabled:true.
   assert.equal(calls.keywordPosts.length, 1);
