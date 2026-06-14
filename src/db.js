@@ -1,389 +1,191 @@
 /**
- * db.js — Lớp truy cập IndexedDB cho extension.
+ * db.js — Lớp truy cập dữ liệu cho extension, nay là MỘT API CLIENT mỏng.
  *
- * Được nạp vào service worker (background.js) thông qua importScripts(),
- * nên các hàm được gắn vào `self` để background dùng chung.
+ * Trước đây dùng IndexedDB cục bộ; nay mọi dữ liệu CHIA SẺ (posts, groups,
+ * products, sources, advisories, conversations...) đi qua web backend bằng
+ * apiFetch() trong api.js (gắn Bearer token, parse JSON, ném khi non-2xx).
  *
- * Schema (version 4):
- *  - DB:    "fb_group_crawler"
- *  - Store: "posts"  keyPath = "postId"
- *      index "by_group"     -> groupId
- *      index "by_crawledAt" -> crawledAt
- *      index "by_time"      -> timestamp
- *  - Store: "groups" keyPath = "groupId"   (nhóm đã tham gia / theo dõi)
- *      index "by_name" -> groupName
- *  - Store: "jobs"   keyPath = "id" (autoIncrement)  (hàng đợi đăng bài / bình luận)
- *      index "by_status" -> status
- *      index "by_type"   -> type
- *  - Store: "products" keyPath = "productId"  (kho sản phẩm/giá để AI tư vấn bán hàng)
- *      index "by_source"   -> source     (tên nguồn: hoanghapc/hacom/...)
- *      index "by_category" -> category   (cpu/vga/ram/...)
- *      index "by_updatedAt"-> updatedAt
- *  - Store: "sources" keyPath = "id"  (cấu hình nguồn dữ liệu: URL API nội bộ + ánh xạ trường)
- *  - Store: "advisories" keyPath = "postId"  (nháp tư vấn/chào giá do AI soạn cho từng bài)
- *      index "by_status"    -> status   (pending/approved/sent/rejected)
- *      index "by_group"     -> groupId
- *      index "by_createdAt" -> createdAt
+ * NGOẠI LỆ — JOBS: hàng đợi job (đăng bài/bình luận) là TRẠNG THÁI TỰ ĐỘNG HOÁ
+ * CỤC BỘ của từng thiết bị, không chia sẻ. Vì vậy job vẫn nằm trong
+ * chrome.storage.local (KHÔNG gọi API). Khi chạy ngoài extension (test bằng
+ * plain Node, không có `chrome`) thì rơi về một store in-memory để module nạp
+ * được mà không crash.
  *
- * Chính các key của store "posts" là tập "ID đã thấy" dùng để lọc bài mới.
+ * QUAN TRỌNG: TÊN HÀM XUẤT RA & HÌNH DẠNG GIÁ TRỊ TRẢ VỀ được GIỮ NGUYÊN để
+ * crawl.js / advisory.js / prices.js / background.js / dashboard views không
+ * phải đổi gì. Tiêu thụ qua `import * as DB from "./db.js"`.
+ *
+ * Module ES (import/export), khớp phong cách util.js / api.js.
  */
 
-const DB_NAME = "fb_group_crawler";
-const DB_VERSION = 5;
-const STORE_POSTS = "posts";
-const STORE_GROUPS = "groups";
-const STORE_JOBS = "jobs";
-const STORE_PRODUCTS = "products";
-const STORE_SOURCES = "sources";
-const STORE_ADVISORIES = "advisories";
-const STORE_CONVERSATIONS = "conversations";
+import { apiFetch } from "./api.js";
 
-let _dbPromise = null;
+/* ----------------------------- Helpers ---------------------------------- */
 
-function openDB() {
-  if (_dbPromise) return _dbPromise;
-
-  _dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-
-    req.onupgradeneeded = (event) => {
-      const db = event.target.result;
-
-      if (!db.objectStoreNames.contains(STORE_POSTS)) {
-        const store = db.createObjectStore(STORE_POSTS, { keyPath: "postId" });
-        store.createIndex("by_group", "groupId", { unique: false });
-        store.createIndex("by_crawledAt", "crawledAt", { unique: false });
-        store.createIndex("by_time", "timestamp", { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(STORE_GROUPS)) {
-        const g = db.createObjectStore(STORE_GROUPS, { keyPath: "groupId" });
-        g.createIndex("by_name", "groupName", { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(STORE_JOBS)) {
-        const j = db.createObjectStore(STORE_JOBS, {
-          keyPath: "id",
-          autoIncrement: true,
-        });
-        j.createIndex("by_status", "status", { unique: false });
-        j.createIndex("by_type", "type", { unique: false });
-      }
-
-      // v3: kho sản phẩm/giá để AI tư vấn bán hàng.
-      if (!db.objectStoreNames.contains(STORE_PRODUCTS)) {
-        const p = db.createObjectStore(STORE_PRODUCTS, { keyPath: "productId" });
-        p.createIndex("by_source", "source", { unique: false });
-        p.createIndex("by_category", "category", { unique: false });
-        p.createIndex("by_updatedAt", "updatedAt", { unique: false });
-      }
-
-      // v3: cấu hình nguồn dữ liệu (URL API nội bộ + cách ánh xạ trường).
-      if (!db.objectStoreNames.contains(STORE_SOURCES)) {
-        db.createObjectStore(STORE_SOURCES, { keyPath: "id" });
-      }
-
-      // v4: nháp tư vấn/chào giá do AI soạn cho từng bài. Khoá theo postId để
-      // 1 bài chỉ có 1 nháp (dedupe tự nhiên: không trả lời trùng).
-      if (!db.objectStoreNames.contains(STORE_ADVISORIES)) {
-        const adv = db.createObjectStore(STORE_ADVISORIES, { keyPath: "postId" });
-        adv.createIndex("by_status", "status", { unique: false });
-        adv.createIndex("by_group", "groupId", { unique: false });
-        adv.createIndex("by_createdAt", "createdAt", { unique: false });
-      }
-
-      // v5: HỘI THOẠI bình luận. Mỗi lần ta đăng một bình luận thành công -> tạo
-      // 1 conversation gắn với permalink bài + permalink bình luận của ta, kèm
-      // mảng `replies` (các phản hồi của người khác dưới bình luận đó). Theo dõi
-      // nền định kỳ sẽ MERGE reply mới vào mảng này (không ghi đè). CHỈ THÊM store
-      // mới — không đụng tới bất kỳ store cũ nào, nên dữ liệu cũ được bảo toàn.
-      if (!db.objectStoreNames.contains(STORE_CONVERSATIONS)) {
-        const cv = db.createObjectStore(STORE_CONVERSATIONS, {
-          keyPath: "id",
-          autoIncrement: true,
-        });
-        cv.createIndex("by_status", "status", { unique: false });
-        cv.createIndex("by_postId", "postId", { unique: false });
-        cv.createIndex("by_updatedAt", "updatedAt", { unique: false });
-        cv.createIndex("by_jobId", "jobId", { unique: false });
-      }
-    };
-
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-
-  return _dbPromise;
-}
-
-function tx(store, mode) {
-  return openDB().then((db) => {
-    const transaction = db.transaction(store, mode);
-    return transaction.objectStore(store);
-  });
+/**
+ * Dựng query string từ object, BỎ QUA các giá trị null/undefined/"".
+ * Trả về "" khi không có tham số nào (để URL giữ nguyên không có dấu "?").
+ */
+function qs(params) {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v === undefined || v === null || v === "") continue;
+    usp.append(k, String(v));
+  }
+  const s = usp.toString();
+  return s ? "?" + s : "";
 }
 
 /* ============================ POSTS ====================================== */
 
 /**
- * Lưu (hoặc cập nhật) nhiều bài viết. Trả về số bài MỚI thực sự được thêm.
+ * Lưu (hoặc cập nhật) nhiều bài viết. Trả về { added, updated } từ server.
  * Bài đã tồn tại (cùng postId) sẽ được cập nhật nhưng không tính là mới.
  */
 async function savePosts(posts) {
   if (!Array.isArray(posts) || posts.length === 0) {
     return { added: 0, updated: 0 };
   }
-
-  const db = await openDB();
-
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_POSTS, "readwrite");
-    const store = transaction.objectStore(STORE_POSTS);
-
-    let added = 0;
-    let updated = 0;
-    let pending = posts.length;
-
-    for (const post of posts) {
-      if (!post || !post.postId) {
-        pending -= 1;
-        continue;
-      }
-      const getReq = store.get(post.postId);
-      getReq.onsuccess = () => {
-        const existing = getReq.result;
-        if (existing) {
-          updated += 1;
-          const merged = {
-            ...existing,
-            ...post,
-            crawledAt: existing.crawledAt,
-            updatedAt: Date.now(),
-          };
-          store.put(merged);
-        } else {
-          added += 1;
-          store.put({
-            ...post,
-            crawledAt: post.crawledAt || Date.now(),
-            updatedAt: Date.now(),
-          });
-        }
-        pending -= 1;
-        if (pending === 0) resolve({ added, updated });
-      };
-      getReq.onerror = () => {
-        pending -= 1;
-        if (pending === 0) resolve({ added, updated });
-      };
-    }
-
-    if (pending === 0) resolve({ added, updated });
-    transaction.onerror = () => reject(transaction.error);
+  const body = await apiFetch("/api/posts", {
+    method: "POST",
+    body: JSON.stringify({ posts }),
   });
+  return { added: body?.added || 0, updated: body?.updated || 0 };
 }
 
 /**
- * Lấy tập postId đã lưu (toàn bộ hoặc theo nhóm) dưới dạng mảng string.
- * Dùng làm danh sách "đã thấy" để content script bỏ qua bài cũ.
+ * Lấy danh sách postId đã lưu (toàn bộ hoặc theo nhóm) dưới dạng MẢNG string.
+ * Dùng làm danh sách "đã thấy" để content script bỏ qua bài cũ (caller bọc
+ * thành Set). GIỮ shape: trả về mảng.
  */
 async function getKnownIds(groupId) {
-  const db = await openDB();
-
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_POSTS, "readonly");
-    const store = transaction.objectStore(STORE_POSTS);
-
-    if (groupId) {
-      const index = store.index("by_group");
-      const ids = [];
-      const req = index.openKeyCursor(IDBKeyRange.only(groupId));
-      req.onsuccess = () => {
-        const cursor = req.result;
-        if (cursor) {
-          ids.push(cursor.primaryKey);
-          cursor.continue();
-        } else {
-          resolve(ids);
-        }
-      };
-      req.onerror = () => reject(req.error);
-    } else {
-      const req = store.getAllKeys();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    }
-  });
+  const body = await apiFetch("/api/posts/known-ids" + qs({ groupId }));
+  return Array.isArray(body?.ids) ? body.ids : [];
 }
 
-/** Lấy toàn bộ bài viết (tùy chọn lọc theo nhóm), sắp theo thời gian crawl giảm dần. */
+/** Lấy toàn bộ bài viết (tùy chọn lọc theo nhóm). Trả về MẢNG (server sort sẵn). */
 async function getAllPosts(groupId) {
-  const store = await tx(STORE_POSTS, "readonly");
-
-  return new Promise((resolve, reject) => {
-    const req = store.getAll();
-    req.onsuccess = () => {
-      let result = req.result || [];
-      if (groupId) result = result.filter((p) => p.groupId === groupId);
-      result.sort((a, b) => (b.crawledAt || 0) - (a.crawledAt || 0));
-      resolve(result);
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const body = await apiFetch("/api/posts" + qs({ groupId }));
+  return Array.isArray(body?.posts) ? body.posts : [];
 }
 
-/** Thống kê: tổng số bài + số bài theo từng nhóm. */
+/** Thống kê: { total, groups:[{groupId, groupName, count}] } — giữ đúng shape cũ. */
 async function getStats() {
-  const posts = await getAllPosts();
-  const byGroup = {};
-  for (const p of posts) {
-    const key = p.groupId || "unknown";
-    if (!byGroup[key]) {
-      byGroup[key] = { groupId: key, groupName: p.groupName || key, count: 0 };
-    }
-    byGroup[key].count += 1;
-    if (p.groupName) byGroup[key].groupName = p.groupName;
-  }
-  return { total: posts.length, groups: Object.values(byGroup) };
+  const body = await apiFetch("/api/stats");
+  return {
+    total: body?.total || 0,
+    groups: Array.isArray(body?.groups) ? body.groups : [],
+  };
 }
 
-/** Xóa toàn bộ dữ liệu (hoặc theo nhóm). Trả về số bài đã xóa. */
+/** Xóa bài của CHÍNH user (hoặc theo nhóm). Trả về SỐ bài đã xóa. */
 async function clearPosts(groupId) {
-  const db = await openDB();
-
-  if (!groupId) {
-    return new Promise((resolve, reject) => {
-      const transaction = db.transaction(STORE_POSTS, "readwrite");
-      const store = transaction.objectStore(STORE_POSTS);
-      const countReq = store.count();
-      countReq.onsuccess = () => {
-        const n = countReq.result;
-        const clearReq = store.clear();
-        clearReq.onsuccess = () => resolve(n);
-        clearReq.onerror = () => reject(clearReq.error);
-      };
-      countReq.onerror = () => reject(countReq.error);
-    });
-  }
-
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_POSTS, "readwrite");
-    const store = transaction.objectStore(STORE_POSTS);
-    const index = store.index("by_group");
-    let deleted = 0;
-    const req = index.openCursor(IDBKeyRange.only(groupId));
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (cursor) {
-        cursor.delete();
-        deleted += 1;
-        cursor.continue();
-      } else {
-        resolve(deleted);
-      }
-    };
-    req.onerror = () => reject(req.error);
+  const body = await apiFetch("/api/posts" + qs({ groupId }), {
+    method: "DELETE",
   });
+  return body?.deleted || 0;
 }
 
 /* ============================ GROUPS ===================================== */
 
-/** Thêm/cập nhật một nhóm. Giữ nguyên addedAt nếu đã có. */
+/** Thêm/cập nhật MỘT nhóm. Trả về bản ghi nhóm (best-effort, echo input). */
 async function saveGroup(group) {
   if (!group || !group.groupId) throw new Error("Thiếu groupId.");
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_GROUPS, "readwrite");
-    const store = transaction.objectStore(STORE_GROUPS);
-    const getReq = store.get(group.groupId);
-    getReq.onsuccess = () => {
-      const existing = getReq.result || {};
-      const merged = {
-        autoCrawl: false,
-        tags: [],
-        note: "",
-        ...existing,
-        ...group,
-        addedAt: existing.addedAt || Date.now(),
-        updatedAt: Date.now(),
-      };
-      const putReq = store.put(merged);
-      putReq.onsuccess = () => resolve(merged);
-      putReq.onerror = () => reject(putReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
+  await apiFetch("/api/groups", {
+    method: "POST",
+    body: JSON.stringify({ groups: [group] }),
   });
+  return { ...group };
 }
 
-/** Lưu nhiều nhóm (dùng khi quét nhóm đã tham gia). Trả về {added, updated}. */
+/** Lưu nhiều nhóm. Trả về { added, updated } từ server. */
 async function saveGroups(groups) {
   if (!Array.isArray(groups) || !groups.length) return { added: 0, updated: 0 };
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_GROUPS, "readwrite");
-    const store = transaction.objectStore(STORE_GROUPS);
-    let added = 0;
-    let updated = 0;
-    let pending = groups.length;
-    for (const g of groups) {
-      if (!g || !g.groupId) {
-        pending -= 1;
-        continue;
-      }
-      const getReq = store.get(g.groupId);
-      getReq.onsuccess = () => {
-        const existing = getReq.result;
-        if (existing) {
-          updated += 1;
-          store.put({ ...existing, ...g, addedAt: existing.addedAt, updatedAt: Date.now() });
-        } else {
-          added += 1;
-          store.put({ autoCrawl: false, tags: [], note: "", ...g, addedAt: Date.now(), updatedAt: Date.now() });
-        }
-        pending -= 1;
-        if (pending === 0) resolve({ added, updated });
-      };
-      getReq.onerror = () => {
-        pending -= 1;
-        if (pending === 0) resolve({ added, updated });
-      };
-    }
-    if (pending === 0) resolve({ added, updated });
-    transaction.onerror = () => reject(transaction.error);
+  const body = await apiFetch("/api/groups", {
+    method: "POST",
+    body: JSON.stringify({ groups }),
   });
+  return { added: body?.added || 0, updated: body?.updated || 0 };
 }
 
-/** Lấy toàn bộ nhóm, kèm số bài đã crawl của từng nhóm. */
+/** Lấy toàn bộ nhóm, kèm postCount (server tính sẵn). Trả về MẢNG. */
 async function getGroups() {
-  const store = await tx(STORE_GROUPS, "readonly");
-  const groups = await new Promise((resolve, reject) => {
-    const req = store.getAll();
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-  const stats = await getStats();
-  const countMap = {};
-  for (const g of stats.groups) countMap[g.groupId] = g.count;
-  return groups
-    .map((g) => ({ ...g, postCount: countMap[g.groupId] || 0 }))
-    .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+  const body = await apiFetch("/api/groups");
+  return Array.isArray(body?.groups) ? body.groups : [];
 }
 
-/** Xóa một nhóm (không xóa bài đã crawl của nhóm đó). */
+/** Xóa một nhóm (không xóa bài đã crawl của nhóm đó). Trả về true. */
 async function deleteGroup(groupId) {
-  const store = await tx(STORE_GROUPS, "readwrite");
-  return new Promise((resolve, reject) => {
-    const req = store.delete(groupId);
-    req.onsuccess = () => resolve(true);
-    req.onerror = () => reject(req.error);
+  await apiFetch("/api/groups/" + encodeURIComponent(groupId), {
+    method: "DELETE",
   });
+  return true;
 }
 
 /* ============================= JOBS ====================================== */
+//
+// Job = trạng thái tự động hoá CỤC BỘ của thiết bị. KHÔNG gọi API. Lưu trong
+// chrome.storage.local; ngoài extension thì dùng store in-memory để test chạy
+// được mà không cần `chrome`.
+
+const JOBS_KEY = "localJobs";
+
+// Store in-memory dự phòng (khi không có chrome.storage). { seq, jobs:[] }.
+let _memJobs = { seq: 1, jobs: [] };
+
+/** Có đang chạy trong môi trường extension có chrome.storage không? */
+function hasChromeStorage() {
+  return (
+    typeof chrome !== "undefined" &&
+    chrome &&
+    chrome.storage &&
+    chrome.storage.local
+  );
+}
+
+/** Đọc toàn bộ store job ({ seq, jobs }). */
+function readJobs() {
+  if (!hasChromeStorage()) {
+    return Promise.resolve(_memJobs);
+  }
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(JOBS_KEY, (r) => {
+        void chrome.runtime.lastError;
+        const v = (r && r[JOBS_KEY]) || { seq: 1, jobs: [] };
+        if (!Array.isArray(v.jobs)) v.jobs = [];
+        if (typeof v.seq !== "number") v.seq = 1;
+        resolve(v);
+      });
+    } catch (e) {
+      resolve({ seq: 1, jobs: [] });
+    }
+  });
+}
+
+/** Ghi toàn bộ store job. */
+function writeJobs(store) {
+  if (!hasChromeStorage()) {
+    _memJobs = store;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set({ [JOBS_KEY]: store }, () => {
+        void chrome.runtime.lastError;
+        resolve();
+      });
+    } catch (e) {
+      resolve();
+    }
+  });
+}
 
 /** Tạo một job (đăng bài / bình luận). Trả về job đã lưu (kèm id). */
 async function createJob(job) {
-  const db = await openDB();
+  const j = job || {};
+  const store = await readJobs();
+  const id = store.seq++;
   const record = {
     type: "post",
     status: "pending",
@@ -391,432 +193,240 @@ async function createJob(job) {
     result: null,
     error: null,
     createdAt: Date.now(),
-    scheduledAt: job.scheduledAt || Date.now(),
-    ...job,
+    scheduledAt: j.scheduledAt || Date.now(),
+    ...j,
+    id,
   };
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_JOBS, "readwrite");
-    const store = transaction.objectStore(STORE_JOBS);
-    const req = store.add(record);
-    req.onsuccess = () => resolve({ ...record, id: req.result });
-    req.onerror = () => reject(req.error);
-  });
+  store.jobs.push(record);
+  await writeJobs(store);
+  return record;
 }
 
-/** Cập nhật một job theo id (gộp các trường truyền vào). */
+/** Cập nhật một job theo id (gộp các trường truyền vào). Trả về job merged hoặc null. */
 async function updateJob(id, patch) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_JOBS, "readwrite");
-    const store = transaction.objectStore(STORE_JOBS);
-    const getReq = store.get(id);
-    getReq.onsuccess = () => {
-      const existing = getReq.result;
-      if (!existing) {
-        resolve(null);
-        return;
-      }
-      const merged = { ...existing, ...patch, updatedAt: Date.now() };
-      const putReq = store.put(merged);
-      putReq.onsuccess = () => resolve(merged);
-      putReq.onerror = () => reject(putReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
-  });
+  const store = await readJobs();
+  const idx = store.jobs.findIndex((j) => j.id === id);
+  if (idx < 0) return null;
+  const merged = { ...store.jobs[idx], ...patch, updatedAt: Date.now() };
+  store.jobs[idx] = merged;
+  await writeJobs(store);
+  return merged;
 }
 
 /** Lấy toàn bộ job (tùy chọn lọc theo type), mới nhất trước. */
 async function getJobs(type) {
-  const store = await tx(STORE_JOBS, "readonly");
-  return new Promise((resolve, reject) => {
-    const req = store.getAll();
-    req.onsuccess = () => {
-      let result = req.result || [];
-      if (type) result = result.filter((j) => j.type === type);
-      result.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      resolve(result);
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const store = await readJobs();
+  let result = store.jobs.slice();
+  if (type) result = result.filter((j) => j.type === type);
+  result.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return result;
 }
 
 /** Lấy các job đang chờ tới hạn chạy (status=pending và scheduledAt<=now). */
 async function getDueJobs(now) {
   const t = now || Date.now();
-  const store = await tx(STORE_JOBS, "readonly");
-  return new Promise((resolve, reject) => {
-    const idx = store.index("by_status");
-    const out = [];
-    const req = idx.openCursor(IDBKeyRange.only("pending"));
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (cursor) {
-        const j = cursor.value;
-        if ((j.scheduledAt || 0) <= t) out.push(j);
-        cursor.continue();
-      } else {
-        out.sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0));
-        resolve(out);
-      }
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const store = await readJobs();
+  const out = store.jobs.filter(
+    (j) => j.status === "pending" && (j.scheduledAt || 0) <= t
+  );
+  out.sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0));
+  return out;
 }
 
-/** Xóa một job theo id. */
+/** Xóa một job theo id. Trả về true. */
 async function deleteJob(id) {
-  const store = await tx(STORE_JOBS, "readwrite");
-  return new Promise((resolve, reject) => {
-    const req = store.delete(id);
-    req.onsuccess = () => resolve(true);
-    req.onerror = () => reject(req.error);
-  });
+  const store = await readJobs();
+  store.jobs = store.jobs.filter((j) => j.id !== id);
+  await writeJobs(store);
+  return true;
 }
 
 /** Xóa các job đã hoàn tất hoặc lỗi (dọn dẹp). Trả về số job đã xóa. */
 async function clearFinishedJobs() {
-  const store = await tx(STORE_JOBS, "readwrite");
-  return new Promise((resolve, reject) => {
-    let deleted = 0;
-    const req = store.openCursor();
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (cursor) {
-        const s = cursor.value.status;
-        if (s === "done" || s === "error") {
-          cursor.delete();
-          deleted += 1;
-        }
-        cursor.continue();
-      } else {
-        resolve(deleted);
-      }
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const store = await readJobs();
+  const before = store.jobs.length;
+  store.jobs = store.jobs.filter(
+    (j) => j.status !== "done" && j.status !== "error"
+  );
+  const deleted = before - store.jobs.length;
+  await writeJobs(store);
+  return deleted;
 }
 
 /* ============================ PRODUCTS =================================== */
 
-/**
- * Lưu (hoặc cập nhật) nhiều sản phẩm. Khóa theo productId.
- * Trả về { added, updated }. Sản phẩm cũ cùng productId sẽ được cập nhật giá/tồn.
- */
+/** Lưu (hoặc cập nhật) nhiều sản phẩm vào catalog chung. Trả về { added, updated }. */
 async function saveProducts(products) {
   if (!Array.isArray(products) || products.length === 0) {
     return { added: 0, updated: 0 };
   }
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_PRODUCTS, "readwrite");
-    const store = transaction.objectStore(STORE_PRODUCTS);
-    let added = 0;
-    let updated = 0;
-    let pending = products.length;
-    for (const prod of products) {
-      if (!prod || !prod.productId) {
-        pending -= 1;
-        continue;
-      }
-      const getReq = store.get(prod.productId);
-      getReq.onsuccess = () => {
-        const existing = getReq.result;
-        if (existing) {
-          updated += 1;
-          store.put({
-            ...existing,
-            ...prod,
-            firstSeenAt: existing.firstSeenAt || Date.now(),
-            updatedAt: Date.now(),
-          });
-        } else {
-          added += 1;
-          store.put({
-            ...prod,
-            firstSeenAt: Date.now(),
-            updatedAt: Date.now(),
-          });
-        }
-        pending -= 1;
-        if (pending === 0) resolve({ added, updated });
-      };
-      getReq.onerror = () => {
-        pending -= 1;
-        if (pending === 0) resolve({ added, updated });
-      };
-    }
-    if (pending === 0) resolve({ added, updated });
-    transaction.onerror = () => reject(transaction.error);
+  const body = await apiFetch("/api/products", {
+    method: "POST",
+    body: JSON.stringify({ products }),
   });
+  return { added: body?.added || 0, updated: body?.updated || 0 };
 }
 
-/** Lấy toàn bộ sản phẩm (tùy chọn lọc theo source), mới cập nhật trước. */
+/** Lấy toàn bộ sản phẩm (tùy chọn lọc theo source). Trả về MẢNG. */
 async function getProducts(source) {
-  const store = await tx(STORE_PRODUCTS, "readonly");
-  return new Promise((resolve, reject) => {
-    const req = store.getAll();
-    req.onsuccess = () => {
-      let result = req.result || [];
-      if (source) result = result.filter((p) => p.source === source);
-      result.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-      resolve(result);
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const body = await apiFetch("/api/products" + qs({ source }));
+  return Array.isArray(body?.products) ? body.products : [];
 }
 
 /**
- * Tìm sản phẩm theo từ khóa + khoảng giá + danh mục (lọc trong bộ nhớ).
- * opts: { query, minPrice, maxPrice, category, source, limit }
+ * Tìm sản phẩm theo từ khóa + khoảng giá + danh mục (server lọc).
+ * opts: { query, minPrice, maxPrice, category, source, limit }. Trả về MẢNG.
  */
 async function searchProducts(opts = {}) {
-  const all = await getProducts(opts.source);
-  const q = (opts.query || "").trim().toLowerCase();
-  const terms = q ? q.split(/\s+/) : [];
-  const min = Number.isFinite(opts.minPrice) ? opts.minPrice : null;
-  const max = Number.isFinite(opts.maxPrice) ? opts.maxPrice : null;
-  const cat = (opts.category || "").toLowerCase();
-  const limit = opts.limit || 50;
-
-  const scored = [];
-  for (const p of all) {
-    if (cat && (p.category || "").toLowerCase() !== cat) continue;
-    const price = Number(p.price) || 0;
-    if (min != null && price < min) continue;
-    if (max != null && price > max) continue;
-
-    const hay = ((p.name || "") + " " + (p.category || "") + " " + (p.brand || "")).toLowerCase();
-    let score = 0;
-    if (terms.length) {
-      let matched = 0;
-      for (const t of terms) if (hay.includes(t)) matched += 1;
-      if (matched === 0) continue; // không khớp từ nào -> loại
-      score = matched / terms.length;
-    } else {
-      score = 1;
-    }
-    scored.push({ product: p, score });
-  }
-  scored.sort((a, b) => b.score - a.score || (a.product.price || 0) - (b.product.price || 0));
-  return scored.slice(0, limit).map((s) => s.product);
+  const body = await apiFetch(
+    "/api/products/search" +
+      qs({
+        query: opts.query,
+        minPrice: Number.isFinite(opts.minPrice) ? opts.minPrice : undefined,
+        maxPrice: Number.isFinite(opts.maxPrice) ? opts.maxPrice : undefined,
+        category: opts.category,
+        source: opts.source,
+        limit: opts.limit,
+      })
+  );
+  return Array.isArray(body?.products) ? body.products : [];
 }
 
-/** Xóa toàn bộ sản phẩm (hoặc theo source). Trả về số sản phẩm đã xóa. */
+/** Xóa sản phẩm theo source. Trả về SỐ sản phẩm đã xóa. */
 async function clearProducts(source) {
-  const db = await openDB();
-  if (!source) {
-    return new Promise((resolve, reject) => {
-      const transaction = db.transaction(STORE_PRODUCTS, "readwrite");
-      const store = transaction.objectStore(STORE_PRODUCTS);
-      const countReq = store.count();
-      countReq.onsuccess = () => {
-        const n = countReq.result;
-        const clearReq = store.clear();
-        clearReq.onsuccess = () => resolve(n);
-        clearReq.onerror = () => reject(clearReq.error);
-      };
-      countReq.onerror = () => reject(countReq.error);
-    });
-  }
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_PRODUCTS, "readwrite");
-    const store = transaction.objectStore(STORE_PRODUCTS);
-    const index = store.index("by_source");
-    let deleted = 0;
-    const req = index.openCursor(IDBKeyRange.only(source));
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (cursor) {
-        cursor.delete();
-        deleted += 1;
-        cursor.continue();
-      } else {
-        resolve(deleted);
-      }
-    };
-    req.onerror = () => reject(req.error);
+  const body = await apiFetch("/api/products" + qs({ source }), {
+    method: "DELETE",
   });
+  return body?.deleted || 0;
 }
 
-/** Xóa một sản phẩm theo productId. */
+/** Xóa một sản phẩm theo productId. Trả về true. */
 async function deleteProduct(productId) {
-  const store = await tx(STORE_PRODUCTS, "readwrite");
-  return new Promise((resolve, reject) => {
-    const req = store.delete(productId);
-    req.onsuccess = () => resolve(true);
-    req.onerror = () => reject(req.error);
+  await apiFetch("/api/products/" + encodeURIComponent(productId), {
+    method: "DELETE",
   });
+  return true;
 }
 
 /* ============================ SOURCES =================================== */
+//
+// Server lưu cấu hình nguồn dưới dạng { id, config }. Lớp shim này dẹp phẳng
+// (flatten) để caller (prices.js) vẫn thấy object phẳng { id, name, url, ... }
+// như IndexedDB cũ.
+
+/** Dẹp phẳng một row source { id, config, updatedAt } -> object phẳng. */
+function flattenSource(row) {
+  let cfg = row && row.config;
+  if (typeof cfg === "string") {
+    try {
+      cfg = JSON.parse(cfg);
+    } catch (e) {
+      cfg = {};
+    }
+  }
+  return { ...(cfg || {}), id: row.id, updatedAt: row.updatedAt };
+}
 
 /**
- * Lưu/cập nhật một cấu hình nguồn dữ liệu.
- * Cấu trúc: { id, name, url, method, headers, bodyTemplate, itemsPath, mapping, enabled }
- *  - itemsPath: đường dẫn tới mảng sản phẩm trong JSON trả về (vd "data.products").
- *  - mapping: ánh xạ field { productId, name, price, category, brand, url, image, stock }
- *    mỗi giá trị là đường dẫn trong từng item (vd "id", "attributes.price").
+ * Lưu/cập nhật một cấu hình nguồn dữ liệu (upsert theo id). Trả về bản ghi đã
+ * lưu (đã gộp default), giữ đúng shape cũ mà prices.js trông đợi.
  */
 async function saveSource(source) {
   if (!source || !source.id) throw new Error("Thiếu id nguồn dữ liệu.");
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_SOURCES, "readwrite");
-    const store = transaction.objectStore(STORE_SOURCES);
-    const getReq = store.get(source.id);
-    getReq.onsuccess = () => {
-      const existing = getReq.result || {};
-      const merged = {
-        method: "GET",
-        headers: {},
-        bodyTemplate: "",
-        itemsPath: "",
-        mapping: {},
-        enabled: true,
-        ...existing,
-        ...source,
-        createdAt: existing.createdAt || Date.now(),
-        updatedAt: Date.now(),
-      };
-      const putReq = store.put(merged);
-      putReq.onsuccess = () => resolve(merged);
-      putReq.onerror = () => reject(putReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
+  const record = {
+    method: "GET",
+    headers: {},
+    bodyTemplate: "",
+    itemsPath: "",
+    mapping: {},
+    enabled: true,
+    ...source,
+    updatedAt: Date.now(),
+  };
+  await apiFetch("/api/sources", {
+    method: "POST",
+    body: JSON.stringify({ id: record.id, config: record }),
   });
+  return record;
 }
 
-/** Lấy toàn bộ cấu hình nguồn dữ liệu. */
+/** Lấy toàn bộ cấu hình nguồn dữ liệu (đã dẹp phẳng). Trả về MẢNG. */
 async function getSources() {
-  const store = await tx(STORE_SOURCES, "readonly");
-  return new Promise((resolve, reject) => {
-    const req = store.getAll();
-    req.onsuccess = () => {
-      const result = req.result || [];
-      result.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-      resolve(result);
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const body = await apiFetch("/api/sources");
+  const rows = Array.isArray(body?.sources) ? body.sources : [];
+  return rows.map(flattenSource);
 }
 
-/** Xóa một cấu hình nguồn theo id. */
+/** Xóa một cấu hình nguồn theo id. Trả về true. */
 async function deleteSource(id) {
-  const store = await tx(STORE_SOURCES, "readwrite");
-  return new Promise((resolve, reject) => {
-    const req = store.delete(id);
-    req.onsuccess = () => resolve(true);
-    req.onerror = () => reject(req.error);
+  await apiFetch("/api/sources/" + encodeURIComponent(id), {
+    method: "DELETE",
   });
+  return true;
 }
 
 /* ========================== ADVISORIES =================================== */
 
 /**
- * Lưu (hoặc cập nhật) một nháp tư vấn. Khoá theo postId nên gọi lại trên cùng
- * bài sẽ GHI ĐÈ (dedupe). Trả về bản ghi đã lưu.
+ * Lưu (hoặc cập nhật) một nháp tư vấn (upsert theo postId của user). Trả về
+ * bản ghi đã lưu, hoặc null nếu thiếu postId.
  */
 async function saveAdvisory(adv) {
   if (!adv || !adv.postId) return null;
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_ADVISORIES, "readwrite");
-    const store = transaction.objectStore(STORE_ADVISORIES);
-    const getReq = store.get(adv.postId);
-    getReq.onsuccess = () => {
-      const existing = getReq.result;
-      const record = {
-        status: "pending",
-        createdAt: Date.now(),
-        ...(existing || {}),
-        ...adv,
-        updatedAt: Date.now(),
-      };
-      const putReq = store.put(record);
-      putReq.onsuccess = () => resolve(record);
-      putReq.onerror = () => reject(putReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
+  const body = await apiFetch("/api/advisories", {
+    method: "POST",
+    body: JSON.stringify(adv),
   });
+  return body?.advisory || null;
 }
 
-/** Lấy toàn bộ nháp tư vấn (tùy chọn lọc theo status), mới nhất trước. */
+/** Lấy toàn bộ nháp tư vấn (tùy chọn lọc theo status). Trả về MẢNG. */
 async function getAdvisories(status) {
-  const store = await tx(STORE_ADVISORIES, "readonly");
-  return new Promise((resolve, reject) => {
-    const req = store.getAll();
-    req.onsuccess = () => {
-      let result = req.result || [];
-      if (status) result = result.filter((a) => a.status === status);
-      result.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      resolve(result);
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const body = await apiFetch("/api/advisories" + qs({ status }));
+  return Array.isArray(body?.advisories) ? body.advisories : [];
 }
 
-/** Lấy 1 nháp theo postId (để biết bài đã có nháp chưa). */
+/** Lấy 1 nháp theo postId, hoặc null. */
 async function getAdvisory(postId) {
-  const store = await tx(STORE_ADVISORIES, "readonly");
-  return new Promise((resolve, reject) => {
-    const req = store.get(postId);
-    req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error);
-  });
+  const body = await apiFetch(
+    "/api/advisories/" + encodeURIComponent(postId)
+  );
+  return body?.advisory || null;
 }
 
-/** Cập nhật một nháp theo postId (gộp các trường truyền vào). */
+/**
+ * Cập nhật một nháp theo postId (gộp các trường truyền vào). Trả về bản ghi
+ * sau cập nhật (đọc lại để giữ shape object như cũ), hoặc null nếu không có.
+ */
 async function updateAdvisory(postId, patch) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_ADVISORIES, "readwrite");
-    const store = transaction.objectStore(STORE_ADVISORIES);
-    const getReq = store.get(postId);
-    getReq.onsuccess = () => {
-      const existing = getReq.result;
-      if (!existing) {
-        resolve(null);
-        return;
-      }
-      const merged = { ...existing, ...patch, updatedAt: Date.now() };
-      const putReq = store.put(merged);
-      putReq.onsuccess = () => resolve(merged);
-      putReq.onerror = () => reject(putReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
+  await apiFetch("/api/advisories/" + encodeURIComponent(postId), {
+    method: "PATCH",
+    body: JSON.stringify(patch || {}),
   });
+  return getAdvisory(postId);
 }
 
-/** Xóa một nháp theo postId. */
+/** Xóa một nháp theo postId. Trả về true. */
 async function deleteAdvisory(postId) {
-  const store = await tx(STORE_ADVISORIES, "readwrite");
-  return new Promise((resolve, reject) => {
-    const req = store.delete(postId);
-    req.onsuccess = () => resolve(true);
-    req.onerror = () => reject(req.error);
+  await apiFetch("/api/advisories/" + encodeURIComponent(postId), {
+    method: "DELETE",
   });
+  return true;
 }
 
-/** Xóa toàn bộ nháp tư vấn (hoặc theo status). Trả về số bản ghi đã xóa. */
+/**
+ * Xóa toàn bộ nháp tư vấn (hoặc theo status). Server không có endpoint xóa
+ * hàng loạt nên ta liệt kê rồi xóa từng cái. Trả về số bản ghi đã xóa.
+ */
 async function clearAdvisories(status) {
-  const store = await tx(STORE_ADVISORIES, "readwrite");
-  return new Promise((resolve, reject) => {
-    let deleted = 0;
-    const req = store.openCursor();
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (cursor) {
-        if (!status || cursor.value.status === status) {
-          cursor.delete();
-          deleted += 1;
-        }
-        cursor.continue();
-      } else {
-        resolve(deleted);
-      }
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const list = await getAdvisories(status);
+  let deleted = 0;
+  for (const a of list) {
+    if (!a || !a.postId) continue;
+    await deleteAdvisory(a.postId);
+    deleted += 1;
+  }
+  return deleted;
 }
 
 /* ----------------------- HỘI THOẠI (conversations) --------------------- */
@@ -826,7 +436,7 @@ async function clearAdvisories(status) {
  * kèm id. `replies` luôn khởi tạo rỗng; theo dõi nền sẽ merge dần vào sau.
  */
 async function createConversation(conv) {
-  const db = await openDB();
+  const c = conv || {};
   const record = {
     status: "watching", // watching | drafted | replied | closed
     postId: "",
@@ -834,131 +444,76 @@ async function createConversation(conv) {
     groupId: "",
     groupName: "",
     jobId: null,
-    myComment: "", // nội dung bình luận của ta
-    myCommentUrl: "", // permalink bình luận của ta (nếu bắt được)
-    replies: [], // [{ id, author, text, ts, seenAt }]
-    draft: null, // nháp phản hồi do AI soạn { reply, confidence, ... }
+    myComment: "",
+    myCommentUrl: "",
+    replies: [],
+    draft: null,
     lastWatchedAt: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
-    ...conv,
+    ...c,
   };
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
-    const store = transaction.objectStore(STORE_CONVERSATIONS);
-    const req = store.add(record);
-    req.onsuccess = () => resolve({ ...record, id: req.result });
-    req.onerror = () => reject(req.error);
+  const body = await apiFetch("/api/conversations", {
+    method: "POST",
+    body: JSON.stringify({
+      postId: record.postId,
+      commentPermalink: record.commentPermalink ?? record.myCommentUrl,
+      replies: record.replies,
+      status: record.status,
+    }),
   });
+  return { ...record, id: body?.id };
 }
 
 /** Lấy toàn bộ hội thoại (tùy chọn lọc theo status), mới cập nhật trước. */
 async function getConversations(status) {
-  const store = await tx(STORE_CONVERSATIONS, "readonly");
-  return new Promise((resolve, reject) => {
-    const req = store.getAll();
-    req.onsuccess = () => {
-      let result = req.result || [];
-      if (status) result = result.filter((c) => c.status === status);
-      result.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-      resolve(result);
-    };
-    req.onerror = () => reject(req.error);
-  });
-}
-
-/** Lấy một hội thoại theo id. */
-async function getConversation(id) {
-  const store = await tx(STORE_CONVERSATIONS, "readonly");
-  return new Promise((resolve, reject) => {
-    const req = store.get(id);
-    req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-/** Cập nhật một hội thoại theo id (gộp trường, KHÔNG ghi đè cả bản ghi). */
-async function updateConversation(id, patch) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
-    const store = transaction.objectStore(STORE_CONVERSATIONS);
-    const getReq = store.get(id);
-    getReq.onsuccess = () => {
-      const existing = getReq.result;
-      if (!existing) {
-        resolve(null);
-        return;
-      }
-      const merged = { ...existing, ...patch, updatedAt: Date.now() };
-      const putReq = store.put(merged);
-      putReq.onsuccess = () => resolve(merged);
-      putReq.onerror = () => reject(putReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
-  });
+  const body = await apiFetch("/api/conversations" + qs({ status }));
+  return Array.isArray(body?.conversations) ? body.conversations : [];
 }
 
 /**
- * MERGE các reply mới vào hội thoại (KHÔNG ghi đè reply cũ). Dedupe theo
- * replyId nếu có, nếu không thì theo cặp (author|text). Trả về { added, total }.
+ * Lấy một hội thoại theo id. Server không có endpoint lấy đơn lẻ nên ta liệt
+ * kê rồi tìm theo id. Trả về bản ghi hoặc null.
  */
-async function mergeReplies(id, incoming) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
-    const store = transaction.objectStore(STORE_CONVERSATIONS);
-    const getReq = store.get(id);
-    getReq.onsuccess = () => {
-      const existing = getReq.result;
-      if (!existing) {
-        resolve({ added: 0, total: 0 });
-        return;
-      }
-      const have = Array.isArray(existing.replies) ? existing.replies.slice() : [];
-      const keyOf = (r) =>
-        (r && r.id) ? "id:" + r.id : "tx:" + ((r && r.author) || "") + "|" + ((r && r.text) || "");
-      const seen = new Set(have.map(keyOf));
-      let added = 0;
-      for (const r of Array.isArray(incoming) ? incoming : []) {
-        if (!r || !r.text) continue;
-        const k = keyOf(r);
-        if (seen.has(k)) continue;
-        seen.add(k);
-        have.push({
-          id: r.id || null,
-          author: r.author || "",
-          text: String(r.text).slice(0, 2000),
-          ts: r.ts || null,
-          timeText: r.timeText || "",
-          seenAt: Date.now(),
-        });
-        added += 1;
-      }
-      const patch = {
-        replies: have,
-        lastWatchedAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-      // Có reply mới của người khác -> đánh dấu để người dùng chú ý (nếu đang chỉ "watching").
-      if (added > 0 && existing.status === "watching") patch.status = "replied";
-      const merged = { ...existing, ...patch };
-      const putReq = store.put(merged);
-      putReq.onsuccess = () => resolve({ added, total: have.length });
-      putReq.onerror = () => reject(putReq.error);
-    };
-    getReq.onerror = () => reject(getReq.error);
-  });
+async function getConversation(id) {
+  const list = await getConversations();
+  return list.find((c) => c && c.id == id) || null; // eslint-disable-line eqeqeq
 }
 
-/** Xóa một hội thoại theo id. */
-async function deleteConversation(id) {
-  const store = await tx(STORE_CONVERSATIONS, "readwrite");
-  return new Promise((resolve, reject) => {
-    const req = store.delete(id);
-    req.onsuccess = () => resolve(true);
-    req.onerror = () => reject(req.error);
+/**
+ * Cập nhật một hội thoại theo id (gộp trường). Trả về bản ghi sau cập nhật
+ * (đọc lại để giữ shape object như cũ), hoặc null nếu không tìm thấy.
+ */
+async function updateConversation(id, patch) {
+  await apiFetch("/api/conversations/" + encodeURIComponent(id), {
+    method: "PATCH",
+    body: JSON.stringify(patch || {}),
   });
+  return getConversation(id);
+}
+
+/**
+ * MERGE các reply mới vào hội thoại (server dedupe, KHÔNG ghi đè reply cũ).
+ * Trả về { added, total }.
+ */
+async function mergeReplies(id, incoming) {
+  const replies = Array.isArray(incoming) ? incoming : [];
+  const body = await apiFetch(
+    "/api/conversations/" + encodeURIComponent(id) + "/replies",
+    {
+      method: "POST",
+      body: JSON.stringify({ replies }),
+    }
+  );
+  return { added: body?.added || 0, total: body?.total || 0 };
+}
+
+/** Xóa một hội thoại theo id. Trả về true. */
+async function deleteConversation(id) {
+  await apiFetch("/api/conversations/" + encodeURIComponent(id), {
+    method: "DELETE",
+  });
+  return true;
 }
 
 // Xuất dưới dạng ES module. background.js nạp qua `import * as DB from "./db.js"`.
@@ -974,7 +529,7 @@ export {
   saveGroups,
   getGroups,
   deleteGroup,
-  // jobs
+  // jobs (chrome.storage.local — device-local, NOT API)
   createJob,
   updateJob,
   getJobs,
