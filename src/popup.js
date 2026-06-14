@@ -101,21 +101,40 @@ function showLoggedOut(note) {
 
 // Hỏi background trạng thái đăng nhập rồi định tuyến giao diện.
 async function refreshAuth() {
-  const res = await bg("AUTH_STATE");
-  if (res && res.ok && res.loggedIn) {
-    showLoggedIn(res.display_name);
-    // Đã đăng nhập: tải dữ liệu phụ thuộc API.
-    loadStats();
-    viewSelectors();
-  } else {
-    showLoggedOut();
+  try {
+    const res = await bg("AUTH_STATE");
+    if (res && res.ok && res.loggedIn) {
+      showLoggedIn(res.display_name);
+      // Đã đăng nhập: tải dữ liệu phụ thuộc API.
+      loadStats();
+      viewSelectors();
+    } else {
+      showLoggedOut();
+    }
+  } catch (e) {
+    // SW lỗi / chưa kịp thức: vẫn đưa về form đăng nhập để có lối thoát,
+    // tránh popup treo ở trạng thái trống (cả login lẫn app đều đang ẩn).
+    void e;
+    showLoggedOut("Không kết nối được máy chủ, vui lòng thử lại.");
   }
+}
+
+// Chuyển lỗi đăng nhập thành thông báo tiếng Việt thân thiện. apiFetch ném lỗi
+// dạng "API 401: invalid credentials" khi sai thông tin; mọi lỗi khác (mất mạng,
+// 5xx) coi như sự cố kết nối thay vì hiện nguyên văn exception tiếng Anh.
+function loginErrorMessage(raw) {
+  const s = String(raw || "");
+  if (/\b401\b/.test(s) || /invalid credentials/i.test(s)) {
+    return "Email hoặc mật khẩu không đúng.";
+  }
+  return "Không đăng nhập được, kiểm tra kết nối rồi thử lại.";
 }
 
 // Xử lý đăng nhập: kiểm tra rỗng, gửi AUTH_LOGIN, định tuyến theo kết quả.
 async function doLogin() {
   const email = els.loginEmail.value.trim();
-  const password = els.loginPassword.value.trim();
+  // KHÔNG trim mật khẩu: khoảng trắng đầu/cuối có thể là một phần hợp lệ.
+  const password = els.loginPassword.value;
   if (!email || !password) {
     setLoginError("Nhập email và mật khẩu");
     return;
@@ -125,11 +144,12 @@ async function doLogin() {
     const res = await bg("AUTH_LOGIN", { email, password });
     if (res && res.ok) {
       els.loginPassword.value = "";
-      showLoggedIn(res.user && res.user.display_name);
+      // Login route trả user.displayName (camelCase) — KHÔNG phải display_name.
+      showLoggedIn(res.user && res.user.displayName);
       loadStats();
       viewSelectors();
     } else {
-      setLoginError((res && res.error) || "Đăng nhập thất bại.");
+      setLoginError(loginErrorMessage(res && res.error));
     }
   } finally {
     els.btnLogin.disabled = false;
