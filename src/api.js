@@ -14,12 +14,14 @@
  * Module ES (import/export), khớp phong cách util.js / db.js.
  */
 
+import { API_BASE_URL } from "./config.js";
+
 // Khoá lưu token trong chrome.storage.local.
 const TOKEN_KEY = "webAuthToken";
 
-// Base URL mặc định: backend env.port = 3300. setBaseUrl() có thể ghi đè
-// (vd đọc từ cấu hình đã lưu sau này).
-let baseUrl = "http://localhost:3300";
+// Base URL backend: lấy từ config.js (NƠI DUY NHẤT để sửa khi deploy — xem
+// src/config.js). setBaseUrl() vẫn có thể ghi đè runtime nếu sau này cần.
+let baseUrl = API_BASE_URL;
 
 // Cache token in-memory để getToken() đồng bộ (không phải đợi storage async).
 let tokenCache = null;
@@ -111,10 +113,24 @@ export function onUnauthorized(cb) {
 export async function apiFetch(path, init = {}) {
   const url = /^https?:\/\//i.test(path) ? path : baseUrl + path;
 
+  // MV3: service worker bị tắt sau ~30s rảnh. Khi một alarm/message đánh thức nó
+  // dậy, module được NẠP LẠI nên tokenCache = null trong khi token THẬT vẫn nằm
+  // ở chrome.storage.local. Nếu gọi API ngay lúc này (vd jobTick mỗi phút), request
+  // sẽ thiếu Bearer -> backend trả 401 -> luồng 401 bên dưới xoá NHẦM token đã lưu
+  // và phát AUTH_REQUIRED, khiến người dùng bị "đăng xuất sau vài phút" dù token
+  // vẫn còn hạn. Nạp lại token từ storage TRƯỚC khi gửi để đóng cửa sổ đua này cho
+  // MỌI caller (kể cả các tác vụ nền chạy theo alarm không await readyPromise).
+  if (!tokenCache && hasChromeStorage()) {
+    await loadToken();
+  }
+
   const headers = { ...(init.headers || {}) };
+  // Ghi lại token THỰC SỰ gửi đi: dùng để phân biệt 401 "phiên hết hạn" (có gửi
+  // token) với 401 "chưa đăng nhập" (không có token) ở luồng xử lý lỗi bên dưới.
+  const sentToken = tokenCache;
   // Chỉ gắn Authorization khi thực sự có token.
-  if (tokenCache) {
-    headers.Authorization = "Bearer " + tokenCache;
+  if (sentToken) {
+    headers.Authorization = "Bearer " + sentToken;
   }
   // Mặc định gửi/nhận JSON khi có body và chưa set Content-Type.
   if (init.body != null && headers["Content-Type"] == null) {
@@ -136,7 +152,12 @@ export async function apiFetch(path, init = {}) {
     // skipAuthHandler=true: BỎ QUA luồng 401 toàn cục (vd lúc đăng nhập, 401 chỉ
     // nghĩa là sai thông tin — KHÔNG được xoá token phiên hiện tại hay broadcast
     // AUTH_REQUIRED). Vẫn ném lỗi như thường để caller tự xử lý.
-    if (res.status === 401 && !init.skipAuthHandler) {
+    //
+    // CHỈ coi 401 là "phiên hết hạn" khi request THỰC SỰ có gửi token (sentToken).
+    // Một 401 cho request KHÔNG kèm token nghĩa là "chưa đăng nhập" chứ không phải
+    // token đã hỏng — xoá token đã lưu lúc này sẽ đá NHẦM người dùng ra (đúng triệu
+    // chứng "đăng xuất sau vài phút" khi SW vừa thức dậy mà cache token còn rỗng).
+    if (res.status === 401 && sentToken && !init.skipAuthHandler) {
       setToken(null);
       if (unauthorizedHandler) {
         try {

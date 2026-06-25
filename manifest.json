@@ -5,6 +5,8 @@
   "description": "Crawl chỉ các bài viết MỚI từ nhóm Facebook đã tham gia và lưu dữ liệu đầy đủ (IndexedDB + xuất JSON/CSV).",
   "permissions": ["storage", "tabs", "scripting", "activeTab", "alarms"],
   "host_permissions": [
+    "http://14.225.206.162:3000/*",
+    "http://localhost:3300/*",
     "https://www.facebook.com/*",
     "https://web.facebook.com/*",
     "https://m.facebook.com/*",

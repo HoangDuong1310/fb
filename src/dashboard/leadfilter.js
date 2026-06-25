@@ -11,9 +11,13 @@
  * Trả nhãn: "buy" | "support" | "seller" | "other".
  *
  * TỪ KHOÁ TÙY CHỈNH: ngoài bộ gốc bên dưới, người dùng có thể bổ sung từ khoá
- * (qua nút "Gợi ý từ khoá" → duyệt). Các từ này lưu ở chrome.storage.local và
- * được GỘP với bộ gốc khi phân loại. Mọi từ mới đều phải người dùng duyệt.
+ * (qua nút "Gợi ý từ khoá" → duyệt). Các từ này lưu ở DB dùng chung toàn hệ
+ * thống (bảng learned_keywords) và được GỘP với bộ gốc khi phân loại. Nhãn
+ * "seller" dùng chung type "sell" với mục "Từ khoá học (Bán)". Bộ gốc bên dưới
+ * chỉ là fallback khi chưa đăng nhập / mất mạng. Mọi từ mới đều phải duyệt.
  */
+
+import { bg } from "./core.js";
 
 // Tín hiệu KHÁCH CẦN MUA (ý định mua, đi tìm hàng).
 const BUY_BASE = [
@@ -49,14 +53,17 @@ const SELLER_BASE = [
   "bên mình có", "cửa hàng mình", "có hoá đơn", "xuất hoá đơn", "nhận order sỉ",
 ];
 
-// Từ khoá tùy chỉnh do người dùng duyệt thêm (nạp từ storage lúc khởi động).
-const CUSTOM = { buy: [], support: [], seller: [] };
-const LEAD_KW_KEY = "leadKeywords";
+// Nhãn lead nội bộ -> type trong DB. "seller" gộp chung type "sell".
+const LABEL_TO_DB_TYPE = { buy: "buy", support: "support", seller: "sell" };
 
-/** Bộ từ khoá hiệu lực = gốc + tùy chỉnh (loại trùng). */
+// Từ khoá nạp từ DB (gộp với bộ gốc khi phân loại). Rỗng khi chưa đăng nhập
+// / mất mạng -> chỉ dùng bộ gốc làm fallback.
+const DB_KW = { buy: [], support: [], seller: [] };
+
+/** Bộ từ khoá hiệu lực = gốc + DB (loại trùng). */
 function kw(label) {
   const base = label === "buy" ? BUY_BASE : label === "support" ? SUPPORT_BASE : SELLER_BASE;
-  return [...new Set(base.concat(CUSTOM[label] || []))];
+  return [...new Set(base.concat(DB_KW[label] || []))];
 }
 
 /** Tất cả từ khoá đã biết (để loại khi khai phá ứng viên mới). */
@@ -120,59 +127,57 @@ export function matchLeadMode(label, mode) {
   return label === mode;
 }
 
-/* ===================== TỪ KHOÁ TÙY CHỈNH (storage) ===================== */
+/* ====================== TỪ KHOÁ TÙY CHỈNH (DB) ======================== */
 
-/** Nạp từ khoá tùy chỉnh từ chrome.storage.local vào bộ nhớ (gọi lúc init). */
-export function loadLeadKeywords() {
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get(LEAD_KW_KEY, (res) => {
-        void chrome.runtime.lastError;
-        const data = (res && res[LEAD_KW_KEY]) || {};
-        ["buy", "support", "seller"].forEach((k) => {
-          CUSTOM[k] = Array.isArray(data[k]) ? data[k] : [];
-        });
-        resolve(CUSTOM);
-      });
-    } catch (_) {
-      resolve(CUSTOM);
-    }
-  });
-}
-
-/** Lưu bộ từ khoá tùy chỉnh hiện tại xuống storage. */
-function persistCustom() {
+/**
+ * Nạp từ khoá dùng chung từ DB vào bộ nhớ (gọi lúc init + sau khi duyệt thêm).
+ * Mỗi nhãn lead lấy đúng type tương ứng (seller -> "sell"). Chỉ nạp từ đang bật.
+ * Nếu chưa đăng nhập / lỗi mạng thì giữ DB_KW rỗng -> classifyLead dùng bộ gốc.
+ */
+export async function loadLeadKeywords() {
+  const labels = ["buy", "support", "seller"];
+  for (const label of labels) DB_KW[label] = [];
   try {
-    chrome.storage.local.set({ [LEAD_KW_KEY]: CUSTOM }, () => void chrome.runtime.lastError);
+    const results = await Promise.all(
+      labels.map((label) => bg("GET_KEYWORDS", { kwType: LABEL_TO_DB_TYPE[label] }))
+    );
+    labels.forEach((label, i) => {
+      const rows = (results[i] && results[i].keywords) || [];
+      DB_KW[label] = rows
+        .filter((r) => r.enabled !== 0 && r.enabled !== false)
+        .map((r) => norm(r.keyword))
+        .filter(Boolean);
+    });
   } catch (_) {
-    /* bỏ qua */
+    /* fallback: giữ bộ gốc */
   }
+  return DB_KW;
 }
 
-/** Thêm 1 từ khoá đã duyệt vào nhóm (buy|support|seller). Trả true nếu mới. */
-export function addLeadKeyword(label, phrase) {
+/**
+ * Thêm 1 từ khoá đã duyệt vào nhóm (buy|support|seller) -> ghi xuống DB dùng
+ * chung. Trả true nếu là từ mới (chưa có trong bộ gốc hoặc DB).
+ */
+export async function addLeadKeyword(label, phrase) {
   const p = norm(phrase);
-  if (!p || !CUSTOM[label]) return false;
-  if (kw(label).includes(p)) return false; // đã có (gốc hoặc tùy chỉnh)
-  CUSTOM[label].push(p);
-  persistCustom();
+  if (!p || !DB_KW[label]) return false;
+  if (kw(label).includes(p)) return false; // đã có (gốc hoặc DB)
+  try {
+    await bg("ADD_KEYWORD", {
+      keyword: p,
+      kwType: LABEL_TO_DB_TYPE[label],
+      enabled: true,
+    });
+  } catch (_) {
+    return false;
+  }
+  DB_KW[label].push(p);
   return true;
 }
 
-/** Danh sách từ khoá tùy chỉnh hiện có (để hiển thị/quản lý). */
+/** Danh sách từ khoá DB hiện đã nạp (để hiển thị/quản lý). */
 export function getCustomKeywords() {
-  return { buy: [...CUSTOM.buy], support: [...CUSTOM.support], seller: [...CUSTOM.seller] };
-}
-
-/** Xoá 1 từ khoá tùy chỉnh khỏi nhóm. */
-export function removeLeadKeyword(label, phrase) {
-  const p = norm(phrase);
-  if (!CUSTOM[label]) return false;
-  const i = CUSTOM[label].indexOf(p);
-  if (i < 0) return false;
-  CUSTOM[label].splice(i, 1);
-  persistCustom();
-  return true;
+  return { buy: [...DB_KW.buy], support: [...DB_KW.support], seller: [...DB_KW.seller] };
 }
 
 /* =================== KHAI PHÁ ỨNG VIÊN TỪ KHO BÀI ===================== */

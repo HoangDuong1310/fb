@@ -38,6 +38,16 @@ const els = {
   loginPassword: $("loginPassword"),
   btnLogin: $("btnLogin"),
   loginError: $("loginError"),
+  rememberMe: $("rememberMe"),
+  linkShowRegister: $("linkShowRegister"),
+  // ---- Đăng ký ----
+  registerSection: $("registerSection"),
+  registerName: $("registerName"),
+  registerEmail: $("registerEmail"),
+  registerPassword: $("registerPassword"),
+  btnRegister: $("btnRegister"),
+  registerError: $("registerError"),
+  linkShowLogin: $("linkShowLogin"),
   authBar: $("authBar"),
   authName: $("authName"),
   btnLogout: $("btnLogout"),
@@ -81,22 +91,53 @@ function setLoginError(text) {
   els.loginError.hidden = false;
 }
 
-// Hiện giao diện đã đăng nhập: ẩn form login, hiện appSection + thanh authBar.
+// Hiện/ẩn dòng lỗi đăng ký.
+function setRegisterError(text) {
+  if (!text) {
+    els.registerError.textContent = "";
+    els.registerError.hidden = true;
+    return;
+  }
+  els.registerError.textContent = text;
+  els.registerError.hidden = false;
+}
+
+// Hiện giao diện đã đăng nhập: ẩn cả form login lẫn register, hiện appSection.
 function showLoggedIn(displayName) {
   els.authName.textContent = displayName || "";
   els.authBar.hidden = false;
   els.loginSection.hidden = true;
+  els.registerSection.hidden = true;
   els.appSection.hidden = false;
   setLoginError("");
+  setRegisterError("");
 }
 
-// Hiện form đăng nhập: ẩn appSection + authBar. note = thông báo tuỳ chọn.
+// Hiện form đăng nhập: ẩn appSection + authBar + form đăng ký. note = thông báo tuỳ chọn.
 function showLoggedOut(note) {
   els.authBar.hidden = true;
   els.appSection.hidden = true;
+  els.registerSection.hidden = true;
   els.loginSection.hidden = false;
   els.authName.textContent = "";
+  setRegisterError("");
   setLoginError(note || "");
+}
+
+// Chuyển sang form đăng ký: ẩn login, hiện register, xoá lỗi cũ.
+function showRegisterView() {
+  els.loginSection.hidden = true;
+  els.registerSection.hidden = false;
+  setLoginError("");
+  setRegisterError("");
+}
+
+// Quay lại form đăng nhập từ form đăng ký.
+function showLoginView() {
+  els.registerSection.hidden = true;
+  els.loginSection.hidden = false;
+  setLoginError("");
+  setRegisterError("");
 }
 
 // Hỏi background trạng thái đăng nhập rồi định tuyến giao diện.
@@ -130,6 +171,56 @@ function loginErrorMessage(raw) {
   return "Không đăng nhập được, kiểm tra kết nối rồi thử lại.";
 }
 
+/* ---- Ghi nhớ tài khoản --------------------------------------------------
+ * Chỉ nhớ EMAIL (không bao giờ nhớ mật khẩu) trong chrome.storage.local. Token
+ * phiên do api.js quản lý riêng và đã sống qua restart; phần này chỉ điền sẵn
+ * email + tích lại ô để người dùng đỡ gõ lại. Bỏ tích -> xoá email đã nhớ.
+ */
+const REMEMBER_KEY = "rememberedLogin";
+
+// Đọc { remember, email } đã lưu (an toàn khi chưa có gì / ngoài extension).
+function loadRememberedLogin() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(REMEMBER_KEY, (r) => {
+        void chrome.runtime.lastError;
+        const saved = (r && r[REMEMBER_KEY]) || {};
+        resolve({
+          remember: !!saved.remember,
+          email: typeof saved.email === "string" ? saved.email : "",
+        });
+      });
+    } catch (e) {
+      resolve({ remember: false, email: "" });
+    }
+  });
+}
+
+// Lưu (remember=true) hoặc xoá (remember=false) email đã nhớ.
+function saveRememberedLogin(remember, email) {
+  try {
+    if (remember && email) {
+      chrome.storage.local.set(
+        { [REMEMBER_KEY]: { remember: true, email } },
+        () => void chrome.runtime.lastError
+      );
+    } else {
+      chrome.storage.local.remove(REMEMBER_KEY, () => void chrome.runtime.lastError);
+    }
+  } catch (e) {
+    // Bỏ qua: không nhớ được tài khoản không phải lỗi chặn đăng nhập.
+  }
+}
+
+// Điền sẵn email đã nhớ + trạng thái ô tích lúc mở popup.
+async function applyRememberedLogin() {
+  const { remember, email } = await loadRememberedLogin();
+  if (els.rememberMe) els.rememberMe.checked = remember;
+  if (remember && email && els.loginEmail && !els.loginEmail.value) {
+    els.loginEmail.value = email;
+  }
+}
+
 // Xử lý đăng nhập: kiểm tra rỗng, gửi AUTH_LOGIN, định tuyến theo kết quả.
 async function doLogin() {
   const email = els.loginEmail.value.trim();
@@ -144,6 +235,10 @@ async function doLogin() {
     const res = await bg("AUTH_LOGIN", { email, password });
     if (res && res.ok) {
       els.loginPassword.value = "";
+      // Nhớ/quên email theo ô tích — chỉ làm sau khi đăng nhập THÀNH CÔNG để
+      // không lưu email gõ sai. KHÔNG bao giờ lưu mật khẩu.
+      const remember = !!(els.rememberMe && els.rememberMe.checked);
+      saveRememberedLogin(remember, email);
       // Login route trả user.displayName (camelCase) — KHÔNG phải display_name.
       showLoggedIn(res.user && res.user.displayName);
       loadStats();
@@ -160,6 +255,59 @@ async function doLogin() {
 async function doLogout() {
   await bg("AUTH_LOGOUT");
   showLoggedOut();
+}
+
+// Chuyển lỗi đăng ký thành thông báo tiếng Việt thân thiện. apiFetch ném lỗi
+// dạng "API 409: email already registered" khi email trùng, "API 400: ..." khi
+// mật khẩu yếu / email sai định dạng; mọi lỗi khác coi như sự cố kết nối.
+function registerErrorMessage(raw) {
+  const s = String(raw || "");
+  if (/\b409\b/.test(s) || /already registered/i.test(s)) {
+    return "Email này đã được đăng ký. Hãy đăng nhập.";
+  }
+  if (/password must be 6-72/i.test(s)) {
+    return "Mật khẩu phải từ 6 đến 72 ký tự.";
+  }
+  if (/invalid email/i.test(s)) {
+    return "Email không hợp lệ.";
+  }
+  if (/\b400\b/.test(s)) {
+    return "Thông tin đăng ký không hợp lệ, vui lòng kiểm tra lại.";
+  }
+  return "Không đăng ký được, kiểm tra kết nối rồi thử lại.";
+}
+
+// Xử lý đăng ký: kiểm tra rỗng + độ dài mật khẩu phía client (khớp ràng buộc
+// backend 6-72 ký tự), gửi AUTH_REGISTER. Backend trả {token, user} và đăng
+// nhập luôn, nên thành công thì vào thẳng appSection.
+async function doRegister() {
+  const email = els.registerEmail.value.trim();
+  // KHÔNG trim mật khẩu: khoảng trắng đầu/cuối có thể là một phần hợp lệ.
+  const password = els.registerPassword.value;
+  const displayName = els.registerName.value.trim();
+  if (!email || !password) {
+    setRegisterError("Nhập email và mật khẩu");
+    return;
+  }
+  if (password.length < 6 || password.length > 72) {
+    setRegisterError("Mật khẩu phải từ 6 đến 72 ký tự.");
+    return;
+  }
+  els.btnRegister.disabled = true;
+  try {
+    const res = await bg("AUTH_REGISTER", { email, password, displayName });
+    if (res && res.ok) {
+      els.registerPassword.value = "";
+      // Register route trả user.displayName (camelCase) — KHÔNG phải display_name.
+      showLoggedIn(res.user && res.user.displayName);
+      loadStats();
+      viewSelectors();
+    } else {
+      setRegisterError(registerErrorMessage(res && res.error));
+    }
+  } finally {
+    els.btnRegister.disabled = false;
+  }
 }
 
 // ---- Tải & hiển thị thống kê ---------------------------------------------
@@ -428,7 +576,23 @@ els.loginPassword.addEventListener("keydown", (e) => {
 });
 els.btnLogout.addEventListener("click", doLogout);
 
+// ---- Sự kiện đăng ký ----
+els.btnRegister.addEventListener("click", doRegister);
+els.registerPassword.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") doRegister();
+});
+els.linkShowRegister.addEventListener("click", (e) => {
+  e.preventDefault();
+  showRegisterView();
+});
+els.linkShowLogin.addEventListener("click", (e) => {
+  e.preventDefault();
+  showLoginView();
+});
+
 // Khởi tạo: cấu hình AI là cục bộ nên tải ngay; dữ liệu phụ thuộc API chỉ
-// chạy sau khi xác nhận đã đăng nhập (trong refreshAuth).
+// chạy sau khi xác nhận đã đăng nhập (trong refreshAuth). Điền sẵn email đã nhớ
+// (nếu có) để người dùng đỡ gõ lại khi phiên hết hạn thật và quay về form login.
 loadAIConfig();
+applyRememberedLogin();
 refreshAuth();

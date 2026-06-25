@@ -8,29 +8,55 @@
  *
  * Đường dữ liệu: KHÔNG gọi HTTP trực tiếp từ dashboard (JWT ở service worker).
  * Mọi thao tác đi qua bg() -> handler ở background.js -> API.apiFetch. Message:
- *   - GET_KEYWORDS    { type? }                 -> { ok, keywords }
- *   - ADD_KEYWORD     { keyword, type, enabled } -> { ok }
- *   - UPDATE_KEYWORD  { id, patch }              -> { ok }
- *   - DELETE_KEYWORD  { id }                     -> { ok }
+ *   - GET_KEYWORDS    { kwType? }                  -> { ok, keywords }
+ *   - ADD_KEYWORD     { keyword, kwType, enabled } -> { ok }
+ *   - UPDATE_KEYWORD  { id, patch }                -> { ok }
+ *   - DELETE_KEYWORD  { id }                       -> { ok }
+ *
+ * LƯU Ý: payload tuyệt đối KHÔNG được dùng khóa tên "type" — nó trùng với khóa
+ * định tuyến của bg(message.type) và sẽ ghi đè lệnh, khiến message rơi vào case
+ * default ở background.js (không trả lời) -> lỗi "The message port closed".
+ * Vì vậy loại từ khóa được truyền dưới tên "kwType".
  */
 import { $, bg, esc, emptyState, toast, timeAgo } from "../core.js";
 
-// State riêng cho view. Hiện chỉ quản lý từ khóa loại "sell" (chưa có UI đổi loại).
+// State riêng cho view. type = tab đang xem (sell | buy | support).
 export const keywordStore = {
   list: [],
   type: "sell",
 };
 
 // Nhãn nguồn từ khóa sang tiếng Việt.
-const ADDED_BY_LABEL = { ai: "AI", user: "Tôi", me: "Tôi" };
+const ADDED_BY_LABEL = { ai: "AI", user: "Tôi", me: "Tôi", system: "Hệ thống" };
+
+// Gợi ý theo từng nhóm để người dùng hiểu nhóm dùng vào việc gì.
+const KW_HINTS = {
+  sell: 'Từ khóa "bán" dùng ở phễu trích giá group VÀ để loại NGƯỜI BÁN khỏi Lọc thông minh. AI có thể tự học thêm (gắn nhãn "mới bởi AI"); bạn có thể bật/tắt hoặc xóa.',
+  buy: 'Từ khóa "Cần mua" giúp Lọc thông minh nhận diện KHÁCH CÓ NHU CẦU MUA. Thêm/bật/tắt để tinh chỉnh bộ lọc bài viết.',
+  support: 'Từ khóa "Cần hỗ trợ" giúp Lọc thông minh nhận diện người HỎI KỸ THUẬT / GẶP SỰ CỐ. Thêm/bật/tắt để tinh chỉnh bộ lọc bài viết.',
+};
 
 export async function loadKeywordsView() {
   await reloadKeywords();
 }
 
+// Đổi nhóm từ khóa đang xem (tab). Cập nhật trạng thái nút + gợi ý rồi nạp lại.
+export async function switchKeywordType(type) {
+  keywordStore.type = type || "sell";
+  const tabs = $("kwTypeTabs");
+  if (tabs) {
+    tabs.querySelectorAll("button[data-kwtype]").forEach((b) => {
+      b.classList.toggle("active", b.dataset.kwtype === keywordStore.type);
+    });
+  }
+  const hint = $("kwHint");
+  if (hint) hint.textContent = KW_HINTS[keywordStore.type] || KW_HINTS.sell;
+  await reloadKeywords();
+}
+
 export async function reloadKeywords() {
   const wrap = $("keywordList");
-  const res = await bg("GET_KEYWORDS", { type: keywordStore.type || "" });
+  const res = await bg("GET_KEYWORDS", { kwType: keywordStore.type || "" });
   if (!res || !res.ok) {
     // Chưa đăng nhập -> hiện hướng dẫn thay vì bảng trống gây hiểu nhầm.
     if (wrap) {
@@ -98,7 +124,7 @@ export async function addKeywordUI() {
     return;
   }
   const type = keywordStore.type || "sell";
-  const res = await bg("ADD_KEYWORD", { keyword: word, type, enabled: true });
+  const res = await bg("ADD_KEYWORD", { keyword: word, kwType: type, enabled: true });
   if (res && res.ok) {
     if (input) input.value = "";
     toast("Đã thêm từ khóa.", "ok", 2000);

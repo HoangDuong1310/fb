@@ -2,6 +2,22 @@
 
 Extension Chrome/Edge (Manifest V3) để crawl **chỉ các bài viết MỚI** từ nhóm Facebook bạn đã tham gia, lưu dữ liệu đầy đủ vào IndexedDB và xuất ra JSON/CSV.
 
+## Cấu trúc repo
+
+```
+.                      # Gốc repo = extension Chrome (load unpacked tại đây)
+├── manifest.json      # Khai báo MV3
+├── src/               # Mã nguồn extension (background, content, popup, dashboard)
+├── test/              # Test client của extension (node --test)
+└── server/            # Phần web để deploy lên server (TÁCH RIÊNG khỏi extension)
+    ├── web/           # Backend Express + MySQL (API /api/*, JWT)
+    ├── web-ui/        # Frontend Next.js (dashboard quản trị)
+    └── DEPLOY.md      # Hướng dẫn deploy lên server đã chạy sẵn web khác
+```
+
+- **Extension** nằm ở thư mục gốc — load unpacked như mục [Cài đặt](#cài-đặt-chế-độ-developer) bên dưới.
+- **Web (backend + frontend)** gom trong [`server/`](server/) để push lên VPS độc lập. Xem hướng dẫn deploy tại [`server/DEPLOY.md`](server/DEPLOY.md) và kiến trúc web tại [`server/web/README.md`](server/web/README.md).
+
 ## Tính năng
 
 - Crawl **tăng dần**: chỉ lấy bài chưa có trong kho. Tự dừng sớm khi gặp nhiều bài cũ liên tiếp (vì feed sắp theo thời gian, phần sau toàn bài cũ).

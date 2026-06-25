@@ -122,7 +122,7 @@ export function renderPosts() {
           ${av}
           <div class="pc-id">
             <span class="pc-author">${esc(author)}${leadBadge}</span>
-            <span class="pc-sub">${esc(p.timeText || timeAgo(p.crawledAt))} · ${esc(p.groupName || p.groupId || "")}</span>
+            <span class="pc-sub">${esc(p.timeText || timeAgo(p.timestamp || p.crawledAt) || "Không rõ thời gian")} · ${esc(p.groupName || p.groupId || "")}</span>
           </div>
         </div>
         <div class="pc-text${isLong ? " clamp" : ""}">${esc(text || "(không có nội dung)")}</div>
@@ -188,14 +188,15 @@ export async function suggestKeywordsUI() {
     title: "Gợi ý từ khoá",
     bodyHTML,
     confirmText: "Thêm từ đã chọn",
-    onConfirm: (overlay) => {
+    onConfirm: async (overlay) => {
       const checks = overlay.querySelectorAll('input[type="checkbox"]:checked');
       let added = 0;
-      checks.forEach((ch) => {
-        if (addLeadKeyword(ch.dataset.grp, ch.dataset.kw)) added++;
-      });
+      // addLeadKeyword ghi xuống DB dùng chung (bất đồng bộ) -> chờ từng từ.
+      for (const ch of checks) {
+        if (await addLeadKeyword(ch.dataset.grp, ch.dataset.kw)) added++;
+      }
       if (added) {
-        toast(`Đã thêm ${added} từ khoá. Bộ lọc đã cập nhật.`, "ok");
+        toast(`Đã thêm ${added} từ khoá vào DB dùng chung. Bộ lọc đã cập nhật.`, "ok");
         renderPosts();
       } else {
         toast("Chưa chọn từ nào (hoặc đã có sẵn).", "info");

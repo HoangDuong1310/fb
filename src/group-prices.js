@@ -36,6 +36,7 @@ import { extractMoneyFigures } from "./advisory.js";
 import { apiFetch as realApiFetch } from "./api.js";
 import * as DB from "./db.js";
 import { getAIConfig, fetchWithTimeout, parseSelectorJson } from "./util.js";
+import { getActiveProfile, systemForExtract } from "./prompts.js";
 
 // Số bài tối đa gửi AI trong MỘT lần gọi (phễu tầng 3). ~10-15 theo plan.
 const BATCH_SIZE = 15;
@@ -174,24 +175,6 @@ export async function extractBatch(posts, aiCall) {
 /* ====================== AI CALLER MẶC ĐỊNH (THẬT) ======================== */
 
 /**
- * Bộ NHẮC cho AI trích giá. AI CHỈ trích từ text được cấp, KHÔNG tự chế regex,
- * KHÔNG bịa số ngoài bài. Trả JSON { results:[{postId, items, new_keywords}] }.
- */
-const EXTRACT_SYSTEM_PROMPT =
-  "Bạn trích GIÁ BÁN từ các bài đăng RAO BÁN trong nhóm mua bán máy tính/linh kiện. " +
-  "Với MỖI bài, trích các sản phẩm ĐANG ĐƯỢC BÁN kèm giá. " +
-  "TUYỆT ĐỐI KHÔNG bịa số: chỉ dùng giá XUẤT HIỆN TRONG TEXT của chính bài đó. " +
-  "Nếu bài không phải rao bán hoặc không có giá rõ ràng -> trả items rỗng. " +
-  "KHÔNG tự nghĩ ra regex hay quy tắc; chỉ ĐỌC và TRÍCH. " +
-  "condition là một trong: 'mới' | 'cũ' | 'likenew' (đoán từ text, không rõ thì 'cũ'). " +
-  "new_keywords: các từ/cụm DẤU HIỆU BÁN mới gặp trong bài chưa có trong danh sách đã cấp " +
-  "(vd 'sang nhượng', 'để lại'); không có thì để mảng rỗng. " +
-  "CHỈ trả JSON đúng cấu trúc, không giải thích, không code fence: " +
-  '{"results":[{"postId":"<id>","items":[{"name":"<tên sản phẩm>","price":"<giá đúng như trong bài>",' +
-  '"condition":"mới|cũ|likenew","warranty":"<bảo hành nếu có>","category":"<danh mục>"}],' +
-  '"new_keywords":["..."]}]}';
-
-/**
  * defaultAiCall(batch, sellKeywords) — AI caller THẬT (OpenAI-compatible), theo
  * đúng pattern classifyIntent của advisory.js (getAIConfig + fetchWithTimeout).
  * Trả mảng per-post { postId, items, new_keywords }. Lỗi/không key -> trả mảng
@@ -205,6 +188,10 @@ async function defaultAiCall(batch, sellKeywords) {
   const apiKey = cfg.apiKey || "";
   const model = cfg.model || "gpt-5.5";
   if (!apiKey) return empty; // không key -> không trích
+
+  // Hồ sơ ngành đang kích hoạt (BE) -> dựng prompt trích giá theo đặc thù ngành.
+  const profile = await getActiveProfile();
+  const sys = systemForExtract(profile);
 
   const knownKeywords = Array.isArray(sellKeywords) ? sellKeywords.join(", ") : "";
   const postsBlock = batch
@@ -229,7 +216,7 @@ async function defaultAiCall(batch, sellKeywords) {
         body: JSON.stringify({
           model,
           messages: [
-            { role: "system", content: EXTRACT_SYSTEM_PROMPT },
+            { role: "system", content: sys },
             { role: "user", content: user },
           ],
           temperature: 0.1,
@@ -254,7 +241,7 @@ async function defaultAiCall(batch, sellKeywords) {
           body: JSON.stringify({
             model,
             messages: [
-              { role: "system", content: EXTRACT_SYSTEM_PROMPT },
+              { role: "system", content: sys },
               { role: "user", content: user },
             ],
             temperature: 0.1,

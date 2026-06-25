@@ -1,0 +1,41 @@
+# ===== Dependencies =====
+node_modules/
+**/node_modules/
+
+# ===== Next.js (web-ui) build output =====
+**/.next/
+**/out/
+**/build/
+
+# ===== Biến môi trường (KHÔNG commit secret) =====
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# ===== Log & file tạm =====
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+out2.txt
+test-out.txt
+*.out.txt
+
+# ===== TypeScript =====
+*.tsbuildinfo
+next-env.d.ts
+
+# ===== Hệ điều hành / editor =====
+.DS_Store
+Thumbs.db
+*.pem
+.vercel
+
+# ===== Đóng gói extension =====
+fb-group-crawler.zip
+
+# ===== Repo server riêng (đẩy lên fb-ui.git, không nhúng vào repo extension) =====
+server/

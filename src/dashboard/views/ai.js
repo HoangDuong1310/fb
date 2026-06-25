@@ -29,7 +29,7 @@ export function loadAIConfig() {
   chrome.storage.local.get(["aiConfig", "aiModelList"], (r) => {
     const cfg = (r && r.aiConfig) || {};
     const cached = (r && Array.isArray(r.aiModelList) && r.aiModelList) || [];
-    $("aiApiBase").value = cfg.apiBase || "https://danglamgiau.com/v1";
+    $("aiApiBase").value = cfg.apiBase || "";
     $("aiApiKey").value = cfg.apiKey || "";
     const model = cfg.model || "gpt-5.5";
     populateModelSelect(cached, model);

@@ -3,83 +3,320 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>FB Group New Posts Crawler</title>
+    <title>Group Radar — Crawler</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
     <style>
+      /* =====================================================================
+         Group Radar — popup, near-monochrome "Market Terminal" system.
+         Same restrained language as the dashboard (không màu mè), scaled to the
+         360px extension surface: graphite neutrals (chroma 0) carry the UI, one
+         quiet warm-sand accent (low chroma ~0.045) marks primary action (takes
+         DARK ink on solid fills), muted green/red only for price meaning,
+         JetBrains Mono on every figure, flat hairline borders — no puffy lifts.
+         OKLCH throughout.
+         ===================================================================== */
       :root {
-        --bg: #ffffff;
-        --fg: #1c1e21;
-        --muted: #65676b;
-        --primary: #1877f2;
-        --primary-hover: #166fe0;
-        --danger: #e4144c;
-        --border: #dddfe2;
-        --soft: #f0f2f5;
-        --ok: #1f8a4c;
+        color-scheme: dark;
+
+        /* ---- Graphite surface ramp (neutral, chroma 0) ---- */
+        --bg: oklch(0.155 0 0);
+        --surface: oklch(0.19 0 0);
+        --surface-2: oklch(0.225 0 0);
+        --surface-3: oklch(0.262 0 0);
+        --ink: oklch(0.96 0 0);
+        --ink-soft: oklch(0.765 0 0);
+        --ink-faint: oklch(0.6 0 0);
+        --line: oklch(0.3 0 0);
+        --line-soft: oklch(0.255 0 0);
+
+        /* ---- Restrained accent — a quiet warm sand, used sparingly ---- */
+        --accent: oklch(0.745 0.045 80);
+        --accent-bright: oklch(0.8 0.05 82);
+        --accent-soft: oklch(0.285 0.014 80);
+        --accent-ink: oklch(0.8 0.04 82);
+        --on-accent: oklch(0.2 0.012 80);
+        --accent-ring: oklch(0.745 0.045 80 / 0.4);
+
+        /* ---- Aliases kept so inline var(--primary)/var(--ring) still resolve ---- */
+        --primary: var(--accent);
+        --ring: var(--accent-ring);
+
+        /* ---- Semantic state — muted, functional only ---- */
+        --green: oklch(0.72 0.085 150);
+        --red: oklch(0.64 0.115 25);
+        --red-soft: oklch(0.285 0.05 25);
+        --danger: var(--red);
+        --danger-soft: var(--red-soft);
+        --ok: var(--green);
+
+        /* ---- Radius: tight, instrument-like ---- */
+        --r-sm: 6px;
+        --r-md: 9px;
+        --r-lg: 12px;
+
+        /* ---- Motion ---- */
+        --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+        --t-fast: 0.12s;
+        --t-mid: 0.18s;
+
+        /* ---- Type ---- */
+        --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+        --font-display: "Space Grotesk", var(--font);
+        --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo,
+          Consolas, monospace;
       }
+
       * { box-sizing: border-box; }
+
       body {
         width: 360px;
         margin: 0;
-        font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        font-family: var(--font);
         background: var(--bg);
-        color: var(--fg);
+        color: var(--ink);
         font-size: 13px;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
       }
+
+      /* Quiet terminal scrollbar */
+      * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+      *::-webkit-scrollbar { width: 8px; height: 8px; }
+      *::-webkit-scrollbar-thumb {
+        background: var(--line);
+        border-radius: 99px;
+        border: 2px solid transparent;
+        background-clip: content-box;
+      }
+      *::-webkit-scrollbar-track { background: transparent; }
+
+      ::selection { background: var(--accent-soft); color: var(--ink); }
+
+      /* ---- Header: brand bar with an amber signal rail ---- */
       header {
-        background: var(--primary);
-        color: #fff;
-        padding: 12px 14px;
+        position: relative;
+        background: var(--surface);
+        color: var(--ink);
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--line);
       }
-      header h1 { font-size: 14px; margin: 0; font-weight: 600; }
-      header p { margin: 4px 0 0; font-size: 11px; opacity: 0.9; }
-      .section { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+      header::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 3px;
+        background: var(--accent);
+      }
+      header h1 {
+        font-family: var(--font-display);
+        font-size: 15px;
+        margin: 0;
+        font-weight: 600;
+        letter-spacing: -0.015em;
+      }
+      header p {
+        margin: 4px 0 0;
+        font-size: 11px;
+        color: var(--ink-soft);
+      }
+
+      /* ---- Sections ---- */
+      .section {
+        padding: 13px 16px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+      h2 {
+        font-family: var(--font);
+        font-size: 11px;
+        margin: 0 0 9px;
+        color: var(--ink-faint);
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+
       .row { display: flex; gap: 8px; align-items: center; }
       .row + .row { margin-top: 8px; }
-      label { color: var(--muted); flex: 1; }
+      label { color: var(--ink-soft); flex: 1; }
+
+      /* ---- Inputs ---- */
       input[type="number"] {
-        width: 72px; padding: 5px 7px; border: 1px solid var(--border);
-        border-radius: 6px; font-size: 13px;
+        width: 76px;
+        padding: 7px 9px;
+        border: 1px solid var(--line);
+        border-radius: var(--r-sm);
+        font-size: 13px;
+        font-family: var(--font-mono);
+        font-feature-settings: "tnum" 1, "zero" 1;
+        background: var(--surface-2);
+        color: var(--ink);
+        outline: none;
+        text-align: right;
+        transition: border-color var(--t-fast), box-shadow var(--t-fast);
       }
       input.full {
-        width: 100%; padding: 6px 8px; border: 1px solid var(--border);
-        border-radius: 6px; font-size: 12px; font-family: inherit;
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: var(--r-sm);
+        font-size: 12px;
+        font-family: inherit;
+        background: var(--surface-2);
+        color: var(--ink);
+        outline: none;
+        transition: border-color var(--t-fast), box-shadow var(--t-fast);
       }
+      input::placeholder { color: var(--ink-faint); }
+      input:focus,
+      input:focus-visible {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+
+      /* ---- Buttons: flat, hairline; solid amber takes dark ink ---- */
       button {
-        border: none; border-radius: 6px; padding: 9px 12px;
-        font-size: 13px; font-weight: 600; cursor: pointer;
+        border: 1px solid transparent;
+        border-radius: var(--r-sm);
+        padding: 9px 12px;
+        font-size: 13px;
+        font-weight: 600;
+        font-family: inherit;
+        cursor: pointer;
+        transition: background var(--t-fast), border-color var(--t-fast),
+          color var(--t-fast);
+      }
+      button:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
       }
       button:disabled { opacity: 0.5; cursor: not-allowed; }
-      .btn-primary { background: var(--primary); color: #fff; flex: 1; }
-      .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
-      .btn-soft { background: var(--soft); color: var(--fg); }
-      .btn-danger { background: #fde8ee; color: var(--danger); }
+
+      .btn-primary {
+        background: var(--accent);
+        color: var(--on-accent);
+        flex: 1;
+      }
+      .btn-primary:hover:not(:disabled) { background: var(--accent-bright); }
+
+      .btn-soft {
+        background: var(--surface-2);
+        color: var(--ink);
+        border-color: var(--line);
+      }
+      .btn-soft:hover:not(:disabled) {
+        border-color: var(--accent);
+        color: var(--accent-ink);
+      }
+
+      .btn-danger {
+        background: transparent;
+        color: var(--red);
+        border-color: var(--red-soft);
+      }
+      .btn-danger:hover:not(:disabled) {
+        background: var(--red-soft);
+        border-color: var(--red);
+      }
+
       .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+      /* ---- Status readout — reads like a terminal line ---- */
       .status {
-        background: var(--soft); border-radius: 8px; padding: 10px;
-        font-size: 12px; min-height: 38px; white-space: pre-wrap;
+        background: var(--surface);
+        border: 1px solid var(--line-soft);
+        border-left: 2px solid var(--line);
+        border-radius: var(--r-sm);
+        padding: 10px 11px;
+        font-size: 12px;
+        min-height: 38px;
+        white-space: pre-wrap;
+        color: var(--ink-soft);
       }
-      .status.ok { color: var(--ok); }
-      .status.err { color: var(--danger); }
-      .stat-line { display: flex; justify-content: space-between; padding: 3px 0; }
-      .stat-line b { font-weight: 600; }
-      .muted { color: var(--muted); font-size: 11px; }
-      .groups { max-height: 110px; overflow: auto; margin-top: 6px; }
+      .status.ok { color: var(--green); border-left-color: var(--green); }
+      .status.err { color: var(--red); border-left-color: var(--red); }
+
+      /* ---- Saved-data figures ---- */
+      .stat-line {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        padding: 4px 0;
+      }
+      .stat-line b {
+        font-weight: 600;
+        font-family: var(--font-mono);
+        font-feature-settings: "tnum" 1, "zero" 1;
+        color: var(--ink);
+      }
+      .muted { color: var(--ink-faint); font-size: 11px; }
+
+      .groups { max-height: 120px; overflow: auto; margin-top: 8px; }
       .group-item {
-        display: flex; justify-content: space-between; padding: 4px 0;
-        border-top: 1px dashed var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        padding: 5px 0;
+        border-top: 1px solid var(--line-soft);
       }
-      h2 { font-size: 12px; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+      .group-item b {
+        font-family: var(--font-mono);
+        font-feature-settings: "tnum" 1, "zero" 1;
+        color: var(--accent-ink);
+      }
+
+      /* ---- Auth bar ---- */
       .authbar {
-        display: flex; justify-content: space-between; align-items: center;
-        padding: 8px 14px; background: var(--soft); border-bottom: 1px solid var(--border);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 9px 16px;
+        background: var(--surface-2);
+        border-bottom: 1px solid var(--line);
       }
       .authbar .name { font-weight: 600; }
       .auth-actions { margin-top: 10px; }
+
+      /* ---- Remember-account row: align the native checkbox with its label ---- */
+      .remember-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: none;
+        color: var(--ink-soft);
+        cursor: pointer;
+        user-select: none;
+      }
+      .remember-row input[type="checkbox"] {
+        width: 15px;
+        height: 15px;
+        margin: 0;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+
+      /* ---- Inline links ---- */
+      a { color: var(--accent-ink); }
+      a:hover { color: var(--accent-bright); }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+        }
+      }
     </style>
   </head>
   <body>
     <header>
-      <h1>FB Group — Crawl bài viết mới</h1>
+      <h1>Group Radar — Crawl bài viết mới</h1>
       <p>Chỉ lấy bài MỚI từ nhóm đang mở • lưu IndexedDB</p>
     </header>
 
@@ -92,10 +329,33 @@
       <h2>Đăng nhập</h2>
       <input type="email" id="loginEmail" class="full" placeholder="Email" autocomplete="username" />
       <input type="password" id="loginPassword" class="full" placeholder="Mật khẩu" autocomplete="current-password" style="margin-top: 8px;" />
+      <label class="remember-row" style="margin-top: 10px;">
+        <input type="checkbox" id="rememberMe" />
+        <span>Ghi nhớ tài khoản</span>
+      </label>
       <div class="auth-actions row">
         <button id="btnLogin" class="btn-primary">Đăng nhập</button>
       </div>
       <div id="loginError" class="status err" style="margin-top: 8px;" hidden></div>
+      <p class="muted" style="margin: 10px 0 0;">
+        Chưa có tài khoản?
+        <a href="#" id="linkShowRegister" style="color: var(--primary); font-weight: 600;">Đăng ký</a>
+      </p>
+    </div>
+
+    <div id="registerSection" class="section" hidden>
+      <h2>Đăng ký</h2>
+      <input type="text" id="registerName" class="full" placeholder="Tên hiển thị (tuỳ chọn)" autocomplete="name" />
+      <input type="email" id="registerEmail" class="full" placeholder="Email" autocomplete="username" style="margin-top: 8px;" />
+      <input type="password" id="registerPassword" class="full" placeholder="Mật khẩu (tối thiểu 6 ký tự)" autocomplete="new-password" style="margin-top: 8px;" />
+      <div class="auth-actions row">
+        <button id="btnRegister" class="btn-primary">Tạo tài khoản</button>
+      </div>
+      <div id="registerError" class="status err" style="margin-top: 8px;" hidden></div>
+      <p class="muted" style="margin: 10px 0 0;">
+        Đã có tài khoản?
+        <a href="#" id="linkShowLogin" style="color: var(--primary); font-weight: 600;">Đăng nhập</a>
+      </p>
     </div>
 
     <div id="appSection" hidden>

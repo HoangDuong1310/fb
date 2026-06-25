@@ -13,6 +13,7 @@ import {
   fetchWithTimeout,
   broadcast,
 } from "./util.js";
+import { getActiveProfile, systemForBuild } from "./prompts.js";
 
 /**
  * Hàm TỰ-CHỨA chạy trong NGỮ CẢNH TRANG (func injection).
@@ -408,26 +409,9 @@ export async function buildConfigWithAI(payload) {
     });
   }
 
-  const sys =
-    "Bạn là KỸ SƯ BUILD PC cao cấp (senior system builder) với 10+ năm kinh nghiệm tại Việt Nam, " +
-    "am hiểu sâu về tương thích phần cứng, nghẽn cổ chai và tối ưu hiệu năng/giá. " +
-    "Khách đưa NGÂN SÁCH (VND) và NHU CẦU. Bạn nhận danh sách linh kiện ỨNG VIÊN theo từng danh mục " +
-    "(mỗi món có id, name, price VND, store, owned=có sẵn trong kho). " +
-    "NHIỆM VỤ: chọn đúng 1 linh kiện cho MỖI danh mục để tạo ra cấu hình TỐT NHẤT CÓ THỂ, theo các nguyên tắc của kỹ sư:\n" +
-    "1) TƯƠNG THÍCH: CPU phải khớp socket/chipset của Mainboard (Intel LGA1700/1851, AMD AM4/AM5); RAM đúng chuẩn (DDR4/DDR5) theo Main; " +
-    "Nguồn (PSU) phải đủ công suất cho VGA + CPU (cộng ~30% dự phòng); Vỏ case đủ chỗ cho VGA và tản nhiệt.\n" +
-    "2) CÂN BẰNG, TRÁNH NGHẼN CỔ CHAI: CPU - VGA - RAM phải tương xứng nhau, không ghép CPU yếu với VGA quá mạnh hoặc ngược lại.\n" +
-    "3) PHÂN BỔ NGÂN SÁCH THEO NHU CẦU: gaming -> dồn tiền cho VGA (40-50%), CPU vừa đủ; " +
-    "đồ hoạ/render/AI -> ưu tiên CPU nhiều nhân + RAM dung lượng lớn + VGA mạnh; " +
-    "văn phòng -> tối giản, bỏ VGA rời nếu CPU có iGPU, dồn vào SSD + RAM; " +
-    "stream -> CPU nhiều nhân + VGA tầm trung + RAM lớn.\n" +
-    "4) TIÊU TIỀN THÔNG MINH: HÃY DÙNG GẦN HẾT ngân sách để đạt hiệu năng cao nhất (không cố tình chọn hàng rẻ để dư tiền), " +
-    "nhưng TUYỆT ĐỐI KHÔNG vượt ngân sách. Nếu dư nhiều, nâng cấp linh kiện quan trọng nhất theo nhu cầu.\n" +
-    "5) ƯU TIÊN owned=true (hàng trong kho) khi hiệu năng/giá tương đương để bán được hàng tồn.\n" +
-    "CHỈ trả JSON hợp lệ, KHÔNG giải thích ngoài JSON, KHÔNG bọc code fence. " +
-    'Cấu trúc: {"items":[{"category":"<tên danh mục>","id":"<id linh kiện đã chọn>","reason":"<lý do kỹ thuật ngắn gọn vì sao chọn món này>"}],"note":"<đánh giá tổng thể cấu hình: điểm mạnh, mức hiệu năng kỳ vọng cho nhu cầu, 1-3 câu>"}. ' +
-    'QUAN TRỌNG: trường "id" là MÃ SỐ NGẮN của ứng viên (đúng giá trị "id" trong danh sách ỨNG VIÊN, ví dụ "7"). CHÉP NGUYÊN VĂN mã đó, KHÔNG tự bịa, KHÔNG ghi tên linh kiện vào id. ' +
-    "BẮT BUỘC mỗi danh mục được yêu cầu phải có đúng 1 item, id phải nằm trong danh sách ứng viên của danh mục đó.";
+  // Hồ sơ ngành đang kích hoạt (BE) -> dựng prompt build theo đặc thù ngành.
+  const profile = await getActiveProfile();
+  const sys = systemForBuild(profile);
 
   const user =
     "NGÂN SÁCH: " + budget + " VND (hãy tận dụng tối đa, không vượt)\n" +
@@ -810,4 +794,137 @@ export async function spinPostContent(payload) {
   }
 
   return { ok: true, variants, source: "ai" };
+}
+
+/**
+ * generateProfileSkill — Dùng AI sinh NỘI DUNG cho 1 trường "skill" của hồ sơ
+ * ngành khi người dùng để trống / nhập thiếu. Dựa vào ngữ cảnh hồ sơ (tên, mô
+ * tả, danh mục) + ý nghĩa của từng skill để viết đoạn hướng dẫn tiếng Việt phù
+ * hợp ngành. CHỈ sinh phần nội dung đặc thù ngành — KHÔNG sinh khung JSON (khung
+ * này do code tự nối ở prompts.js nên không bao giờ vỡ luồng).
+ *
+ * payload: { field, profile:{ name, description, categories } }
+ *   field ∈ classifyIntro | draftPersona | extractIntro | buildPersona
+ * trả: { ok, text, source } hoặc { ok:false, error }
+ */
+export async function generateProfileSkill(payload) {
+  const field = payload && payload.field ? String(payload.field) : "";
+  const profile = (payload && payload.profile) || {};
+  const name = String(profile.name || "").trim();
+  const description = String(profile.description || "").trim();
+  const categories = Array.isArray(profile.categories)
+    ? profile.categories.map((c) => String(c || "").trim()).filter(Boolean)
+    : [];
+
+  // Mô tả ý nghĩa + yêu cầu của từng skill để AI viết đúng "phần đặc thù ngành".
+  const SKILL_SPECS = {
+    classifyIntro:
+      "Đoạn hướng dẫn AI PHÂN LOẠI Ý ĐỊNH của một bài đăng / bình luận trong nhóm: " +
+      "khách MUỐN MUA, khách CHỈ HỎI/THẮC MẮC, hay nội dung BỎ QUA (không liên quan). " +
+      "Nêu rõ dấu hiệu nhận biết theo đặc thù ngành (từ khóa, ngữ cảnh) để AI quyết định chính xác.",
+    draftPersona:
+      "Đoạn mô tả VAI TRÒ và QUY TẮC khi AI SOẠN TRẢ LỜI khách: giọng văn, thái độ, " +
+      "cách xưng hô, điều nên nói / nên tránh, cách dẫn dắt chốt đơn phù hợp ngành. " +
+      "Viết như bản mô tả nhân sự bán hàng giỏi của ngành này.",
+    extractIntro:
+      "Đoạn hướng dẫn AI TRÍCH GIÁ / thông tin sản phẩm từ các bài RAO BÁN trong nhóm: " +
+      "cần lấy những trường nào (tên sản phẩm, giá, tình trạng...) và lưu ý đặc thù ngành " +
+      "khi đọc giá (đơn vị, khoảng giá, cách viết tắt thường gặp).",
+    buildPersona:
+      "Đoạn hướng dẫn AI GHÉP BỘ / tư vấn combo theo NGÂN SÁCH của khách trong ngành này: " +
+      "cách phân bổ ngân sách cho từng nhóm sản phẩm, ưu tiên gì trước, nguyên tắc cân đối. " +
+      "Nếu ngành không có khái niệm ghép bộ thì viết ngắn gọn cách gợi ý sản phẩm theo ngân sách.",
+  };
+  const spec = SKILL_SPECS[field];
+  if (!spec) return { ok: false, error: "Trường skill không hợp lệ: " + field };
+  if (!name && !description && !categories.length) {
+    return {
+      ok: false,
+      error: "Hãy điền tên / mô tả / danh mục hồ sơ trước để AI có ngữ cảnh sinh nội dung.",
+    };
+  }
+
+  const cfg = await getAIConfig();
+  const apiBase = (cfg.apiBase || "https://danglamgiau.com/v1").replace(/\/+$/, "");
+  const apiKey = cfg.apiKey || "";
+  const model = cfg.model || "gpt-5.5";
+  if (!apiKey) {
+    return { ok: false, error: "Chưa cấu hình API key AI (tab Cài đặt) nên chưa sinh được nội dung." };
+  }
+
+  const ctx =
+    "NGÀNH / HỒ SƠ:\n" +
+    "- Tên: " + (name || "(chưa đặt)") + "\n" +
+    "- Mô tả: " + (description || "(chưa có)") + "\n" +
+    "- Danh mục sản phẩm: " + (categories.length ? categories.join(", ") : "(chưa có)") + "\n";
+
+  const sys =
+    "Bạn là CHUYÊN GIA THIẾT KẾ PROMPT cho trợ lý bán hàng AI tiếng Việt. Người dùng " +
+    "đang tạo 'hồ sơ ngành' để áp tool cho ngành của họ. Nhiệm vụ của bạn: viết NỘI DUNG " +
+    "đặc thù ngành cho MỘT phần hướng dẫn (skill) dựa trên ngữ cảnh hồ sơ.\n" +
+    "QUY TẮC:\n" +
+    "1) Viết tiếng Việt tự nhiên, rõ ràng, đúng đặc thù ngành đã cho.\n" +
+    "2) CHỈ viết phần nội dung hướng dẫn, KHÔNG kèm khung JSON, KHÔNG ví dụ JSON, " +
+    "KHÔNG tiêu đề thừa, KHÔNG giải thích ngoài lề.\n" +
+    "3) Độ dài vừa phải (vài câu đến một đoạn), dùng gạch đầu dòng khi cần cho dễ đọc.\n" +
+    'CHỈ trả JSON hợp lệ, KHÔNG bọc code fence. Cấu trúc: {"text":"<nội dung hướng dẫn>"}';
+
+  const user =
+    ctx + "\n" +
+    "PHẦN CẦN VIẾT:\n" + spec + "\n\n" +
+    'Hãy trả JSON đúng cấu trúc {"text":"..."} với nội dung hướng dẫn cho phần trên.';
+
+  const AI_TIMEOUT_MS = 30000;
+  const callOnce = async (useJsonFormat) => {
+    const body = {
+      model,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user },
+      ],
+      temperature: 0.7,
+      max_tokens: 1500,
+      stream: false,
+    };
+    if (useJsonFormat) body.response_format = { type: "json_object" };
+    return fetchWithTimeout(
+      apiBase + "/chat/completions",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey },
+        body: JSON.stringify(body),
+      },
+      AI_TIMEOUT_MS
+    );
+  };
+
+  let resp;
+  try {
+    resp = await callOnce(true);
+    if (resp && (resp.status === 400 || resp.status === 422)) {
+      resp = await callOnce(false);
+    }
+  } catch (e) {
+    return { ok: false, error: "Gọi AI thất bại: " + String(e) };
+  }
+  if (!resp || !resp.ok) {
+    return { ok: false, error: "AI trả lỗi (HTTP " + (resp ? resp.status : "?") + ")." };
+  }
+
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    return { ok: false, error: "Không đọc được phản hồi AI." };
+  }
+  const raw = data && data.choices && data.choices[0] && data.choices[0].message
+    ? data.choices[0].message.content
+    : "";
+  const obj = parseSelectorJson(raw);
+  // Ưu tiên obj.text; nếu AI lỡ trả thẳng văn bản (không phải JSON) thì dùng raw.
+  let text = obj && typeof obj.text === "string" ? obj.text.trim() : "";
+  if (!text) text = String(raw || "").trim();
+  if (!text) return { ok: false, error: "AI không sinh được nội dung." };
+
+  return { ok: true, text, source: "ai" };
 }

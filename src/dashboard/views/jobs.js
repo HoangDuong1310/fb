@@ -27,7 +27,13 @@ export function renderJobs(type) {
     wrap.innerHTML = emptyState("Chưa có việc nào", "Tạo việc ở khung bên trái để đưa vào hàng đợi.");
     return;
   }
-  wrap.innerHTML = list
+  // Việc do người dùng soạn được tạo ở trạng thái "Chờ duyệt" (paused) -> KHÔNG
+  // tự chạy. Hiện thanh "Duyệt tất cả" khi còn việc chờ duyệt để xác nhận một lần.
+  const pausedCount = list.filter((j) => j.status === "paused").length;
+  const approveBar = pausedCount
+    ? `<div class="job-approve-bar"><span class="hint">${pausedCount} việc đang chờ bạn duyệt trước khi đăng.</span><button class="btn primary sm" data-act="approve-all">Duyệt tất cả (${pausedCount})</button></div>`
+    : "";
+  wrap.innerHTML = approveBar + list
     .map((j) => {
       const target =
         type === "comment"
@@ -58,7 +64,9 @@ export function renderJobs(type) {
               : "Tạo: " + timeAgo(j.createdAt)
           }</span>
           ${
-            j.status === "pending" || j.status === "error"
+            j.status === "paused"
+              ? `<button class="btn primary sm" data-act="approve">Duyệt</button><button class="btn ghost sm" data-act="run">Đăng ngay</button>`
+              : j.status === "pending" || j.status === "error"
               ? `<button class="btn ghost sm" data-act="run">Chạy ngay</button>`
               : ""
           }
@@ -69,7 +77,13 @@ export function renderJobs(type) {
     .join("");
 }
 export function statusText(s) {
-  return { pending: "Chờ", running: "Đang chạy", done: "Xong", error: "Lỗi" }[s] || s;
+  return {
+    paused: "Chờ duyệt",
+    pending: "Chờ",
+    running: "Đang chạy",
+    done: "Xong",
+    error: "Lỗi",
+  }[s] || s;
 }
 export function groupName(id) {
   const g = store.groups.find((x) => x.groupId === id);
@@ -183,26 +197,33 @@ export async function preparePost() {
     return toast("Hãy chọn ít nhất một nhóm hoặc bật đăng lên trang cá nhân.", "err");
 
   let variants;
+  // fallbackInfo: thông báo bền vững hiển thị trong modal xem trước khi AI không xào nấu được
+  let fallbackInfo = null;
   if (useAI && targets.length > 1) {
     const loading = toast("Đang nhờ AI xào nấu nội dung...", "info", 60000);
     const res = await bg("AI_SPIN_CONTENT", { payload: { content, count: targets.length } });
     loading.close();
     if (res && res.ok && Array.isArray(res.variants) && res.variants.length) {
       variants = res.variants;
-      if (res.source === "fallback")
-        toast(res.note || "Chưa xào nấu được bằng AI, tạm dùng nội dung gốc.", "info");
+      if (res.source === "fallback") {
+        const note = res.note || "Chưa xào nấu được bằng AI, tạm dùng nội dung gốc.";
+        toast(note, "info");
+        fallbackInfo = { kind: "warn", note };
+      }
     } else {
       variants = targets.map(() => content);
-      toast((res && res.error) || "AI lỗi, dùng nội dung gốc cho mọi mục tiêu.", "err");
+      const note = (res && res.error) || "AI lỗi, dùng nội dung gốc cho mọi mục tiêu.";
+      toast(note, "err");
+      fallbackInfo = { kind: "err", note };
     }
   } else {
     variants = targets.map(() => content);
   }
 
-  showPreview(targets, variants, content);
+  showPreview(targets, variants, content, fallbackInfo);
 }
 
-function showPreview(targets, variants, origContent) {
+function showPreview(targets, variants, origContent, fallbackInfo) {
   const images = postImagesArr.slice();
   const spacing = Math.max(0, parseInt($("postJobSpacing").value, 10) || 0);
   const tVal = $("postJobTime").value;
@@ -231,18 +252,27 @@ function showPreview(targets, variants, origContent) {
 
   modal({
     title: `Xem trước ${targets.length} bài đăng`,
-    bodyHTML: `<p class="hint">Bạn có thể sửa từng biến thể trước khi tạo việc.</p><div class="variant-list">${rows}</div>${imgNote}`,
+    bodyHTML: `${
+      fallbackInfo
+        ? `<div class="ai-fallback-banner ${fallbackInfo.kind === "err" ? "err" : "warn"}">${esc(
+            fallbackInfo.note
+          )}</div>`
+        : ""
+    }<p class="hint">Bạn có thể sửa từng biến thể trước khi tạo việc.</p><div class="variant-list">${rows}</div>${imgNote}`,
     confirmText: `Tạo ${targets.length} việc`,
     onConfirm: async (overlay) => {
       const tas = [...overlay.querySelectorAll(".variant-item textarea")];
       const batchId = "batch_" + Date.now();
       let created = 0;
+      // Gom các nhóm đã tạo việc thành công để lưu vào lịch sử "nhóm hay đăng".
+      const postedGroups = [];
       for (let i = 0; i < targets.length; i++) {
         const text = ((tas[i] && tas[i].value) || "").trim();
         if (!text) continue;
         const scheduledAt = baseTime + i * spacing * 60000;
         const job = {
           type: "post",
+          status: "paused", // chờ người dùng duyệt, KHÔNG tự đăng
           targetType: targets[i].type,
           groupId: targets[i].groupId,
           content: text,
@@ -252,9 +282,25 @@ function showPreview(targets, variants, origContent) {
           scheduledAt,
         };
         const res = await bg("CREATE_JOB", { job });
-        if (res && res.ok) created++;
+        if (res && res.ok) {
+          created++;
+          // Chỉ lưu nhóm thật (bỏ qua đăng lên trang cá nhân — không có groupId).
+          if (targets[i].type === "group" && targets[i].groupId) {
+            postedGroups.push({
+              groupId: targets[i].groupId,
+              groupName: targets[i].name || targets[i].groupId,
+            });
+          }
+        }
       }
-      toast(`Đã tạo ${created}/${targets.length} việc đăng bài.`, created ? "ok" : "err");
+      // Lưu lịch sử nhóm đăng gần đây / hay đăng (theo tài khoản, device-local).
+      if (postedGroups.length) {
+        await bg("RECORD_POSTED_GROUPS", { groups: postedGroups });
+      }
+      toast(
+        `Đã tạo ${created}/${targets.length} việc (đang CHỜ DUYỆT). Bấm "Duyệt" để đăng.`,
+        created ? "ok" : "err"
+      );
       $("postJobContent").value = "";
       $("postJobTime").value = "";
       postImagesArr.length = 0;
@@ -283,7 +329,7 @@ export async function createCommentJob(prefillUrl) {
   const scheduledAt = t ? new Date(t).getTime() : Date.now();
   const images = cmtImagesArr.slice();
   const res = await bg("CREATE_JOB", {
-    job: { type: "comment", targetUrl, content, images, scheduledAt },
+    job: { type: "comment", status: "paused", targetUrl, content, images, scheduledAt },
   });
   if (!res || !res.ok) return toast("Không tạo được việc.", "err");
   $("cmtJobContent").value = "";
@@ -291,6 +337,6 @@ export async function createCommentJob(prefillUrl) {
   $("cmtJobTime").value = "";
   cmtImagesArr.length = 0;
   renderCmtImgPreview();
-  toast("Đã đưa vào hàng đợi bình luận.", "ok");
+  toast('Đã thêm vào hàng đợi (CHỜ DUYỆT). Bấm "Duyệt" để gửi.', "ok");
   loadJobs("comment");
 }

@@ -129,6 +129,12 @@ async function deleteGroup(groupId) {
 // được mà không cần `chrome`.
 const JOBS_KEY = "localJobs";
 
+// Một job ở trạng thái "running" lâu hơn ngưỡng này được coi là bị KẸT (do
+// service worker MV3 bị Chrome tắt giữa chừng) và sẽ được khôi phục để chạy lại.
+const STUCK_RUNNING_MS = 3 * 60 * 1000; // 3 phút
+// Số lần thử tối đa trước khi đánh dấu lỗi (tránh lặp vô hạn / đăng trùng mãi).
+const MAX_JOB_ATTEMPTS = 3;
+
 // Store in-memory dự phòng (khi không có chrome.storage). { seq, jobs:[] }.
 let _memJobs = { seq: 1, jobs: [] };
 
@@ -245,6 +251,35 @@ async function getDueJobs(now) {
   return out;
 }
 
+/**
+ * Khôi phục các job bị KẸT ở trạng thái "running": service worker MV3 có thể bị
+ * Chrome tắt giữa chừng khi đang chạy một job, để lại job đó mãi ở "running" —
+ * getDueJobs (chỉ lấy "pending") sẽ KHÔNG bao giờ chạy lại nó, nên một mẻ lớn
+ * (vd 39 nhóm) chỉ chạy được vài bài rồi đứng. Hàm này đưa job kẹt về "pending"
+ * để guồng lịch chạy lại, hoặc đánh "error" nếu đã thử quá số lần cho phép.
+ * Trả về số job đã thay đổi.
+ */
+async function recoverStuckJobs(now) {
+  const t = now || Date.now();
+  const store = await readJobs();
+  let changed = 0;
+  for (const j of store.jobs) {
+    if (j.status !== "running") continue;
+    const last = j.updatedAt || j.createdAt || 0;
+    if (t - last <= STUCK_RUNNING_MS) continue; // còn đang chạy hợp lệ
+    if ((j.attempts || 0) >= MAX_JOB_ATTEMPTS) {
+      j.status = "error";
+      j.error = "Bị gián đoạn nhiều lần (service worker tắt giữa chừng).";
+    } else {
+      j.status = "pending"; // thử lại ở tick sau
+    }
+    j.updatedAt = t;
+    changed++;
+  }
+  if (changed) await writeJobs(store);
+  return changed;
+}
+
 /** Xóa một job theo id. Trả về true. */
 async function deleteJob(id) {
   const store = await readJobs();
@@ -263,6 +298,124 @@ async function clearFinishedJobs() {
   const deleted = before - store.jobs.length;
   await writeJobs(store);
   return deleted;
+}
+
+/* ===================== POSTED GROUPS (lịch sử đăng) ====================== */
+//
+// Lưu CỤC BỘ theo thiết bị (chrome.storage.local) danh sách nhóm mà từng tài
+// khoản đã đăng bài, kèm số lần đăng (count) và lần đăng gần nhất
+// (lastPostedAt). Dùng để gợi ý "nhóm đăng gần đây / nhóm hay đăng" theo tài
+// khoản. KHÔNG gọi API, KHÔNG chia sẻ giữa người dùng. Khi không có
+// chrome.storage (môi trường test) thì dùng store in-memory.
+const POSTED_GROUPS_KEY = "postedGroups";
+
+// Số nhóm tối đa giữ lại cho mỗi tài khoản (tránh phình to vô hạn).
+const MAX_POSTED_GROUPS_PER_USER = 100;
+
+// Store in-memory dự phòng. Cấu trúc: { [userId]: PostedGroup[] }.
+let _memPostedGroups = {};
+
+/** Đọc toàn bộ map nhóm-đã-đăng ({ [userId]: PostedGroup[] }). */
+function readPostedGroups() {
+  if (!hasChromeStorage()) {
+    return Promise.resolve(_memPostedGroups);
+  }
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(POSTED_GROUPS_KEY, (r) => {
+        void chrome.runtime.lastError;
+        const v = (r && r[POSTED_GROUPS_KEY]) || {};
+        resolve(v && typeof v === "object" ? v : {});
+      });
+    } catch (e) {
+      resolve({});
+    }
+  });
+}
+
+/** Ghi toàn bộ map nhóm-đã-đăng. */
+function writePostedGroups(map) {
+  if (!hasChromeStorage()) {
+    _memPostedGroups = map;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set({ [POSTED_GROUPS_KEY]: map }, () => {
+        void chrome.runtime.lastError;
+        resolve();
+      });
+    } catch (e) {
+      resolve();
+    }
+  });
+}
+
+/** Khóa tài khoản dùng làm key trong map (mặc định "_local" khi chưa đăng nhập). */
+function postedGroupsKeyFor(userId) {
+  return userId == null || userId === "" ? "_local" : String(userId);
+}
+
+/**
+ * Ghi nhận một tài khoản vừa đăng vào các nhóm. Tăng count và cập nhật
+ * lastPostedAt cho mỗi nhóm. `groups` là mảng { groupId, groupName }.
+ * Trả về danh sách nhóm-đã-đăng mới nhất của tài khoản.
+ */
+async function recordPostedGroups(userId, groups) {
+  const list = Array.isArray(groups) ? groups : [];
+  const map = await readPostedGroups();
+  const key = postedGroupsKeyFor(userId);
+  const arr = Array.isArray(map[key]) ? map[key] : [];
+  const byId = new Map(arr.map((g) => [g.groupId, g]));
+  const now = Date.now();
+  for (const g of list) {
+    const groupId = g && g.groupId != null ? String(g.groupId) : "";
+    if (!groupId) continue;
+    const groupName = (g && g.groupName) || groupId;
+    const existing = byId.get(groupId);
+    if (existing) {
+      existing.count = (existing.count || 0) + 1;
+      existing.lastPostedAt = now;
+      existing.groupName = groupName;
+    } else {
+      byId.set(groupId, { groupId, groupName, count: 1, lastPostedAt: now });
+    }
+  }
+  // Sắp theo lần đăng gần nhất giảm dần rồi cắt bớt nếu quá ngưỡng.
+  let next = [...byId.values()].sort(
+    (a, b) => (b.lastPostedAt || 0) - (a.lastPostedAt || 0)
+  );
+  if (next.length > MAX_POSTED_GROUPS_PER_USER) {
+    next = next.slice(0, MAX_POSTED_GROUPS_PER_USER);
+  }
+  map[key] = next;
+  await writePostedGroups(map);
+  return next;
+}
+
+/**
+ * Lấy danh sách nhóm-đã-đăng của một tài khoản, kèm hai cách sắp xếp gợi ý.
+ * Trả về { recent: PostedGroup[], frequent: PostedGroup[] }.
+ */
+async function getPostedGroups(userId, opts = {}) {
+  const map = await readPostedGroups();
+  const key = postedGroupsKeyFor(userId);
+  const arr = Array.isArray(map[key]) ? map[key].slice() : [];
+  const limit =
+    typeof opts.limit === "number" && opts.limit > 0 ? opts.limit : 10;
+  const recent = arr
+    .slice()
+    .sort((a, b) => (b.lastPostedAt || 0) - (a.lastPostedAt || 0))
+    .slice(0, limit);
+  const frequent = arr
+    .slice()
+    .sort(
+      (a, b) =>
+        (b.count || 0) - (a.count || 0) ||
+        (b.lastPostedAt || 0) - (a.lastPostedAt || 0)
+    )
+    .slice(0, limit);
+  return { recent, frequent };
 }
 
 /* ============================ PRODUCTS =================================== */
@@ -304,9 +457,15 @@ async function searchProducts(opts = {}) {
   return Array.isArray(body?.products) ? body.products : [];
 }
 
-/** Xóa sản phẩm theo source. Trả về SỐ sản phẩm đã xóa. */
+/**
+ * Xóa sản phẩm. Có source -> xóa theo source. Không có source -> xóa TOÀN BỘ
+ * (truyền cờ all=1 để server phân biệt "xóa hết có chủ đích" với lỗi thiếu
+ * tham số — server chặn DELETE không phạm vi để tránh xóa nhầm cả kho).
+ * Trả về SỐ sản phẩm đã xóa.
+ */
 async function clearProducts(source) {
-  const body = await apiFetch("/api/products" + qs({ source }), {
+  const query = source ? qs({ source }) : qs({ all: 1 });
+  const body = await apiFetch("/api/products" + query, {
     method: "DELETE",
   });
   return body?.deleted || 0;
@@ -372,6 +531,70 @@ async function getSources() {
 /** Xóa một cấu hình nguồn theo id. Trả về true. */
 async function deleteSource(id) {
   await apiFetch("/api/sources/" + encodeURIComponent(id), {
+    method: "DELETE",
+  });
+  return true;
+}
+
+/* ========================== PROMPT PROFILES ============================== *
+ * "Hồ sơ ngành" — phần đặc thù ngành của các system prompt AI, lưu ở backend
+ * (bảng prompt_profiles) nên chia sẻ được. prompts.js gọi getActivePromptProfile()
+ * để lấy hồ sơ đang dùng; dashboard dùng các hàm còn lại để quản lý.
+ * ------------------------------------------------------------------------- */
+
+/** Lấy toàn bộ hồ sơ ngành. Trả về MẢNG (mỗi phần tử gồm config + id/name/isActive). */
+async function getPromptProfiles() {
+  const body = await apiFetch("/api/prompt-profiles");
+  const rows = Array.isArray(body?.profiles) ? body.profiles : [];
+  return rows.map((r) => ({
+    ...(r.config || {}),
+    id: r.id,
+    name: r.name,
+    isActive: !!r.isActive,
+    updatedAt: r.updatedAt,
+  }));
+}
+
+/** Lấy hồ sơ ngành ĐANG KÍCH HOẠT (đã dẹp phẳng config). Trả về object hoặc null. */
+async function getActivePromptProfile() {
+  const body = await apiFetch("/api/prompt-profiles/active");
+  const r = body?.profile;
+  if (!r) return null;
+  return {
+    ...(r.config || {}),
+    id: r.id,
+    name: r.name,
+    isActive: !!r.isActive,
+    updatedAt: r.updatedAt,
+  };
+}
+
+/** Lưu/cập nhật một hồ sơ ngành (upsert theo id). Trả về bản ghi đã lưu. */
+async function savePromptProfile(profile) {
+  if (!profile || !profile.id) throw new Error("Thiếu id hồ sơ ngành.");
+  await apiFetch("/api/prompt-profiles", {
+    method: "POST",
+    body: JSON.stringify({
+      id: profile.id,
+      name: profile.name ?? profile.id,
+      config: profile,
+      isActive: !!profile.isActive,
+    }),
+  });
+  return profile;
+}
+
+/** Kích hoạt một hồ sơ ngành (đặt là hồ sơ duy nhất AI dùng). Trả về true. */
+async function activatePromptProfile(id) {
+  await apiFetch("/api/prompt-profiles/" + encodeURIComponent(id) + "/activate", {
+    method: "POST",
+  });
+  return true;
+}
+
+/** Xóa một hồ sơ ngành theo id. Trả về true. */
+async function deletePromptProfile(id) {
+  await apiFetch("/api/prompt-profiles/" + encodeURIComponent(id), {
     method: "DELETE",
   });
   return true;
@@ -456,6 +679,7 @@ async function createConversation(conv) {
     groupId: "",
     groupName: "",
     jobId: null,
+    commentId: null,
     myComment: "",
     myCommentUrl: "",
     replies: [],
@@ -470,6 +694,9 @@ async function createConversation(conv) {
     body: JSON.stringify({
       postId: record.postId,
       commentPermalink: record.commentPermalink ?? record.myCommentUrl,
+      // ID bình luận GỐC của ta (parent). Trích chắc chắn từ URL (comment_id=)
+      // nên định vị reply CHÍNH XÁC, khỏi dò mò theo nội dung text.
+      commentId: record.commentId,
       replies: record.replies,
       status: record.status,
       // Rich context fields must reach the server too, otherwise getConversations
@@ -558,8 +785,12 @@ export {
   updateJob,
   getJobs,
   getDueJobs,
+  recoverStuckJobs,
   deleteJob,
   clearFinishedJobs,
+  // posted groups (lịch sử đăng — device-local, NOT API)
+  recordPostedGroups,
+  getPostedGroups,
   // products
   saveProducts,
   getProducts,
@@ -570,6 +801,12 @@ export {
   saveSource,
   getSources,
   deleteSource,
+  // prompt profiles (hồ sơ ngành — đặc thù ngành của system prompt AI)
+  getPromptProfiles,
+  getActivePromptProfile,
+  savePromptProfile,
+  activatePromptProfile,
+  deletePromptProfile,
   // advisories (nháp tư vấn AI)
   saveAdvisory,
   getAdvisories,

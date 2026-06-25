@@ -47,6 +47,7 @@ test("createConversation POSTs the full rich field set", async () => {
     postUrl: "https://fb.com/groups/x/posts/1",
     groupId: "g1",
     groupName: "Group One",
+    commentId: "2198772343999307",
     myComment: "Inbox giá nhé",
     myCommentUrl: "https://fb.com/comment/abc",
     postText: "Cần bán iPhone",
@@ -67,6 +68,9 @@ test("createConversation POSTs the full rich field set", async () => {
   assert.equal(body.postUrl, "https://fb.com/groups/x/posts/1");
   assert.equal(body.groupId, "g1");
   assert.equal(body.groupName, "Group One");
+  // commentId là ID bình luận GỐC trích chắc từ URL — phải tới server để định
+  // vị reply chính xác, khỏi dò mò theo nội dung text.
+  assert.equal(body.commentId, "2198772343999307");
   assert.equal(body.myComment, "Inbox giá nhé");
   assert.equal(body.myCommentUrl, "https://fb.com/comment/abc");
   assert.equal(body.postText, "Cần bán iPhone");

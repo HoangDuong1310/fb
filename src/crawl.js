@@ -261,10 +261,50 @@ async function runPostInPage(text, images) {
     document.querySelector('div[role="textbox"][contenteditable="true"]');
   if (!box) return { ok: false, error: "Không tìm thấy ô soạn bài." };
   box.focus();
-  try {
-    document.execCommand("insertText", false, text);
-  } catch (e) {
-    box.textContent = text;
+  // FB dùng trình soạn contenteditable (Lexical). Lexical CHẶN beforeinput nên
+  // execCommand("insertParagraph"/"insertLineBreak") bị vô hiệu, chỉ insertText
+  // lọt qua -> "\n" bị nuốt -> dồn 1 hàng. Cách ĐÁNG TIN CẬY để giữ xuống dòng
+  // là giả lập sự kiện PASTE với text/plain: Lexical tự chuyển "\n" thành ngắt
+  // dòng thật. Có dự phòng gõ-từng-dòng nếu paste không lọt.
+  const pasteInto = (el, str) => {
+    try {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", str);
+      const ev = new ClipboardEvent("paste", {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+      });
+      el.dispatchEvent(ev);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+  const typeFallback = (raw) => {
+    const str = String(raw == null ? "" : raw);
+    const lines = str.split(/\r\n|\r|\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        let broke = false;
+        try { broke = document.execCommand("insertParagraph"); } catch (e) {}
+        if (!broke) {
+          try { broke = document.execCommand("insertLineBreak"); } catch (e) {}
+        }
+        if (!broke) {
+          try { document.execCommand("insertText", false, "\n"); } catch (e) {}
+        }
+      }
+      if (lines[i]) {
+        try { document.execCommand("insertText", false, lines[i]); } catch (e) {}
+      }
+    }
+  };
+  pasteInto(box, text);
+  await sleep(500);
+  // Nếu paste không vào (ô vẫn rỗng) thì mới dùng dự phòng.
+  if (!((box.textContent || "").trim())) {
+    try { typeFallback(text); } catch (e) { box.textContent = text; }
   }
   await sleep(1600);
 
@@ -374,10 +414,49 @@ async function runCommentInPage(text, images) {
   }
   if (!box) return { ok: false, error: "Không tìm thấy ô bình luận." };
   box.focus();
-  try {
-    document.execCommand("insertText", false, text);
-  } catch (e) {
-    box.textContent = text;
+  // FB dùng contenteditable (Lexical) -> nó CHẶN beforeinput nên execCommand
+  // insertLineBreak/insertParagraph vô hiệu, "\n" bị nuốt -> dồn 1 hàng. Cách
+  // đáng tin cậy là giả lập PASTE text/plain (Lexical tự tạo ngắt dòng, KHÔNG
+  // gửi bình luận như phím Enter). Dự phòng: gõ-từng-dòng bằng insertLineBreak.
+  const pasteInto = (el, str) => {
+    try {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", str);
+      const ev = new ClipboardEvent("paste", {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+      });
+      el.dispatchEvent(ev);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+  const typeFallback = (raw) => {
+    const str = String(raw == null ? "" : raw);
+    const lines = str.split(/\r\n|\r|\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        // KHÔNG dùng phím Enter vì với bình luận Enter = GỬI.
+        let broke = false;
+        try { broke = document.execCommand("insertLineBreak"); } catch (e) {}
+        if (!broke) {
+          try { broke = document.execCommand("insertParagraph"); } catch (e) {}
+        }
+        if (!broke) {
+          try { document.execCommand("insertText", false, "\n"); } catch (e) {}
+        }
+      }
+      if (lines[i]) {
+        try { document.execCommand("insertText", false, lines[i]); } catch (e) {}
+      }
+    }
+  };
+  pasteInto(box, text);
+  await sleep(500);
+  if (!((box.textContent || "").trim())) {
+    try { typeFallback(text); } catch (e) { box.textContent = text; }
   }
   await sleep(1200);
 
@@ -473,6 +552,10 @@ async function executePostJob(job) {
     });
   } catch (e) {
     return { ok: false, error: "Lỗi chạy script đăng bài: " + String(e) };
+  } finally {
+    // Đóng tab sau khi đăng xong để một mẻ lớn (vd 39 nhóm) không mở 39 tab
+    // chồng chất gây nặng máy/treo trình duyệt.
+    try { await chrome.tabs.remove(tab.id); } catch (e) {}
   }
   return (res && res[0] && res[0].result) || { ok: false, error: "Không có kết quả." };
 }
@@ -518,25 +601,31 @@ async function executeCommentJob(job) {
  */
 async function runWatchRepliesInPage(myCommentId, myCommentText) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  // Cuộn nhẹ để FB tải khu vực bình luận.
-  try { window.scrollTo(0, Math.floor(document.body.scrollHeight / 3)); } catch (e) {}
-  await sleep(2000);
+  // Cuộn NHIỀU LẦN để FB tải lười (lazy-load) toàn bộ khu vực bình luận —
+  // tab nền dễ KHÔNG kịp render reply nếu chỉ cuộn 1 lần.
+  for (let s = 0; s < 4; s++) {
+    try { window.scrollTo(0, Math.floor((document.body.scrollHeight * (s + 1)) / 5)); } catch (e) {}
+    await sleep(1200);
+  }
 
-  // Bấm "Xem thêm bình luận / Xem các câu trả lời" để lộ reply ẩn (best-effort).
-  const moreKeys = [
-    "xem thêm bình luận", "xem các câu trả lời", "xem tất cả", "trả lời",
-    "view more comments", "view more replies", "view all", "replies",
-  ];
+  // CHỈ bấm nút MỞ RỘNG (xem thêm bình luận / xem các câu trả lời) để lộ reply
+  // ẩn. TUYỆT ĐỐI KHÔNG bấm nút "Trả lời" (soạn phản hồi) của từng bình luận —
+  // BUG cũ: khoá "trả lời"/"replies" khớp đúng nút SOẠN nên ta đã bấm Trả lời
+  // lên MỌI bình luận. Phân biệt CHẮC CHẮN (không đoán): nút MỞ RỘNG luôn kèm
+  // "xem"/"view" hoặc một CON SỐ ("3 câu trả lời", "view 2 replies"); còn nút
+  // soạn chỉ là đúng chữ "Trả lời"/"Reply"/"Phản hồi" trơ trọi -> loại hẳn.
+  const expandRe = /(xem thêm|xem tất cả|xem các câu trả lời|\d+\s*câu trả lời|view more|view all|view\s+\d+\s*repl|\d+\s*repl)/i;
+  const composeOnly = /^(trả lời|reply|phản hồi|bình luận|comment)$/i;
   for (let pass = 0; pass < 2; pass++) {
     const btns = [...document.querySelectorAll('div[role="button"], span[role="button"], a[role="link"]')];
     let clicked = 0;
     for (const b of btns) {
-      const t = (b.textContent || "").trim().toLowerCase();
+      const t = (b.textContent || "").trim();
       if (!t || t.length > 40) continue;
-      if (moreKeys.some((k) => t.includes(k))) {
-        try { b.click(); clicked++; } catch (e) {}
-        if (clicked >= 6) break;
-      }
+      if (composeOnly.test(t)) continue;   // KHÔNG bấm nút SOẠN "Trả lời"
+      if (!expandRe.test(t)) continue;      // CHỈ bấm nút MỞ RỘNG reply/bình luận
+      try { b.click(); clicked++; } catch (e) {}
+      if (clicked >= 6) break;
     }
     if (!clicked) break;
     await sleep(1800);
@@ -544,9 +633,20 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
 
   const REPLY_RE = /[?&]reply_comment_id=(\d+)/;
   const COMMENT_RE = /[?&]comment_id=(\d+)/;
-  // Chuẩn hoá khoảng trắng để khớp text bền hơn (FB hay chèn xuống dòng/space).
-  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
-  const needle = norm(myCommentText).slice(0, 50);
+  // Chuẩn hoá để khớp text BỀN: bỏ dấu tiếng Việt + gộp khoảng trắng + thường
+  // hoá. Lý do bỏ dấu: cùng một chữ tiếng Việt có thể được mã hoá 2 kiểu khác
+  // nhau (NFC tổ hợp sẵn "ề" = U+1EC1, hoặc NFD "e" + dấu rời). Nếu nội dung
+  // người dùng dán và DOM của FB khác chuẩn hoá Unicode thì String.includes sẽ
+  // TRƯỢT dù nhìn y hệt. Bỏ dấu (NFD + xoá dấu tổ hợp + đ->d) khử hẳn khác biệt
+  // này nên việc dò bình luận của ta đáng tin hơn nhiều.
+  const deaccent = (s) =>
+    String(s || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/đ/g, "d")
+      .replace(/Đ/g, "D");
+  const norm = (s) => deaccent(s).replace(/\s+/g, " ").trim().toLowerCase();
+  const needle = norm(myCommentText).slice(0, 60);
 
   // SỰ THẬT VỀ DOM (theo buildCleanSample trong content.js): trong NHÓM NÀY bình
   // luận/trả lời KHÔNG phải [role="article"] lồng nhau, mà là các mục <li> trong
@@ -555,32 +655,70 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
   // hiệu DUY NHẤT đáng tin để biết reply thuộc bình luận NÀO -> bám chặt vào nó,
   // KHÔNG đoán theo cấu trúc lồng (sẽ vơ nhầm bình luận của người khác).
 
-  // Đơn vị (mục) chứa một anchor bình luận: ưu tiên <li>, rồi [role="article"].
+  // Đơn vị (mục) chứa một REPLY/bình luận: ưu tiên [role="article"] vì SỰ THẬT
+  // DOM (xem captureMyComment) là mỗi bình luận/reply là MỘT [role="article"];
+  // anchor reply_comment_id thường CHÍNH LÀ link THỜI GIAN ("4 ngày") nằm trong
+  // một <li>/<span> TÍ HON -> nếu lấy closest('li') sẽ chỉ vớ được mẩu thời gian
+  // (author="4 ngày", text="4 ngày") chứ không phải nội dung reply. Trèo lên
+  // [role="article"] gần nhất để lấy ĐÚNG cả tác giả lẫn nội dung của reply đó.
   const unitOf = (el) => {
     if (!el || !el.closest) return el && el.parentElement;
-    return el.closest('li') || el.closest('[role="article"]') || el.parentElement || el;
+    return el.closest('[role="article"]') || el.closest('li') || el.parentElement || el;
   };
+  // Nhận diện text "thời gian tương đối" (4 ngày, 2 giờ, 5 phút, vừa xong,
+  // 3d, 2h...) để KHÔNG nhầm là tên tác giả hay nội dung reply.
+  const RELTIME_RE = /^(\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm|s|m|h|d|w|y)|vừa xong|just now|yesterday|hôm qua)\b/i;
   const authorOf = (unit) => {
-    const a = unit.querySelector('a[href*="/user/"], a[href*="/profile.php"], strong a, h3 a, a[role="link"][href*="facebook.com"]');
-    return a ? (a.textContent || "").trim() : "";
+    // Tên tác giả: link hồ sơ có text KHÔNG phải thời gian. Duyệt nhiều ứng viên
+    // rồi lấy cái đầu tiên hợp lệ (bỏ link thời gian, link rỗng).
+    const cands = unit.querySelectorAll(
+      'a[href*="/user/"], a[href*="/profile.php"], a[href*="/groups/"][role="link"], strong a, h3 a, span a[role="link"]'
+    );
+    for (const a of cands) {
+      const t = (a.textContent || "").trim();
+      if (!t || t.length > 80) continue;
+      if (RELTIME_RE.test(t)) continue; // bỏ link thời gian
+      return t;
+    }
+    return "";
   };
-  // Text của một mục reply: div[dir="auto"] dài nhất trong mục đó.
+  // Text của một reply: div[dir="auto"] dài nhất TRONG mục đó, bỏ qua những
+  // đoạn chỉ là thời gian/nhãn ngắn để không trả về "4 ngày".
   const textOf = (unit) => {
     let best = "";
     for (const d of unit.querySelectorAll('div[dir="auto"], span[dir="auto"]')) {
       const t = (d.textContent || "").trim();
+      if (!t || RELTIME_RE.test(t)) continue;
       if (t.length > best.length) best = t;
     }
-    if (!best) best = (unit.textContent || "").trim();
-    return best.slice(0, 1500);
+    if (!best) {
+      // Dự phòng: gộp text mục rồi loại các token thời gian ở đầu/cuối.
+      const raw = (unit.textContent || "").trim();
+      best = RELTIME_RE.test(raw) ? "" : raw;
+    }
+    // Nới rộng giới hạn bóc text (tới ~200k ký tự) để bình luận/reply RẤT DÀI
+    // không bị cắt cụt khi hiển thị luồng hội thoại và khi đưa cho AI soạn nháp.
+    return best.slice(0, 200000);
   };
 
   // 1) Xác định comment_id của BÌNH LUẬN CỦA TA (parentId).
   //    - Nếu đã biết sẵn (qua job) thì dùng luôn.
-  //    - Nếu chưa: tìm anchor có comment_id NHƯNG KHÔNG có reply_comment_id (=>
-  //      là bình luận CHA, không phải reply) mà mục chứa nó khớp nội dung của ta.
+  //    - Nếu chưa: dò theo nội dung bình luận của ta qua 2 tầng:
+  //        a) KHỚP CHẶT: mục chứa anchor comment_id có chứa nguyên cụm needle.
+  //        b) KHỚP MỀM (fallback): chấm điểm theo TỪ trùng nhau (token overlap),
+  //           chọn mục điểm cao nhất nếu vượt ngưỡng. Lý do: FB hay chèn " · ",
+  //           "Đã chỉnh sửa", emoji, hay cắt bớt text -> includes() có thể trượt
+  //           dù đúng bình luận. Token overlap bền hơn với mấy nhiễu đó.
+  //    Tokens dùng cho khớp mềm: bỏ từ quá ngắn để giảm trùng ngẫu nhiên.
+  const tokensOf = (s) => norm(s).split(" ").filter((w) => w.length >= 2);
+  const needleTokens = tokensOf(myCommentText).slice(0, 40);
+  const needleSet = new Set(needleTokens);
   let parentId = myCommentId ? String(myCommentId) : null;
-  if (!parentId && needle) {
+  // Chẩn đoán: đếm anchor + lưu vài mẫu text để báo khi dò trượt.
+  let commentAnchors = 0;
+  const sampleTexts = [];
+  let bestSoft = { id: null, score: 0 };
+  if (!parentId && (needle || needleSet.size)) {
     let bestLen = Infinity;
     for (const a of document.querySelectorAll('a[href*="comment_id"]')) {
       const href = a.href || a.getAttribute("href") || "";
@@ -589,27 +727,87 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
       if (!cm) continue;
       const unit = unitOf(a);
       if (!unit) continue;
+      commentAnchors += 1;
       const full = norm(unit.textContent);
-      if (!full.includes(needle)) continue;
-      // Mục nhỏ nhất (theo full text) còn chứa needle = sát bình luận ta nhất.
-      if (full.length < bestLen) { bestLen = full.length; parentId = cm[1]; }
+      if (sampleTexts.length < 5) sampleTexts.push(full.slice(0, 80));
+      // a) Khớp chặt theo cụm.
+      if (needle && full.includes(needle)) {
+        if (full.length < bestLen) { bestLen = full.length; parentId = cm[1]; }
+        continue;
+      }
+      // b) Khớp mềm theo tỉ lệ từ của needle xuất hiện trong mục.
+      if (needleSet.size) {
+        let hit = 0;
+        for (const w of needleSet) if (full.includes(w)) hit++;
+        const score = hit / needleSet.size;
+        if (score > bestSoft.score) bestSoft = { id: cm[1], score };
+      }
+    }
+    // Chỉ nhận khớp mềm khi chưa có khớp chặt VÀ đủ tin cậy (>=70% từ trùng).
+    if (!parentId && bestSoft.id && bestSoft.score >= 0.7) {
+      parentId = bestSoft.id;
     }
   }
 
-  // Không xác định được bình luận của ta -> KHÔNG đoán, trả rỗng (kèm cờ để chẩn đoán).
+  // Không xác định được bình luận của ta -> KHÔNG đoán, trả rỗng (kèm dữ liệu
+  // chẩn đoán để báo người dùng vì sao trượt: bao nhiêu anchor, điểm mềm cao
+  // nhất, vài mẫu text — giúp biết link sai trang hay text dán không khớp).
   if (!parentId) {
-    return { ok: true, replies: [], parentId: null, noParent: true };
+    return {
+      ok: true,
+      replies: [],
+      parentId: null,
+      noParent: true,
+      diag: {
+        commentAnchors,
+        bestSoftScore: Math.round(bestSoft.score * 100),
+        needlePreview: needle.slice(0, 60),
+        samples: sampleTexts,
+      },
+    };
   }
+
+  // Tên tác giả + NỘI DUNG của BÌNH LUẬN GỐC (của ta). Tác giả dùng để gắn cờ
+  // `mine` cho từng reply; nội dung dùng để hiển thị "Bình luận của bạn" và làm
+  // lượt MỞ ĐẦU của luồng hội thoại. Khi người dùng theo dõi bằng LINK có
+  // comment_id (không dán text), `myComment` rỗng -> phải bóc nội dung gốc TỪ
+  // trang để luồng có đủ hai phía. Tìm anchor comment_id===parentId mà KHÔNG
+  // phải reply, lấy unit -> authorOf + textOf.
+  let myAuthor = "";
+  let myRootText = "";
+  for (const a of document.querySelectorAll('a[href*="comment_id"]')) {
+    const href = a.href || a.getAttribute("href") || "";
+    if (REPLY_RE.test(href)) continue;
+    const cm = href.match(COMMENT_RE);
+    if (!cm || cm[1] !== parentId) continue;
+    const u = unitOf(a);
+    if (!u) continue;
+    if (!myAuthor) myAuthor = authorOf(u);
+    if (!myRootText) myRootText = textOf(u);
+    if (myAuthor && myRootText) break;
+  }
+  const myAuthorN = norm(myAuthor);
 
   // 2) Gom REPLY thuộc ĐÚNG bình luận của ta: anchor có reply_comment_id VÀ
   //    comment_id === parentId. Khử trùng theo reply_comment_id.
+  // Đếm chẩn đoán để biết VÌ SAO ra 0 reply: tổng anchor reply trên trang, số
+  // anchor khớp đúng parentId, các parentId khác mà ta thấy (giúp phát hiện link
+  // có comment_id KHÔNG khớp anchor reply trên trang — ví dụ FB đổi id).
   const byReplyId = new Map();
+  let replyAnchorsTotal = 0;
+  let replyAnchorsMatched = 0;
+  const otherParents = new Set();
   for (const a of document.querySelectorAll('a[href*="reply_comment_id"]')) {
     const href = a.href || a.getAttribute("href") || "";
     const cm = href.match(COMMENT_RE);
     const rm = href.match(REPLY_RE);
     if (!cm || !rm) continue;
-    if (cm[1] !== parentId) continue; // reply của bình luận KHÁC -> bỏ
+    replyAnchorsTotal += 1;
+    if (cm[1] !== parentId) {
+      otherParents.add(cm[1]); // reply của bình luận KHÁC -> ghi nhận để báo
+      continue;
+    }
+    replyAnchorsMatched += 1;
     if (byReplyId.has(rm[1])) continue;
     const unit = unitOf(a);
     if (unit) byReplyId.set(rm[1], unit);
@@ -620,12 +818,37 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
     const author = authorOf(unit);
     const text = textOf(unit);
     if (!text) continue;
-    // Bỏ nếu mục chính là bình luận của ta (an toàn).
-    if (needle && norm(text).includes(needle)) continue;
-    out.push({ id: replyId, author, text });
+    // Bỏ nếu mục CHÍNH LÀ bình luận GỐC của ta (không phải reply) — tránh tự
+    // nhân đôi bình luận gốc vào luồng. KHÔNG bỏ các reply của ta nữa: một hội
+    // thoại thật là qua lại (khách hỏi -> ta đáp -> khách hỏi tiếp), nên ta
+    // GIỮ cả lượt của ta để hiển thị đúng mạch, chỉ GẮN CỜ ai là người nói.
+    const isMyRoot = needle && norm(text).includes(needle) && !myAuthorN;
+    if (isMyRoot) continue;
+    // `mine`: lượt này là của TA nếu tác giả trùng tác giả bình luận gốc.
+    const mine = !!(myAuthorN && norm(author) === myAuthorN);
+    out.push({ id: replyId, author, text, mine });
   }
 
-  return { ok: true, replies: out, parentId };
+  // Luôn kèm chẩn đoán: kể cả khi parentId đã biết (link có comment_id) mà vẫn
+  // ra 0 reply, người dùng cần biết là trang KHÔNG có anchor reply nào khớp —
+  // do reply chưa tải, hay comment_id của link không trùng anchor trên trang.
+  return {
+    ok: true,
+    replies: out,
+    parentId,
+    // Tác giả + nội dung bình luận GỐC của ta. Caller dùng để backfill
+    // `myComment` khi người dùng theo dõi bằng LINK (không dán text) -> thẻ
+    // hội thoại mới có "Bình luận của bạn" làm lượt mở đầu.
+    myAuthor,
+    myRootText,
+    diag: {
+      parentId,
+      commentAnchors,
+      replyAnchorsTotal,
+      replyAnchorsMatched,
+      otherParents: [...otherParents].slice(0, 5),
+    },
+  };
 }
 
 /** Mở permalink bình luận của ta ở tab NỀN, quét reply, đóng tab. */
@@ -786,6 +1009,9 @@ async function processDueJobs() {
   if (_processing) return;
   _processing = true;
   try {
+    // Khôi phục job bị KẸT ở "running" (service worker MV3 tắt giữa chừng) để
+    // một mẻ lớn không bị đứng sau vài bài. Đưa job kẹt về "pending" rồi chạy.
+    try { await DB.recoverStuckJobs(Date.now()); } catch (e) {}
     const due = await DB.getDueJobs(Date.now());
     for (const job of due) {
       await runJob(job);
@@ -1121,6 +1347,11 @@ async function processReplyWatch(opts = {}) {
   if (!cfg.enabled && !opts.manual) return { ok: false, error: "Theo dõi reply đang tắt." };
   _watching = true;
   let checked = 0, newReplies = 0, noParent = 0;
+  // Lưu chẩn đoán của hội thoại GẦN NHẤT để báo người dùng vì sao ra ít/không
+  // có reply: số anchor bình luận, số anchor reply tổng/khớp, các parentId khác
+  // thấy trên trang, điểm khớp mềm, vài mẫu text. Giúp phân biệt "trang chưa
+  // tải reply" với "comment_id của link không trùng anchor trên trang".
+  let lastDiag = null;
   try {
     let convs = await DB.getConversations();
     // Chỉ theo dõi hội thoại chưa đóng và có link để mở.
@@ -1129,32 +1360,52 @@ async function processReplyWatch(opts = {}) {
     );
     const limit = Math.max(1, Math.min(30, parseInt(opts.maxPerRun, 10) || cfg.maxPerRun));
     convs = convs.slice(0, limit);
-    for (const c of convs) {
+    for (let i = 0; i < convs.length; i++) {
+      const c = convs[i];
       const res = await executeWatchReplies(c);
       checked += 1;
       // Không định vị được bình luận của ta trên trang -> đếm để báo rõ.
-      if (res && res.ok && res.noParent) noParent += 1;
+      if (res && res.ok && res.noParent) {
+        noParent += 1;
+      }
       // Lần đầu suy ra được comment_id của ta (comment thủ công) -> lưu lại để
       // các lượt quét sau chính xác và nhanh hơn.
       if (res && res.ok && res.parentId && !c.commentId) {
         try { await DB.updateConversation(c.id, { commentId: res.parentId }); } catch (e) {}
       }
+      // Theo dõi bằng LINK có comment_id (không dán text) -> `myComment` rỗng.
+      // Bóc nội dung bình luận GỐC từ trang để "Bình luận của bạn" và lượt MỞ
+      // ĐẦU của luồng hội thoại có đủ, thay vì chỉ thấy mỗi reply của khách.
+      if (res && res.ok && res.myRootText && !(c.myComment || "").trim()) {
+        try {
+          await DB.updateConversation(c.id, { myComment: res.myRootText });
+          c.myComment = res.myRootText;
+          broadcast("CONVERSATION_UPDATE", { id: c.id });
+        } catch (e) {}
+      }
+      let added = 0;
       if (res && res.ok && Array.isArray(res.replies) && res.replies.length) {
         const m = await DB.mergeReplies(c.id, res.replies);
         if (m && m.added) {
+          added = m.added;
           newReplies += m.added;
           broadcast("CONVERSATION_UPDATE", { id: c.id, added: m.added });
         }
       }
-      // Giãn cách 15–45s giữa các hội thoại (như jitter auto-crawl).
-      await sleep(randInt(15000, 45000));
+      // Giữ chẩn đoán khi KHÔNG có reply mới (kể cả lúc đã biết comment_id):
+      // người dùng cần biết trang thấy bao nhiêu anchor reply, khớp mấy cái, có
+      // parentId nào khác — để biết link sai trang hay reply chưa kịp tải.
+      if (res && res.ok && res.diag && !added) lastDiag = res.diag;
+      // Giãn cách 15–45s GIỮA các hội thoại (như jitter auto-crawl) — KHÔNG chờ
+      // sau hội thoại CUỐI để lượt quét thủ công 1 mục trả kết quả ngay.
+      if (i < convs.length - 1) await sleep(randInt(15000, 45000));
     }
   } catch (e) {
     // bỏ qua, chờ chu kỳ sau
   } finally {
     _watching = false;
   }
-  return { ok: true, checked, newReplies, noParent };
+  return { ok: true, checked, newReplies, noParent, diag: lastDiag };
 }
 
 /** Khôi phục alarm theo-dõi-reply khi service worker khởi động lại. */

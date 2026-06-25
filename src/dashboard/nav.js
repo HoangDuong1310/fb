@@ -20,6 +20,7 @@ import { loadSettings } from "./views/settings.js";
 import { loadGroupPricesView } from "./views/groupprices.js";
 import { loadKeywordsView } from "./views/keywords.js";
 import { loadSharingView } from "./views/sharing.js";
+import { loadProfilesView } from "./views/profiles.js";
 
 export const VIEW_META = {
   overview: ["Tổng quan", "Theo dõi hiệu quả khai thác nhóm của bạn."],
@@ -36,6 +37,7 @@ export const VIEW_META = {
   groupprices: ["Giá Group", "Mặt bằng giá trích từ bài rao bán trong nhóm, gom theo sản phẩm thấp→cao."],
   keywords: ["Từ khóa học", "Quản lý từ khóa AI đã học để lọc bài rao bán khi trích giá group."],
   sharing: ["Cài đặt chia sẻ", "Bật/tắt chia sẻ dữ liệu của bạn cho người dùng khác xem."],
+  profiles: ["Hồ sơ ngành", "Tùy biến giọng AI theo ngành hàng của bạn (bán điện thoại, bất động sản, thuê phòng...). Lưu ở backend, chia sẻ được."],
   settings: ["Cài đặt", "Quản lý cấu hình crawl, tự động, AI và dữ liệu của tiện ích."],
 };
 
@@ -62,5 +64,6 @@ export function switchView(view) {
   if (view === "groupprices") loadGroupPricesView();
   if (view === "keywords") loadKeywordsView();
   if (view === "sharing") loadSharingView();
+  if (view === "profiles") loadProfilesView();
   if (view === "settings") loadSettings();
 }

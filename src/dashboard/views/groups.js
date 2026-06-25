@@ -23,8 +23,10 @@ export function fillGroupSelects() {
 /**
  * Dựng danh sách checkbox chọn nhóm để đăng bài hàng loạt (tab Đăng bài).
  * Giữ lại trạng thái đã tick khi nạp lại (nếu nhóm vẫn còn).
+ * Ưu tiên ghim các nhóm "hay đăng" / "đăng gần đây" lên đầu (theo tài khoản,
+ * lấy từ lịch sử device-local qua GET_POSTED_GROUPS).
  */
-export function fillPostGroupChecklist() {
+export async function fillPostGroupChecklist() {
   const list = $("postGroupList");
   if (!list) return;
   const checked = new Set(
@@ -36,14 +38,75 @@ export function fillPostGroupChecklist() {
     if (cnt) cnt.textContent = "0";
     return;
   }
-  list.innerHTML = store.groups
+
+  // Lấy lịch sử nhóm hay đăng / đăng gần đây để ghim lên đầu.
+  // Không chặn hiển thị: nếu lỗi thì coi như không có lịch sử.
+  let frequent = [];
+  let recent = [];
+  try {
+    const res = await bg("GET_POSTED_GROUPS", { opts: { limit: 8 } });
+    if (res && res.ok) {
+      frequent = res.frequent || [];
+      recent = res.recent || [];
+    }
+  } catch {
+    /* bỏ qua — vẫn dựng danh sách bình thường */
+  }
+
+  // Map groupId -> nhãn ghim ("frequent" ưu tiên hơn "recent") + số lần đăng.
+  const pinMeta = new Map();
+  for (const g of recent) {
+    if (g && g.groupId && !pinMeta.has(g.groupId)) {
+      pinMeta.set(g.groupId, { kind: "recent", count: g.count || 0 });
+    }
+  }
+  for (const g of frequent) {
+    if (g && g.groupId) {
+      // frequent đè lên recent (ưu tiên cao hơn).
+      pinMeta.set(g.groupId, { kind: "frequent", count: g.count || 0 });
+    }
+  }
+
+  // Sắp xếp: nhóm được ghim lên đầu (frequent trước recent, rồi theo số lần đăng),
+  // còn lại giữ nguyên thứ tự gốc.
+  const rank = (id) => {
+    const m = pinMeta.get(id);
+    if (!m) return 3;
+    return m.kind === "frequent" ? 0 : 1;
+  };
+  const ordered = store.groups
+    .map((g, idx) => ({ g, idx }))
+    .sort((a, b) => {
+      const ra = rank(a.g.groupId);
+      const rb = rank(b.g.groupId);
+      if (ra !== rb) return ra - rb;
+      if (ra < 2) {
+        const ca = (pinMeta.get(a.g.groupId) || {}).count || 0;
+        const cb = (pinMeta.get(b.g.groupId) || {}).count || 0;
+        if (cb !== ca) return cb - ca;
+      }
+      return a.idx - b.idx;
+    })
+    .map((x) => x.g);
+
+  list.innerHTML = ordered
     .map((g) => {
       const name = g.groupName || g.groupId;
-      return `<label class="gcl-item" data-name="${esc(name)}">
+      const meta = pinMeta.get(g.groupId);
+      let badge = "";
+      if (meta) {
+        const pinned = meta.kind === "frequent" ? "pinned-freq" : "pinned-recent";
+        const label =
+          meta.kind === "frequent"
+            ? `Hay đăng${meta.count ? ` · ${meta.count} lần` : ""}`
+            : "Gần đây";
+        badge = `<span class="gcl-pin ${pinned}" title="${esc(label)}">${esc(label)}</span>`;
+      }
+      return `<label class="gcl-item${meta ? " is-pinned" : ""}" data-name="${esc(name)}">
         <input class="gcl-check" type="checkbox" value="${esc(g.groupId)}" data-name="${esc(name)}" ${
         checked.has(g.groupId) ? "checked" : ""
       } />
-        <span class="gcl-name" title="${esc(name)}">${esc(name)}</span>
+        <span class="gcl-name" title="${esc(name)}">${esc(name)}</span>${badge}
       </label>`;
     })
     .join("");

@@ -14,6 +14,7 @@
 
 import * as DB from "./db.js";
 import { getAIConfig, fetchWithTimeout, parseSelectorJson, broadcast } from "./util.js";
+import { getActiveProfile, systemForClassify, systemForDraft } from "./prompts.js";
 
 // Lọc thô bằng từ khóa: bài có dấu hiệu MUA hoặc HỎI mới đáng đưa cho AI phân
 // loại (tiết kiệm token + tránh nhiễu). Bài không khớp gì -> bỏ qua sớm.
@@ -126,24 +127,9 @@ async function classifyIntent(text) {
   const model = cfg.model || "gpt-5.5";
   if (!apiKey) return fallback; // không key -> dùng lọc thô
 
-  const sys =
-    "Bạn phân loại Ý ĐỊNH của một bài đăng Facebook trong nhóm mua bán máy tính/linh kiện. " +
-    "Phân loại vào MỘT trong ba nhãn:\n" +
-    '- "buy": người này CHƯA có hàng và ĐANG MUỐN MUA / nhờ build cấu hình mới / hỏi nơi bán để chốt đơn ' +
-    "(tức là mình có thể CHÀO sản phẩm cho họ).\n" +
-    '- "question": HỎI XIN Ý KIẾN — gồm cả khi khách ĐÃ có sẵn cấu hình hoặc ĐÃ được báo giá và chỉ nhờ ' +
-    "ĐÁNH GIÁ xem 'cấu hình này ổn không', 'giá này hợp lý chưa', 'có nên lấy không', hỏi kỹ thuật/so sánh, " +
-    "HOẶC nhờ CHẨN ĐOÁN SỰ CỐ ('máy bị lỗi gì', 'không lên hình', 'tự tắt', 'kêu bíp'...) — các bài này " +
-    "thường KÈM ẢNH chụp máy/màn hình lỗi, hãy nhìn ảnh để đoán bệnh. " +
-    "Loại này cần NHẬN ĐỊNH của người trong nghề, KHÔNG nhất thiết phải chào bán sản phẩm.\n" +
-    '- "ignore": rao bán, spam, tin tức, hỏi chuyện ngoài lề, không liên quan mua hàng.\n' +
-    "Lưu ý: nếu khách vừa nhờ đánh giá cấu hình/giá ĐÃ CÓ vừa có thể muốn mua, ưu tiên \"question\" " +
-    "vì việc chính là đưa ra nhận định trung thực.\n" +
-    "CHỈ trả JSON, không giải thích, không code fence. Cấu trúc: " +
-    '{"intent":"buy|question|ignore","needs":"<tóm tắt nhu cầu 1 câu>","budget":<số VND hoặc null>,' +
-    '"categories":["cpu","vga","ram","mainboard","ssd","psu","case","cooler","laptop","màn hình","khác"],' +
-    '"keywords":"<từ khóa sản phẩm để tra kho, cách nhau bởi dấu cách>"}. ' +
-    "budget là số nguyên VND nếu suy ra được (10 triệu -> 10000000), không thì null.";
+  // Hồ sơ ngành đang kích hoạt (BE) -> dựng prompt phân loại theo đặc thù ngành.
+  const profile = await getActiveProfile();
+  const sys = systemForClassify(profile);
   const user = "BÀI ĐĂNG:\n" + clean + "\n\nTrả JSON phân loại theo đúng cấu trúc.";
 
   let resp;
@@ -236,6 +222,9 @@ async function draftAdvisory(post, products, intentInfo) {
   // KHÔNG có key -> KHÔNG bịa. Thà không trả lời.
   if (!apiKey) return { allowReply: false, error: "no_api_key" };
 
+  // Hồ sơ ngành đang kích hoạt (BE) -> dựng persona soạn trả lời theo đặc thù ngành.
+  const profile = await getActiveProfile();
+
   const idMap = new Map(); // mã ngắn -> product thật
   let seq = 0;
   const slim = (products || []).slice(0, 18).map((p) => {
@@ -253,46 +242,9 @@ async function draftAdvisory(post, products, intentInfo) {
   });
 
   const budgetTxt = intentInfo && intentInfo.budget ? (intentInfo.budget + " VND") : "(không nêu)";
-  const sys =
-    "Bạn LÀ một người bán máy tính/linh kiện thật ở Việt Nam, đã làm nghề nhiều năm — KHÔNG phải bot, " +
-    "KHÔNG phải AI. Bạn đang trả lời bình luận của khách trong một nhóm Facebook mua bán máy tính, " +
-    "đúng kiểu một anh/chị chủ tiệm nhắn tin: nói chuyện tự nhiên, đời thường, thẳng thắn và CÓ TÂM.\n" +
-    "\n" +
-    "QUAN TRỌNG NHẤT — TRẢ LỜI ĐÚNG ĐIỀU KHÁCH HỎI:\n" +
-    "• Đọc kỹ khách thực sự muốn gì. Nếu khách hỏi 'cấu hình này ổn không', 'giá này hợp lý chưa', " +
-    "'có nên mua không' -> nhiệm vụ chính của bạn là ĐƯA RA NHẬN ĐỊNH THẬT, có chính kiến, như một người " +
-    "trong nghề nhận xét giúp. ĐỪNG khen lấy lệ 'cái nào cũng dùng tốt, thừa sức' rồi lảng sang bán hàng — " +
-    "khách hỏi để nghe đánh giá thật, trả lời hời hợt là mất uy tín ngay.\n" +
-    "• Khi đánh giá cấu hình/giá: nói rõ điểm hợp lý VÀ điểm chưa ổn (nếu có). Ví dụ linh kiện đời quá cũ, " +
-    "giá hơi cao/thấp so với mặt bằng, chỗ nào đáng tiền chỗ nào nên cân nhắc. Trung thực kể cả khi điều đó " +
-    "nghĩa là không chốt được đơn — uy tín quan trọng hơn một lần bán.\n" +
-    "• Đừng chào bán những thứ khách RÕ RÀNG đã có sẵn trong cấu hình của họ. Chỉ gợi ý khi nó THỰC SỰ giúp ích " +
-    "cho điều khách đang băn khoăn, và nói tự nhiên ('nếu cần thì bên mình có...'), không nhồi nhét.\n" +
-    "\n" +
-    "QUY TẮC VỀ GIÁ & SẢN PHẨM (vi phạm = mất uy tín):\n" +
-    "1) Khi tự bạn chào một sản phẩm và nêu giá -> CHỈ được dùng sản phẩm và GIÁ trong danh sách SẢN PHẨM THẬT " +
-    "bên dưới, ghi ĐÚNG con số price (hoặc buildPrice), KHÔNG làm tròn, KHÔNG bịa, KHÔNG tự ý giảm giá/tặng quà.\n" +
-    "2) Bạn ĐƯỢC nhắc lại con số mà CHÍNH KHÁCH đã nêu trong bài (vd khách nói 'báo giá 18 triệu' thì bạn có thể " +
-    "bình luận về mức 18 triệu đó) — đây là nhận xét, không phải bịa giá.\n" +
-    "3) KHÔNG bịa thông số kỹ thuật. Không chắc thì nói ước lượng/đại khái, đừng phán chắc nịch.\n" +
-    "4) Không xin SĐT công khai, không spam link.\n" +
-    "\n" +
-    "GIỌNG VĂN: như người thật nhắn tin — NGẮN GỌN, chỉ 1 đến 3 câu, đi thẳng vào trọng tâm, " +
-    "xưng 'mình/bên mình', gọi khách 'bạn' hoặc 'anh/chị' tùy bài. TUYỆT ĐỐI KHÔNG dùng emoji/icon. " +
-    "KHÔNG sáo rỗng, KHÔNG dài dòng, KHÔNG liệt kê gạch đầu dòng máy móc. " +
-    "VIẾT ĐÚNG CHÍNH TẢ tiếng Việt, đủ dấu, đúng từ — đọc lại reply trước khi trả để chắc không sai chính tả. " +
-    "Nếu thật sự không có gì hữu ích để nói (bài không rõ, ngoài chuyên môn) -> allowReply=false.\n" +
-    "\n" +
-    "NẾU CÓ ẢNH ĐÍNH KÈM: khách thường chụp màn hình lỗi / linh kiện / cấu hình. Hãy NHÌN KỸ ảnh để " +
-    "đoán bệnh hoặc đọc thông tin (mã lỗi, đèn báo, model linh kiện) rồi trả lời sát thực tế. Nếu ảnh mờ " +
-    "hoặc thiếu thông tin để kết luận chắc, nói ra điều cần kiểm tra thêm thay vì phán bừa.\n" +
-    "\n" +
-    "CHỈ trả JSON, không code fence. Cấu trúc: " +
-    '{"allowReply":true|false,"reply":"<nội dung bình luận gửi khách>","usedIds":["<mã sản phẩm bạn TỰ chào>"],' +
-    '"confidence":<0..1>}. Lưu ý: usedIds CHỈ gồm sản phẩm bạn chủ động chào bán, KHÔNG gồm đồ của khách. ' +
-    'Mỗi giá tiền bạn TỰ chào trong "reply" phải khớp giá thật của sản phẩm có id trong "usedIds".';
+  const sys = systemForDraft(profile);
   const user =
-    "BÀI ĐĂNG / CÂU HỎI CỦA KHÁCH:\n" + String(post.text || "").slice(0, 1200) + "\n\n" +
+    "BÀI ĐĂNG / CÂU HỎI CỦA KHÁCH:\n" + String(post.text || "").slice(0, 200000) + "\n\n" +
     "Ý ĐỊNH: " + ((intentInfo && intentInfo.intent) || "buy") +
     " (buy = muốn mua/cần tư vấn cấu hình; question = hỏi đánh giá/kỹ thuật)\n" +
     "NHU CẦU (tóm tắt): " + ((intentInfo && intentInfo.needs) || "(tự đọc bài mà suy)") + "\n" +
@@ -379,7 +331,7 @@ async function draftAdvisory(post, products, intentInfo) {
     return { allowReply: false, error: "no_reply" };
   }
 
-  const reply = String(parsed.reply).trim().slice(0, 1500);
+  const reply = String(parsed.reply).trim().slice(0, 200000);
   const usedIds = Array.isArray(parsed.usedIds) ? parsed.usedIds.map((x) => String(x).trim()) : [];
   const usedProducts = [];
   for (const id of usedIds) {
@@ -665,7 +617,7 @@ async function analyzePost(post) {
  * conv: bản ghi conversation từ DB (có postText, myComment, replies[]).
  * Trả về kết quả draftAdvisory (allowReply, reply, usedProducts, confidence...).
  */
-async function draftConversationReply(conv) {
+async function draftConversationReply(conv, opts = {}) {
   const cfg = await getAIConfig();
   if (!cfg.apiKey) return { allowReply: false, error: "no_api_key" };
   if (!conv) return { allowReply: false, error: "no_conversation" };
@@ -673,9 +625,20 @@ async function draftConversationReply(conv) {
   const replies = Array.isArray(conv.replies) ? conv.replies : [];
   if (!replies.length) return { allowReply: false, error: "no_replies" };
 
-  // Reply mới nhất của khách là điều cần trả lời.
-  const latest = replies[replies.length - 1];
-  const latestText = String((latest && latest.text) || "");
+  // Lượt của KHÁCH (không phải của ta) là các ứng viên cần trả lời.
+  const guestReplies = replies.filter((r) => !r.mine);
+  const pool = guestReplies.length ? guestReplies : replies;
+  // Chọn ĐÚNG người cần trả lời: nếu UI chỉ định targetReplyId (khi có NHIỀU
+  // người cùng trả lời dưới bình luận của ta) thì trả lời đúng người đó; nếu
+  // không -> mặc định trả lời lượt KHÁCH MỚI NHẤT.
+  let target = null;
+  if (opts && opts.targetReplyId != null && opts.targetReplyId !== "") {
+    const tid = String(opts.targetReplyId);
+    target = pool.find((r) => String(r.id) === tid) || replies.find((r) => String(r.id) === tid);
+  }
+  if (!target) target = pool[pool.length - 1];
+  const latestText = String((target && target.text) || "");
+  const targetAuthor = String((target && target.author) || "").trim();
 
   // Phân loại ý định dựa trên TOÀN bộ ngữ cảnh (bài gốc + reply mới) để tra kho.
   const intentText = [conv.postText || "", latestText].join("\n");
@@ -698,16 +661,21 @@ async function draftConversationReply(conv) {
 
   // Dựng "post" tổng hợp: AI sẽ đọc cả mạch hội thoại và trả lời reply mới nhất.
   // Giữ nguyên cơ chế hậu kiểm giá của draftAdvisory (dùng post.text).
+  // CTX: nới rộng ngữ cảnh tối đa (~200k ký tự) để AI đọc TRỌN cuộc trò chuyện
+  // (bài gốc + bình luận của ta + TẤT CẢ phản hồi qua lại) thay vì bị cắt cụt.
+  const CTX = 200000;
   const thread =
-    "BÀI ĐĂNG GỐC CỦA KHÁCH:\n" + String(conv.postText || "(không lưu)").slice(0, 800) + "\n\n" +
-    "BÌNH LUẬN TRƯỚC ĐÓ CỦA BẠN (người bán):\n" + String(conv.myComment || "").slice(0, 500) + "\n\n" +
-    "KHÁCH ĐÃ TRẢ LỜI LẠI BẠN" +
-    (replies.length > 1 ? " (mới nhất ở cuối, " + replies.length + " phản hồi):\n" : ":\n") +
+    "BÀI ĐĂNG GỐC CỦA KHÁCH:\n" + String(conv.postText || "(không lưu)").slice(0, CTX) + "\n\n" +
+    "BÌNH LUẬN TRƯỚC ĐÓ CỦA BẠN (người bán):\n" + String(conv.myComment || "").slice(0, CTX) + "\n\n" +
+    "TOÀN BỘ PHẢN HỒI DƯỚI BÌNH LUẬN (theo thứ tự, mới nhất ở cuối):\n" +
     replies
-      .map((r, i) => (i + 1) + ". " + (r.author ? r.author + ": " : "") + String(r.text || "").slice(0, 400))
+      .map((r, i) => (i + 1) + ". " + (r.mine ? "[BẠN] " : "") + (r.author ? r.author + ": " : "") + String(r.text || "").slice(0, CTX))
       .join("\n") +
-    "\n\nHãy trả lời TRỰC TIẾP phản hồi MỚI NHẤT của khách, tiếp nối tự nhiên cuộc " +
-    "trò chuyện như người bán thật đang nhắn tiếp. Bám đúng điều khách vừa nói.";
+    "\n\nNGƯỜI CẦN TRẢ LỜI NGAY: " + (targetAuthor || "(khách)") +
+    " — họ vừa nói: \"" + latestText.slice(0, CTX) + "\"\n" +
+    "Hãy trả lời TRỰC TIẾP đúng người này, tiếp nối tự nhiên cuộc trò chuyện như " +
+    "người bán thật đang nhắn tiếp. MỞ ĐẦU phản hồi bằng cách gọi/tag đúng tên họ " +
+    "(\"@" + (targetAuthor || "bạn") + "\") rồi mới vào nội dung. Bám đúng điều người này vừa nói.";
 
   const pseudoPost = {
     text: thread,
@@ -715,7 +683,20 @@ async function draftConversationReply(conv) {
     postId: conv.postId || "",
   };
 
-  return await draftAdvisory(pseudoPost, matches, info);
+  const result = await draftAdvisory(pseudoPost, matches, info);
+  // Tag đúng người như human: nếu AI chưa gọi tên người cần trả lời ở ĐẦU phản
+  // hồi thì tự thêm "@Tên " để phản hồi hướng đúng người (giống người bán thật
+  // bấm trả lời đúng comment của họ). Kèm target để UI hiển thị/đăng đúng.
+  if (result && result.allowReply && targetAuthor) {
+    const r = String(result.reply || "");
+    const head = r.slice(0, targetAuthor.length + 4).toLowerCase();
+    if (!head.includes(targetAuthor.toLowerCase())) {
+      result.reply = "@" + targetAuthor + " " + r;
+    }
+    result.targetAuthor = targetAuthor;
+    result.targetReplyId = target && target.id ? String(target.id) : null;
+  }
+  return result;
 }
 
 /**

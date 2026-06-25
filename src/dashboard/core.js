@@ -11,21 +11,30 @@
 
 export const $ = (id) => document.getElementById(id);
 
-export function bg(type, payload = {}) {
+// Lỗi kênh "tạm thời" của MV3: khi service worker đang ở giữa quá trình bị
+// Chrome cho ngủ (suspend) thì message gửi tới nó hỏng NGAY với
+// "The message port closed before a response was received." Đây KHÔNG phải
+// lỗi đăng nhập hay lỗi backend — chỉ là đua thức/ngủ của SW. Gửi lại sau một
+// nhịp ngắn để SW mới kịp khởi động và trả lời, thay vì bắt người dùng tự
+// Reload extension mỗi lần mở Dashboard sau lúc rảnh.
+const TRANSIENT_PORT_ERRORS = [
+  "message port closed",
+  "Could not establish connection",
+  "Receiving end does not exist",
+];
+
+function isTransientPortError(message) {
+  const m = String(message || "").toLowerCase();
+  return TRANSIENT_PORT_ERRORS.some((s) => m.includes(s.toLowerCase()));
+}
+
+function sendOnce(type, payload) {
   return new Promise((resolve) => {
     try {
       chrome.runtime.sendMessage({ type, ...payload }, (res) => {
         const err = chrome.runtime.lastError;
         if (err) {
-          // Kênh tới service worker bị lỗi: thường do vừa reload extension
-          // mà chưa mở lại tab Dashboard, hoặc service worker chưa nạp code mới.
-          resolve({
-            ok: false,
-            error:
-              "Mất kết nối tới tiện ích (" +
-              err.message +
-              "). Hãy Reload extension trong chrome://extensions rồi mở lại Dashboard.",
-          });
+          resolve({ ok: false, _portError: err.message });
           return;
         }
         if (res === undefined) {
@@ -42,12 +51,30 @@ export function bg(type, payload = {}) {
         resolve(res);
       });
     } catch (e) {
-      resolve({
-        ok: false,
-        error: "Không gửi được lệnh tới tiện ích: " + String(e),
-      });
+      resolve({ ok: false, _portError: String(e) });
     }
   });
+}
+
+export async function bg(type, payload = {}, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await sendOnce(type, payload);
+    // Thành công, hoặc lỗi "thật" (SW có trả lời nhưng ok:false) -> trả luôn.
+    if (!res || res._portError === undefined) return res;
+    // Lỗi kênh tạm thời và còn lượt thử: đợi SW mới thức dậy rồi gửi lại.
+    if (isTransientPortError(res._portError) && attempt < retries) {
+      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+      continue;
+    }
+    // Hết lượt thử hoặc lỗi kênh không thể tự phục hồi -> báo người dùng.
+    return {
+      ok: false,
+      error:
+        "Mất kết nối tới tiện ích (" +
+        res._portError +
+        "). Hãy Reload extension trong chrome://extensions rồi mở lại Dashboard.",
+    };
+  }
 }
 
 /* ----------------------------- Trạng thái ------------------------------- */
@@ -147,7 +174,14 @@ export function esc(s) {
 }
 export function timeAgo(ts) {
   if (!ts) return "";
-  const d = Date.now() - ts;
+  // Chấp nhận cả số (epoch ms) lẫn chuỗi ngày giờ (DATETIME từ web backend trả
+  // qua JSON). Trước đây chỉ trừ trực tiếp nên chuỗi "2024-01-01 10:00:00" cho
+  // ra NaN -> hiển thị "NaN ngày trước". Chuẩn hoá về epoch ms trước khi tính.
+  let ms = typeof ts === "number" ? ts : Date.parse(ts);
+  // BIGINT timestamp có thể về dạng chuỗi số thuần ("1700000000000") -> ép số.
+  if (Number.isNaN(ms) && /^\d+$/.test(String(ts))) ms = Number(ts);
+  if (!Number.isFinite(ms)) return "";
+  const d = Date.now() - ms;
   const m = Math.floor(d / 60000);
   if (m < 1) return "vừa xong";
   if (m < 60) return m + " phút trước";
@@ -162,7 +196,9 @@ export function fmtDateTime(ts) {
 export function colorFor(str) {
   let h = 0;
   for (let i = 0; i < String(str).length; i++) h = (h * 31 + str.charCodeAt(i)) % 360;
-  return `hsl(${h}, 58%, 52%)`;
+  // Quiet, near-graphite avatar chips: a faint per-name hue, very low
+  // saturation, dark enough that #fff label text stays legible. No rainbow.
+  return `hsl(${h}, 10%, 36%)`;
 }
 export function initials(name) {
   const parts = String(name || "?").trim().split(/\s+/).slice(0, 2);

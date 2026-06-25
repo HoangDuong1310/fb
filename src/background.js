@@ -31,7 +31,8 @@ import {
   seedPriceSources,
 } from "./prices.js";
 import { listSheetTabs, previewSheet, importSheetTabs } from "./sheets.js";
-import { discoverSelectors, buildConfigWithAI, listModels, spinPostContent } from "./ai.js";
+import { discoverSelectors, buildConfigWithAI, listModels, spinPostContent, generateProfileSkill } from "./ai.js";
+import { clearProfileCache } from "./prompts.js";
 import {
   generateAdvisories,
   analyzePost,
@@ -170,6 +171,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    case "GEN_PROFILE_SKILL": {
+      generateProfileSkill(msg.payload || {})
+        .then((r) => sendResponse(r))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     case "GET_SELECTORS": {
       chrome.storage.local.get("fbSelectors", (r) => {
         sendResponse({ ok: true, selectors: (r && r.fbSelectors) || null });
@@ -255,6 +263,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    case "RECORD_POSTED_GROUPS": {
+      // Lưu lịch sử nhóm đã đăng theo tài khoản (device-local).
+      // authUser?.id dùng để tách dữ liệu theo từng tài khoản đăng nhập.
+      DB.recordPostedGroups(authUser ? authUser.id : null, msg.groups || [])
+        .then((groups) => sendResponse({ ok: true, groups }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "GET_POSTED_GROUPS": {
+      // Trả về danh sách nhóm đăng gần đây / hay đăng theo tài khoản.
+      DB.getPostedGroups(authUser ? authUser.id : null, msg.opts || {})
+        .then((result) => sendResponse({ ok: true, ...result }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     case "DELETE_JOB": {
       (async () => {
         // Tuỳ chọn: xoá luôn bài trên Facebook nếu có link bài và người dùng đồng ý.
@@ -282,6 +307,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!job) return sendResponse({ ok: false, error: "Không tìm thấy job." });
         const r = await runJob(job);
         sendResponse(r);
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "APPROVE_JOB": {
+      // Duyệt 1 việc: paused -> pending để guồng lịch (processDueJobs) tự đăng.
+      (async () => {
+        const jobs = await DB.getJobs();
+        const job = jobs.find((j) => j.id === msg.id);
+        if (!job) return sendResponse({ ok: false, error: "Không tìm thấy job." });
+        if (job.status !== "paused")
+          return sendResponse({ ok: false, error: "Việc không ở trạng thái chờ duyệt." });
+        await DB.updateJob(msg.id, { status: "pending" });
+        scheduleTickSoon();
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "APPROVE_ALL_JOBS": {
+      // Duyệt tất cả việc đang chờ (tuỳ chọn lọc theo type): paused -> pending.
+      (async () => {
+        const jobs = await DB.getJobs(msg.jobType);
+        const paused = jobs.filter((j) => j.status === "paused");
+        for (const j of paused) await DB.updateJob(j.id, { status: "pending" });
+        if (paused.length) scheduleTickSoon();
+        sendResponse({ ok: true, approved: paused.length });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
@@ -502,12 +554,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const url = String(msg.url || "").trim();
         const myComment = String(msg.myComment || "").trim();
         if (!url) return sendResponse({ ok: false, error: "Thiếu link bài viết." });
-        if (!myComment) return sendResponse({ ok: false, error: "Cần nhập nội dung bình luận của bạn để dò reply." });
         // Suy ra postId / groupId / commentId từ URL (best-effort).
         const postId =
           (url.match(/\/posts\/(\d+)/) || url.match(/[?&](?:story_fbid|fbid|multi_permalinks)=(\d+)/) || [])[1] || "";
         const groupId = (url.match(/\/groups\/(\d+)/) || [])[1] || "";
         const commentId = (url.match(/[?&]comment_id=(\d+)/) || [])[1] || "";
+        // Cần MỘT trong hai để định vị bình luận của ta: hoặc comment_id trích
+        // CHẮC CHẮN từ URL (định vị reply chính xác, khỏi dò text), hoặc nội dung
+        // bình luận để dò mềm. Có comment_id thì KHÔNG bắt buộc dán nội dung nữa.
+        if (!commentId && !myComment) {
+          return sendResponse({
+            ok: false,
+            error: "Link không có comment_id — hãy dán link bình luận của bạn (có comment_id=) hoặc nhập nội dung bình luận để dò.",
+          });
+        }
         let groupName = "";
         if (groupId) {
           try {
@@ -548,7 +608,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       (async () => {
         const conv = await DB.getConversation(msg.id);
         if (!conv) return sendResponse({ ok: false, error: "Không tìm thấy hội thoại." });
-        const draft = await draftConversationReply(conv);
+        // targetReplyId (tuỳ chọn): khi NHIỀU người cùng trả lời dưới bình luận
+        // của ta, UI gửi id của reply cần trả lời để AI soạn ĐÚNG người đó.
+        const draft = await draftConversationReply(conv, { targetReplyId: msg.targetReplyId });
         if (!draft || !draft.allowReply) {
           return sendResponse({ ok: false, error: (draft && draft.error) || "AI không soạn được nháp." });
         }
@@ -560,6 +622,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             confidence: draft.confidence,
             needsHumanCheck: !!draft.needsHumanCheck,
             checkNote: draft.checkNote || "",
+            // Người mà nháp này nhắm trả lời (khi có nhiều người cùng reply) ->
+            // UI hiển thị "Trả lời <Tên>" cho rõ, đăng đúng mạch.
+            targetAuthor: draft.targetAuthor || "",
+            targetReplyId: draft.targetReplyId || null,
             draftedAt: Date.now(),
           },
         });
@@ -698,7 +764,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "GET_KEYWORDS": {
       (async () => {
         await readyPromise;
-        const type = String(msg.type || "").trim();
+        const type = String(msg.kwType || "").trim();
         const data = await API.apiFetch("/api/keywords" + (type ? "?type=" + encodeURIComponent(type) : ""));
         sendResponse({ ok: true, keywords: (data && data.keywords) || [] });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
@@ -713,7 +779,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           method: "POST",
           body: JSON.stringify({
             keyword: msg.keyword,
-            type: msg.type || "sell",
+            type: msg.kwType || "sell",
             addedBy: "user",
             enabled: msg.enabled !== false,
           }),
@@ -791,6 +857,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const user = (data && data.user) || null;
         await setAuthUser(user);
         sendResponse({ ok: true, user });
+        // Seed lại nguồn giá ngay sau khi có token hợp lệ. Nếu SW khởi động lúc
+        // CHƯA đăng nhập thì seed lúc khởi tạo đã 401 và bị bỏ qua -> mục "Nguồn
+        // dữ liệu giá" trống. Chạy lại ở đây để 4 nguồn mặc định xuất hiện ngay
+        // sau lần đăng nhập đầu. Lỗi (nếu có) nuốt im, không cản luồng đăng nhập.
+        pruneLegacySources().then(() => seedPriceSources()).catch(() => {});
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Đăng ký: gọi POST /api/auth/register. Backend trả {token, user} y như
+    // login, nên lưu token + user và đăng nhập luôn cho người dùng. skipAuthHandler:
+    // lỗi 4xx lúc đăng ký (email trùng / mật khẩu yếu) KHÔNG được kích hoạt luồng
+    // 401 toàn cục — đó là lỗi nhập liệu, không phải token phiên hết hạn.
+    case "AUTH_REGISTER": {
+      (async () => {
+        await readyPromise;
+        const email = String(msg.email || "").trim();
+        const password = String(msg.password || "");
+        const displayName = String(msg.displayName || "").trim();
+        const data = await API.apiFetch("/api/auth/register", {
+          method: "POST",
+          body: JSON.stringify({
+            email,
+            password,
+            displayName: displayName || undefined,
+          }),
+          skipAuthHandler: true,
+        });
+        API.setToken(data && data.token);
+        const user = (data && data.user) || null;
+        await setAuthUser(user);
+        sendResponse({ ok: true, user });
+        // Seed nguồn giá ngay sau khi đăng ký xong (token mới, hợp lệ) để user
+        // mới thấy 4 nguồn mặc định ngay, không phải đợi SW khởi động lại.
+        pruneLegacySources().then(() => seedPriceSources()).catch(() => {});
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
@@ -814,6 +915,51 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           loggedIn: !!token,
           display_name: (token && authUser && authUser.displayName) || "",
         });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // ----------------------- HỒ SƠ NGÀNH (prompt profiles) ----------------
+    // Quản lý từ dashboard view "Hồ sơ ngành". Dữ liệu 100% ở backend (bảng
+    // prompt_profiles) nên chia sẻ được. Mọi handler đi qua DB.* (wrap apiFetch).
+    case "GET_PROMPT_PROFILES": {
+      (async () => {
+        await readyPromise;
+        const profiles = await DB.getPromptProfiles();
+        sendResponse({ ok: true, profiles });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Lưu/cập nhật một hồ sơ ngành (upsert theo id ở backend).
+    case "SAVE_PROMPT_PROFILE": {
+      (async () => {
+        await readyPromise;
+        await DB.savePromptProfile(msg.profile || {});
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Kích hoạt một hồ sơ ngành (đặt là hồ sơ duy nhất AI dùng). Xoá cache để
+    // các lần gọi AI sau nạp lại hồ sơ mới ngay, không phải đợi cache 60s hết hạn.
+    case "ACTIVATE_PROMPT_PROFILE": {
+      (async () => {
+        await readyPromise;
+        await DB.activatePromptProfile(msg.id);
+        clearProfileCache();
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Xóa một hồ sơ ngành. Cũng xoá cache phòng khi đang xóa hồ sơ active.
+    case "DELETE_PROMPT_PROFILE": {
+      (async () => {
+        await readyPromise;
+        await DB.deletePromptProfile(msg.id);
+        clearProfileCache();
+        sendResponse({ ok: true });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
@@ -849,5 +995,12 @@ try {
   initAutoSync();
   initReplyWatch();
   // Dọn nguồn trùng "Linh kiện máy tính" đời cũ TRƯỚC khi seed lại 4 nguồn chuẩn.
-  pruneLegacySources().then(() => seedPriceSources());
+  // PHẢI đợi readyPromise (token đã nạp vào cache) trước, nếu không các lệnh
+  // getSources/saveSource bắn đi khi SW vừa thức dậy sẽ thiếu Authorization ->
+  // 401 -> seed bị nuốt lỗi (catch rỗng) và token bị xoá oan. Đây là lý do mục
+  // "Nguồn dữ liệu giá" trống dù lẽ ra phải có 4 nguồn seed mặc định.
+  readyPromise
+    .then(() => pruneLegacySources())
+    .then(() => seedPriceSources())
+    .catch(() => {});
 } catch (e) {}

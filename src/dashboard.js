@@ -132,8 +132,10 @@ import {
   addKeywordUI,
   toggleKeyword,
   deleteKeyword,
+  switchKeywordType,
 } from "./dashboard/views/keywords.js";
 import { loadSharingView, saveSharePref } from "./dashboard/views/sharing.js";
+import { loadProfilesView, onProfileAction } from "./dashboard/views/profiles.js";
 
 /* ============================ SỰ KIỆN UI ============================== */
 function bindEvents() {
@@ -424,7 +426,7 @@ function bindEvents() {
       if (!btn) return;
       const id = btn.dataset.id;
       const act = btn.dataset.cvAct;
-      if (act === "draft") draftConvReplyUI(id);
+      if (act === "draft") draftConvReplyUI(id, btn.dataset.targetReply);
       else if (act === "approve") approveConvReplyUI(id);
       else if (act === "close") toggleConvClose(id);
       else if (act === "del") deleteConvUI(id);
@@ -490,18 +492,41 @@ function bindEvents() {
       if (tr) deleteKeyword(tr.dataset.id);
     });
   }
+  // Chuyển tab nhóm từ khóa (Bán / Cần mua / Cần hỗ trợ).
+  if ($("kwTypeTabs"))
+    $("kwTypeTabs").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-kwtype]");
+      if (btn) switchKeywordType(btn.dataset.kwtype);
+    });
 
   // Cài đặt chia sẻ: mỗi công tắc lưu riêng khi đổi.
   ["shareCrawled", "shareCommented", "shareGroupPrices"].forEach((id) => {
     if ($(id)) $(id).addEventListener("change", () => saveSharePref(id));
   });
+
+  // Hồ sơ ngành: 1 delegation cho cả section (nút dùng data-act).
+  const profilesView = document.querySelector('.view[data-view="profiles"]');
+  if (profilesView) profilesView.addEventListener("click", onProfileAction);
 }
 
 async function onJobAction(e, type) {
+  const actEl = e.target.closest("[data-act]");
+  const act = actEl && actEl.dataset.act;
+  // "Duyệt tất cả" nằm ở thanh phía trên, KHÔNG thuộc job-card nào.
+  if (act === "approve-all") {
+    toast("Đang duyệt các việc...", "info", 3000);
+    const res = await bg("APPROVE_ALL_JOBS", { jobType: type });
+    const n = (res && res.approved) || 0;
+    toast(
+      n ? `Đã duyệt ${n} việc. Sẽ đăng theo lịch.` : "Không có việc nào để duyệt.",
+      n ? "ok" : "info"
+    );
+    loadJobs(type);
+    return;
+  }
   const card = e.target.closest(".job-card");
   if (!card) return;
   const id = Number(card.dataset.id);
-  const act = e.target.closest("[data-act]") && e.target.closest("[data-act]").dataset.act;
   if (act === "del") {
     const job = (store.jobs || []).find((j) => j.id === id);
     const postUrl = job && job.result && job.result.postUrl;
@@ -554,6 +579,12 @@ async function onJobAction(e, type) {
       return;
     }
     await bg("DELETE_JOB", { id });
+    loadJobs(type);
+  } else if (act === "approve") {
+    // Duyệt 1 việc: chuyển paused -> pending để guồng lịch tự đăng theo giờ.
+    const res = await bg("APPROVE_JOB", { id });
+    if (res && res.ok) toast("Đã duyệt việc. Sẽ đăng theo lịch.", "ok");
+    else toast((res && res.error) || "Không duyệt được việc.", "err", 5000);
     loadJobs(type);
   } else if (act === "run") {
     toast("Đang chạy việc...", "info", 3000);
@@ -633,6 +664,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (view === "groupprices") reloadGroupPrices();
     else if (view === "keywords") reloadKeywords();
     else if (view === "sharing") loadSharingView();
+    else if (view === "profiles") loadProfilesView();
   }
 });
 
