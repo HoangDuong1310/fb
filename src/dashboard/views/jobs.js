@@ -33,7 +33,10 @@ export function renderJobs(type) {
   const approveBar = pausedCount
     ? `<div class="job-approve-bar"><span class="hint">${pausedCount} việc đang chờ bạn duyệt trước khi đăng.</span><button class="btn primary sm" data-act="approve-all">Duyệt tất cả (${pausedCount})</button></div>`
     : "";
-  wrap.innerHTML = approveBar + list
+  const toolbarRow = list.length
+    ? `<div class="job-approve-bar"><span class="hint">${list.length} việc trong hàng đợi.</span><button class="btn danger-ghost sm" data-act="clear-all">Xóa tất cả</button></div>`
+    : "";
+  wrap.innerHTML = approveBar + toolbarRow + list
     .map((j) => {
       const target =
         type === "comment"
@@ -263,14 +266,14 @@ function showPreview(targets, variants, origContent, fallbackInfo) {
     onConfirm: async (overlay) => {
       const tas = [...overlay.querySelectorAll(".variant-item textarea")];
       const batchId = "batch_" + Date.now();
-      let created = 0;
-      // Gom các nhóm đã tạo việc thành công để lưu vào lịch sử "nhóm hay đăng".
-      const postedGroups = [];
+      // Thu thập danh sách job cần tạo (bỏ qua mục nội dung rỗng).
+      const jobsToCreate = [];
+      const jobTargets = [];
       for (let i = 0; i < targets.length; i++) {
         const text = ((tas[i] && tas[i].value) || "").trim();
         if (!text) continue;
         const scheduledAt = baseTime + i * spacing * 60000;
-        const job = {
+        jobsToCreate.push({
           type: "post",
           status: "paused", // chờ người dùng duyệt, KHÔNG tự đăng
           targetType: targets[i].type,
@@ -280,23 +283,12 @@ function showPreview(targets, variants, origContent, fallbackInfo) {
           batchId,
           batchName: targets[i].name,
           scheduledAt,
-        };
-        const res = await bg("CREATE_JOB", { job });
-        if (res && res.ok) {
-          created++;
-          // Chỉ lưu nhóm thật (bỏ qua đăng lên trang cá nhân — không có groupId).
-          if (targets[i].type === "group" && targets[i].groupId) {
-            postedGroups.push({
-              groupId: targets[i].groupId,
-              groupName: targets[i].name || targets[i].groupId,
-            });
-          }
-        }
+        });
+        jobTargets.push(targets[i]);
       }
-      // Lưu lịch sử nhóm đăng gần đây / hay đăng (theo tài khoản, device-local).
-      if (postedGroups.length) {
-        await bg("RECORD_POSTED_GROUPS", { groups: postedGroups });
-      }
+      // Tạo TOÀN BỘ job trong MỘT lần message (batch) để tránh mất SW giữa chừng.
+      const res = await bg("CREATE_JOBS", { jobs: jobsToCreate });
+      const created = (res && res.ok && Array.isArray(res.jobs)) ? res.jobs.length : 0;
       toast(
         `Đã tạo ${created}/${targets.length} việc (đang CHỜ DUYỆT). Bấm "Duyệt" để đăng.`,
         created ? "ok" : "err"

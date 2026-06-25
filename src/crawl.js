@@ -142,15 +142,59 @@ async function scanJoinedGroupsInPage() {
   const RESERVED = new Set([
     "joins", "feed", "discover", "create", "your_groups", "category", "search", "notifications",
   ]);
+  // Các đoạn path cho biết link trỏ tới bài viết/thông báo cụ thể chứ không phải trang chủ nhóm.
+  const POST_SEGMENTS = new Set([
+    "posts", "permalink", "permalinks", "photo", "photos", "videos", "media",
+    "user", "members", "notif",
+  ]);
+  // Các cụm cho biết text là dòng hoạt động/thông báo, không phải tên nhóm sạch.
+  const NOISE_MARKERS = [
+    "Lần hoạt động gần nhất",
+    "đã bình luận",
+    "đã đăng",
+    "đã chia sẻ",
+    "đã phản hồi",
+    "đã trả lời",
+    "đã thích",
+    "bài viết của bạn",
+  ];
+  // Làm sạch tên nhóm: bỏ tiền tố "Chưa đọc", cắt phần phụ đề hoạt động, bỏ mốc thời gian ở đuôi.
+  const cleanName = (raw) => {
+    let s = (raw || "").trim();
+    if (!s) return "";
+    s = s.replace(/^Chưa đọc\s*/i, "").trim();
+    let cut = s.length;
+    for (const mk of NOISE_MARKERS) {
+      const idx = s.indexOf(mk);
+      if (idx >= 0 && idx < cut) cut = idx;
+    }
+    s = s.slice(0, cut).trim();
+    // Bỏ mốc thời gian tương đối ở đuôi, vd ".3 giờ", ".41 phút", "1 tuần".
+    s = s.replace(/[.\s]*\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm)(\s*trước)?$/i, "").trim();
+    // Bỏ dấu câu thừa ở đuôi.
+    s = s.replace(/[:.\-\s]+$/, "").trim();
+    return s;
+  };
   const map = {};
   document.querySelectorAll('a[href*="/groups/"]').forEach((a) => {
     const href = a.href || "";
-    const m = href.match(/\/groups\/([^/?#]+)/);
+    const path = href.split(/[?#]/)[0];
+    const m = path.match(/\/groups\/([^/]+)(\/[^?#]*)?$/);
     if (!m) return;
     const id = m[1];
     if (RESERVED.has(id)) return;
-    const name = (a.textContent || "").trim();
-    if (name && name.length > 1 && !/^https?:/i.test(name) && !map[id]) {
+    // Bỏ qua link trỏ tới bài viết/thông báo cụ thể (vd /groups/{id}/posts/...).
+    const rest = (m[2] || "").replace(/^\/+|\/+$/g, "");
+    if (rest && POST_SEGMENTS.has(rest.split("/")[0])) return;
+    const name = cleanName(a.textContent || "");
+    if (
+      name &&
+      name.length > 1 &&
+      name.length < 120 &&
+      !/^https?:/i.test(name) &&
+      !NOISE_MARKERS.some((mk) => name.includes(mk)) &&
+      !map[id]
+    ) {
       map[id] = name;
     }
   });
@@ -315,18 +359,39 @@ async function runPostInPage(text, images) {
   } catch (e) {}
 
   // 3) Bấm nút Đăng.
-  const scope = box.closest('div[role="dialog"]') || document;
-  const btns = [...scope.querySelectorAll('div[role="button"], button')];
-  let postBtn = btns.find((b) => {
-    const t = lower(b);
-    return t === "đăng" || t === "post";
-  });
-  if (!postBtn) return { ok: false, error: "Không tìm thấy nút Đăng." };
-  // Chờ nút hết disabled.
-  for (let i = 0; i < 8 && postBtn.getAttribute("aria-disabled") === "true"; i++) {
-    await sleep(700);
+  //    LƯU Ý: Tài khoản bật "chế độ chuyên nghiệp" khi đăng lên trang cá nhân
+  //    KHÔNG có nút "Đăng" ngay, mà hiện nút "Tiếp" -> màn xem trước -> rồi mới
+  //    có nút "Đăng". Vì vậy phải: tìm "Đăng" trước; nếu không thấy thì bấm
+  //    "Tiếp"/"Next" để qua màn xem trước rồi tìm lại "Đăng" (lặp tối đa vài bước).
+  const dialogOf = () => box.closest('div[role="dialog"]') || document;
+  const findBtn = (labels) => {
+    const scope = dialogOf();
+    const els = [...scope.querySelectorAll('div[role="button"], button')];
+    return els.find((b) => {
+      // Bỏ qua nút đang ẩn (không hiển thị).
+      if (b.offsetParent === null && b.getAttribute("aria-hidden") === "true") return false;
+      const t = lower(b);
+      return t && labels.some((x) => t === x);
+    });
+  };
+  const clickWhenEnabled = async (btn) => {
+    for (let i = 0; i < 8 && btn.getAttribute("aria-disabled") === "true"; i++) {
+      await sleep(700);
+    }
+    try { btn.click(); } catch (e) {}
+  };
+
+  let postBtn = findBtn(["đăng", "post"]);
+  // Nếu chưa có nút Đăng, đi qua các bước "Tiếp"/"Next" (tối đa 3 lần) tới màn xem trước.
+  for (let step = 0; step < 3 && !postBtn; step++) {
+    const nextBtn = findBtn(["tiếp", "next", "tiếp tục", "continue"]);
+    if (!nextBtn) break;
+    await clickWhenEnabled(nextBtn);
+    await sleep(2200);
+    postBtn = findBtn(["đăng", "post"]);
   }
-  try { postBtn.click(); } catch (e) {}
+  if (!postBtn) return { ok: false, error: "Không tìm thấy nút Đăng." };
+  await clickWhenEnabled(postBtn);
   await sleep(3200);
 
   // 4) Cố gắng bắt permalink của ĐÚNG bài vừa đăng (best-effort).
@@ -963,6 +1028,21 @@ async function executeDeletePost(postUrl) {
 }
 
 /** Chạy một job (đăng bài / bình luận) và cập nhật trạng thái vào DB. */
+/** Đọc authUser hiện tại từ chrome.storage.local (cùng key với background.js). */
+async function _getAuthUserId() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get("webAuthUser", (r) => {
+        void chrome.runtime.lastError;
+        const u = r && r["webAuthUser"];
+        resolve(u ? u.id || null : null);
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
 async function runJob(job) {
   await DB.updateJob(job.id, { status: "running", attempts: (job.attempts || 0) + 1, error: null });
   broadcast("JOB_UPDATE", { jobId: job.id });
@@ -974,6 +1054,18 @@ async function runJob(job) {
   }
   if (result && result.ok) {
     await DB.updateJob(job.id, { status: "done", result, error: null });
+    // Đăng bài thành công -> lưu lịch sử "nhóm hay đăng" (chỉ khi job có groupId).
+    if (job.type !== "comment" && job.groupId) {
+      try {
+        const userId = await _getAuthUserId();
+        if (userId) {
+          await DB.recordPostedGroups(userId, [{
+            groupId: job.groupId,
+            groupName: job.batchName || job.groupId,
+          }]);
+        }
+      } catch (e) {}
+    }
     // Bình luận thành công -> tạo HỘI THOẠI để theo dõi reply về sau (chỉ THÊM,
     // không đụng dữ liệu cũ). Bọc try để không làm hỏng luồng job nếu lỗi.
     if (job.type === "comment") {

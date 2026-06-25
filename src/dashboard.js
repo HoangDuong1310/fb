@@ -136,6 +136,7 @@ import {
 } from "./dashboard/views/keywords.js";
 import { loadSharingView, saveSharePref } from "./dashboard/views/sharing.js";
 import { loadProfilesView, onProfileAction } from "./dashboard/views/profiles.js";
+import { switchRcTab } from "./dashboard/views/remote-commands.js";
 
 /* ============================ SỰ KIỆN UI ============================== */
 function bindEvents() {
@@ -416,6 +417,14 @@ function bindEvents() {
       syncConvTabs();
       reloadConversations();
     });
+
+  // Lệnh từ Web (remote commands)
+  if ($("rcStatusTabs"))
+    $("rcStatusTabs").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-status]");
+      if (btn) switchRcTab(btn.dataset.status || "");
+    });
+
   if ($("watchEnabled")) $("watchEnabled").addEventListener("change", saveWatchConfig);
   if ($("watchInterval")) $("watchInterval").addEventListener("change", saveWatchConfig);
   if ($("btnWatchNow")) $("btnWatchNow").addEventListener("click", watchNow);
@@ -522,6 +531,25 @@ async function onJobAction(e, type) {
       n ? "ok" : "info"
     );
     loadJobs(type);
+    return;
+  }
+  // "Xóa tất cả" — xoá toàn bộ việc trong hàng đợi.
+  if (act === "clear-all") {
+    const count = (store.jobs || []).length;
+    if (!count) { toast("Hàng đợi trống.", "info"); return; }
+    modal({
+      title: "Xóa tất cả việc trong hàng đợi",
+      bodyHTML: `<p>Bạn muốn xóa <b>${count} việc</b> khỏi hàng đợi?</p><p style="color:var(--red)">Thao tác này không thể hoàn tác.</p>`,
+      confirmText: "Xóa tất cả",
+      danger: true,
+      onConfirm: async () => {
+        toast("Đang xóa tất cả việc...", "info", 3000);
+        const res = await bg("CLEAR_ALL_JOBS");
+        const n = (res && res.deleted) || 0;
+        toast(n ? `Đã xóa ${n} việc.` : "Không có việc nào để xóa.", n ? "ok" : "info");
+        loadJobs(type);
+      },
+    });
     return;
   }
   const card = e.target.closest(".job-card");

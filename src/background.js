@@ -66,6 +66,7 @@ import {
   initReplyWatch,
 } from "./crawl.js";
 import { runGroupPriceExtraction } from "./group-prices.js";
+import { pollRemoteCommands, connectRealtime, disconnectRealtime } from "./remote-commands.js";
 
 /* ----------------------- XÁC THỰC WEB BACKEND (state) ------------------ */
 
@@ -263,6 +264,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    case "CREATE_JOBS": {
+      // Batch: tạo nhiều job cùng lúc trong một lần message (giảm rủi ro mất SW).
+      DB.createJobs(msg.jobs || [])
+        .then((jobs) => {
+          scheduleTickSoon();
+          sendResponse({ ok: true, jobs });
+        })
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     case "RECORD_POSTED_GROUPS": {
       // Lưu lịch sử nhóm đã đăng theo tài khoản (device-local).
       // authUser?.id dùng để tách dữ liệu theo từng tài khoản đăng nhập.
@@ -295,6 +307,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case "CLEAR_FINISHED_JOBS": {
       DB.clearFinishedJobs()
+        .then((deleted) => sendResponse({ ok: true, deleted }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "CLEAR_ALL_JOBS": {
+      DB.clearAllJobs()
         .then((deleted) => sendResponse({ ok: true, deleted }))
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
@@ -837,6 +856,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    // ---- LỆNH TỪ WEB: trả danh sách lệnh (dùng cho dashboard view) ----
+    case "GET_REMOTE_COMMANDS": {
+      (async () => {
+        await readyPromise;
+        const params = new URLSearchParams();
+        if (msg.status) params.set("status", msg.status);
+        if (msg.page) params.set("page", String(msg.page));
+        if (msg.limit) params.set("limit", String(msg.limit));
+        const qs = params.toString();
+        const data = await API.apiFetch("/api/remote-commands" + (qs ? "?" + qs : ""));
+        sendResponse({ ok: true, ...(data || {}) });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     // ----------------------- XÁC THỰC WEB BACKEND (JWT) ------------------
     // Đăng nhập: gọi POST /api/auth/login, lưu token vào api.js (persist storage),
     // nhớ display_name để AUTH_STATE trả lại, rồi trả về user để UI hiển thị.
@@ -984,9 +1018,11 @@ try {
   readyPromise = Promise.all([API.loadToken(), loadAuthUser()]);
 
   chrome.alarms.create("jobTick", { periodInMinutes: 1 });
+  chrome.alarms.create("cmdPoll", { periodInMinutes: 0.5 });
   chrome.alarms.onAlarm.addListener((a) => {
     if (!a) return;
     if (a.name === "jobTick") processDueJobs();
+    else if (a.name === "cmdPoll") pollRemoteCommands();
     else if (a.name === AUTOCRAWL_ALARM) processAutoCrawl();
     else if (a.name === AUTOSYNC_ALARM) processAutoSync();
     else if (a.name === WATCH_ALARM) processReplyWatch();
@@ -999,6 +1035,12 @@ try {
   // getSources/saveSource bắn đi khi SW vừa thức dậy sẽ thiếu Authorization ->
   // 401 -> seed bị nuốt lỗi (catch rỗng) và token bị xoá oan. Đây là lý do mục
   // "Nguồn dữ liệu giá" trống dù lẽ ra phải có 4 nguồn seed mặc định.
+  // Open WebSocket for instant command push (best-effort; polling remains
+  // as fallback).  connectRealtime() needs the token to be loaded first.
+  readyPromise
+    .then(() => connectRealtime())
+    .catch(() => {});
+
   readyPromise
     .then(() => pruneLegacySources())
     .then(() => seedPriceSources())

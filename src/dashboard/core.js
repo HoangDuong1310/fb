@@ -59,21 +59,36 @@ function sendOnce(type, payload) {
 export async function bg(type, payload = {}, retries = 2) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     const res = await sendOnce(type, payload);
-    // Thành công, hoặc lỗi "thật" (SW có trả lời nhưng ok:false) -> trả luôn.
-    if (!res || res._portError === undefined) return res;
-    // Lỗi kênh tạm thời và còn lượt thử: đợi SW mới thức dậy rồi gửi lại.
-    if (isTransientPortError(res._portError) && attempt < retries) {
-      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
-      continue;
+    // SW không phản hồi (res === undefined) -> thử lại (SW có thể vừa bị Chrome tắt).
+    if (!res) {
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+        continue;
+      }
+      return {
+        ok: false,
+        error:
+          'Service worker không phản hồi lệnh "' +
+          type +
+          '". Hãy Reload extension rồi mở lại Dashboard.',
+      };
     }
-    // Hết lượt thử hoặc lỗi kênh không thể tự phục hồi -> báo người dùng.
-    return {
-      ok: false,
-      error:
-        "Mất kết nối tới tiện ích (" +
-        res._portError +
-        "). Hãy Reload extension trong chrome://extensions rồi mở lại Dashboard.",
-    };
+    // Lỗi kênh tạm thời và còn lượt thử: đợi SW mới thức dậy rồi gửi lại.
+    if (res._portError !== undefined) {
+      if (isTransientPortError(res._portError) && attempt < retries) {
+        await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+        continue;
+      }
+      return {
+        ok: false,
+        error:
+          "Mất kết nối tới tiện ích (" +
+          res._portError +
+          "). Hãy Reload extension trong chrome://extensions rồi mở lại Dashboard.",
+      };
+    }
+    // Thành công, hoặc lỗi "thật" (SW có trả lời nhưng ok:false) -> trả luôn.
+    return res;
   }
 }
 

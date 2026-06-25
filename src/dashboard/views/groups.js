@@ -7,6 +7,28 @@ import { $, bg, store, toast, modal, esc, timeAgo, colorFor, initials, emptyStat
 import { flashSaved } from "../prefs.js";
 
 /* ================================ NHÓM ================================= */
+
+// Các cụm cho biết tên nhóm bị lẫn text thông báo/hoạt động của Facebook.
+const GROUP_NAME_NOISE = [
+  "Lần hoạt động gần nhất",
+  "đã bình luận",
+  "đã đăng",
+  "đã chia sẻ",
+  "đã phản hồi",
+  "đã trả lời",
+  "đã thích",
+  "bài viết của bạn",
+];
+
+/** Trả về true nếu tên nhóm trông sạch (không phải dòng thông báo/hoạt động). */
+export function isCleanGroupName(name) {
+  const s = (name || "").trim();
+  if (!s || s.length < 2 || s.length > 120) return false;
+  if (/^https?:/i.test(s)) return false;
+  if (/^Chưa đọc/i.test(s)) return false;
+  return !GROUP_NAME_NOISE.some((mk) => s.includes(mk));
+}
+
 export async function loadGroups() {
   const res = await bg("GET_GROUPS");
   store.groups = (res && res.groups) || [];
@@ -32,7 +54,9 @@ export async function fillPostGroupChecklist() {
   const checked = new Set(
     [...list.querySelectorAll("input.gcl-check:checked")].map((c) => c.value)
   );
-  if (!store.groups.length) {
+  // Lọc bỏ những bản ghi rác từ lần quét cũ (text thông báo/hoạt động lẫn vào tên nhóm).
+  const cleanGroups = store.groups.filter((g) => isCleanGroupName(g.groupName));
+  if (!cleanGroups.length) {
     list.innerHTML = `<p class="gcl-empty">Chưa có nhóm — hãy quét nhóm ở tab Nhóm trước.</p>`;
     const cnt = $("postGroupCount");
     if (cnt) cnt.textContent = "0";
@@ -74,7 +98,7 @@ export async function fillPostGroupChecklist() {
     if (!m) return 3;
     return m.kind === "frequent" ? 0 : 1;
   };
-  const ordered = store.groups
+  const ordered = cleanGroups
     .map((g, idx) => ({ g, idx }))
     .sort((a, b) => {
       const ra = rank(a.g.groupId);
@@ -117,7 +141,9 @@ export async function fillPostGroupChecklist() {
 export function renderGroups() {
   const term = ($("groupSearch").value || "").toLowerCase();
   const list = store.groups.filter(
-    (g) => !term || (g.groupName || "").toLowerCase().includes(term) || g.groupId.includes(term)
+    (g) =>
+      isCleanGroupName(g.groupName) &&
+      (!term || (g.groupName || "").toLowerCase().includes(term) || g.groupId.includes(term))
   );
   const wrap = $("groupsWrap");
   if (!list.length) {

@@ -213,6 +213,30 @@ async function createJob(job) {
   return record;
 }
 
+/** Tạo nhiều job cùng lúc (batch). Trả về mảng job đã lưu. */
+async function createJobs(jobs) {
+  const store = await readJobs();
+  const results = [];
+  for (const j of jobs || []) {
+    const id = store.seq++;
+    const record = {
+      type: "post",
+      status: "pending",
+      attempts: 0,
+      result: null,
+      error: null,
+      createdAt: Date.now(),
+      scheduledAt: j.scheduledAt || Date.now(),
+      ...j,
+      id,
+    };
+    store.jobs.push(record);
+    results.push(record);
+  }
+  await writeJobs(store);
+  return results;
+}
+
 /** Cập nhật một job theo id (gộp các trường truyền vào). Trả về job merged hoặc null. */
 async function updateJob(id, patch) {
   const store = await readJobs();
@@ -296,6 +320,15 @@ async function clearFinishedJobs() {
     (j) => j.status !== "done" && j.status !== "error"
   );
   const deleted = before - store.jobs.length;
+  await writeJobs(store);
+  return deleted;
+}
+
+/** Xóa TOÀN BỘ job trong hàng đợi (bất kể trạng thái). Trả về số job đã xóa. */
+async function clearAllJobs() {
+  const store = await readJobs();
+  const deleted = store.jobs.length;
+  store.jobs = [];
   await writeJobs(store);
   return deleted;
 }
@@ -782,12 +815,14 @@ export {
   deleteGroup,
   // jobs (chrome.storage.local — device-local, NOT API)
   createJob,
+  createJobs,
   updateJob,
   getJobs,
   getDueJobs,
   recoverStuckJobs,
   deleteJob,
   clearFinishedJobs,
+  clearAllJobs,
   // posted groups (lịch sử đăng — device-local, NOT API)
   recordPostedGroups,
   getPostedGroups,

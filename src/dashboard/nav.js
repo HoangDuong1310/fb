@@ -21,6 +21,7 @@ import { loadGroupPricesView } from "./views/groupprices.js";
 import { loadKeywordsView } from "./views/keywords.js";
 import { loadSharingView } from "./views/sharing.js";
 import { loadProfilesView } from "./views/profiles.js";
+import { loadRemoteCommandsView } from "./views/remote-commands.js";
 
 export const VIEW_META = {
   overview: ["Tổng quan", "Theo dõi hiệu quả khai thác nhóm của bạn."],
@@ -39,6 +40,7 @@ export const VIEW_META = {
   sharing: ["Cài đặt chia sẻ", "Bật/tắt chia sẻ dữ liệu của bạn cho người dùng khác xem."],
   profiles: ["Hồ sơ ngành", "Tùy biến giọng AI theo ngành hàng của bạn (bán điện thoại, bất động sản, thuê phòng...). Lưu ở backend, chia sẻ được."],
   settings: ["Cài đặt", "Quản lý cấu hình crawl, tự động, AI và dữ liệu của tiện ích."],
+  remoteCommands: ["Lệnh từ Web", "Xem và theo dõi các lệnh điều khiển từ web server."],
 };
 
 export function switchView(view) {
@@ -66,4 +68,5 @@ export function switchView(view) {
   if (view === "sharing") loadSharingView();
   if (view === "profiles") loadProfilesView();
   if (view === "settings") loadSettings();
+  if (view === "remoteCommands") loadRemoteCommandsView();
 }
