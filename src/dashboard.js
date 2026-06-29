@@ -48,6 +48,8 @@ import {
   analyzePostUI,
   applyLeadMode,
   suggestKeywordsUI,
+  toggleMineOnly,
+  loadPostComments,
 } from "./dashboard/views/posts.js";
 import { loadLeadKeywords } from "./dashboard/leadfilter.js";
 import {
@@ -207,6 +209,8 @@ function bindEvents() {
     });
   if ($("btnSuggestKeywords"))
     $("btnSuggestKeywords").addEventListener("click", suggestKeywordsUI);
+  if ($("btnMineOnly"))
+    $("btnMineOnly").addEventListener("click", toggleMineOnly);
   $("btnExportJson").addEventListener("click", () => exportPosts("json"));
   $("btnExportCsv").addEventListener("click", () => exportPosts("csv"));
   $("btnClearPosts").addEventListener("click", clearGroupPosts);
@@ -220,6 +224,13 @@ function bindEvents() {
         body.classList.toggle("clamp", !expanded);
         tog.textContent = expanded ? "Xem bớt" : "Xem thêm";
       }
+      return;
+    }
+    const showCmt = e.target.closest("[data-show-comments]");
+    if (showCmt) {
+      const id = showCmt.dataset.showComments;
+      const container = document.getElementById("cmtHist_" + id);
+      loadPostComments(id, container);
       return;
     }
     const ana = e.target.closest("[data-analyze]");

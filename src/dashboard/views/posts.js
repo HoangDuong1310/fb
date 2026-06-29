@@ -22,7 +22,19 @@ import {
 } from "./advisory.js";
 
 /* =============================== BÀI VIẾT ============================== */
+
+/** Lấy userId của người dùng hiện tại từ SW (cần cho ownership badge).
+ * Gọi một lần; kết quả cache vào store.currentUserId. */
+async function ensureCurrentUserId() {
+  if (store.currentUserId !== undefined) return;
+  const res = await bg("AUTH_STATE");
+  store.currentUserId = (res && res.userId) || null;
+}
+
 export async function loadPosts() {
+  // Đảm bảo có userId để so sánh ownership khi render card.
+  await ensureCurrentUserId();
+
   const sel = $("postsGroupFilter");
   // Khôi phục bộ lọc nhóm đã lưu (lần đầu vào tab, khi select còn rỗng).
   if (sel && !sel.value) {
@@ -32,9 +44,35 @@ export async function loadPosts() {
   const groupId = (sel && sel.value) || "";
   store.postsGroupId = groupId;
   saveUIPref("postsGroupId", groupId);
-  const res = await bg("GET_ALL_POSTS", { groupId });
+
+  // Khôi phục trạng thái mine-only từ prefs.
+  if (store.postsMineOnly == null) {
+    store.postsMineOnly = !!uiPref("postsMineOnly", false);
+  }
+  _syncMineBtn();
+
+  const res = await bg("GET_ALL_POSTS", {
+    groupId,
+    mine: store.postsMineOnly ? 1 : undefined,
+  });
   store.posts = (res && res.posts) || [];
   renderPosts();
+}
+
+/** Đồng bộ trạng thái active của nút mine-only với store. */
+function _syncMineBtn() {
+  const btn = $("btnMineOnly");
+  if (!btn) return;
+  btn.classList.toggle("active", !!store.postsMineOnly);
+  btn.textContent = store.postsMineOnly ? "✓ Chỉ của tôi" : "Chỉ của tôi";
+}
+
+/** Bật/tắt chế độ chỉ hiển thị bài của chính mình rồi reload. */
+export async function toggleMineOnly() {
+  store.postsMineOnly = !store.postsMineOnly;
+  saveUIPref("postsMineOnly", store.postsMineOnly);
+  _syncMineBtn();
+  await loadPosts();
 }
 
 // Chế độ lọc thông minh hiện tại: all | lead | buy | support.
@@ -92,6 +130,7 @@ export function renderPosts() {
     );
     return;
   }
+  const myId = store.currentUserId || null;
   wrap.innerHTML = list
     .map((p) => {
       const imgs = p.images || [];
@@ -110,18 +149,27 @@ export function renderPosts() {
         lead.label !== "other"
           ? `<span class="lead-badge ${LEAD_META[lead.label].cls}">${LEAD_META[lead.label].text}</span>`
           : "";
+      // Badge quyền sở hữu: phân biệt bài của mình / bài người khác chia sẻ.
+      const isOwn = myId && String(p.crawledBy) === String(myId);
+      const ownerBadge = p.crawledBy != null
+        ? (isOwn
+            ? `<span class="lead-badge mine-badge">của tôi</span>`
+            : `<span class="lead-badge share-badge">chia sẻ</span>`)
+        : "";
       const links = (p.links || []).length
         ? `<div class="pc-links">${(p.links || [])
             .slice(0, 3)
             .map((l) => `<a href="${esc(l)}" target="_blank" rel="noopener">🔗 ${esc(shortUrl(l))}</a>`)
             .join("")}</div>`
         : "";
+      // Khu vực lịch sử bình luận (ẩn mặc định, hiện khi click nút).
+      const cmtHistId = `cmtHist_${esc(p.postId || "")}`;
       return `
       <div class="post-card">
         <div class="pc-head">
           ${av}
           <div class="pc-id">
-            <span class="pc-author">${esc(author)}${leadBadge}</span>
+            <span class="pc-author">${esc(author)}${leadBadge}${ownerBadge}</span>
             <span class="pc-sub">${esc(p.timeText || timeAgo(p.timestamp || p.crawledAt) || "Không rõ thời gian")} · ${esc(p.groupName || p.groupId || "")}</span>
           </div>
         </div>
@@ -134,9 +182,49 @@ export function renderPosts() {
           <span class="pc-metric" title="Bình luận">${cmtIco()} ${p.comments != null ? p.comments : "—"}</span>
           <span class="spacer"></span>
           ${p.permalink ? `<a class="btn ghost sm" href="${esc(p.permalink)}" target="_blank" rel="noopener">Mở bài ↗</a>` : ""}
+          <button class="btn ghost sm" data-show-comments="${esc(p.postId || "")}" title="Xem lịch sử đã bình luận">📋 Lịch sử BL</button>
           <button class="btn ghost sm" data-cmt="${esc(p.permalink || "")}">Bình luận</button>
           <button class="btn primary sm" data-analyze="${esc(p.postId || "")}">AI phân tích</button>
         </div>
+        <div class="pc-cmt-hist" id="${cmtHistId}" hidden></div>
+      </div>`;
+    })
+    .join("");
+}
+
+/**
+ * Tải và hiển thị lịch sử bình luận của một bài viết trong panel ẩn của card.
+ * Gọi khi user click nút "📋 Lịch sử BL".
+ */
+export async function loadPostComments(postId, containerEl) {
+  if (!containerEl) return;
+  // Toggle: nếu đang hiển thị thì ẩn lại.
+  if (!containerEl.hidden) {
+    containerEl.hidden = true;
+    return;
+  }
+  containerEl.hidden = false;
+  containerEl.innerHTML = `<span class="hint">Đang tải...</span>`;
+  const res = await bg("GET_POST_COMMENTS", { postId });
+  if (!res || !res.ok) {
+    containerEl.innerHTML = `<span class="hint" style="color:var(--red,#e53935)">Lỗi tải lịch sử.</span>`;
+    return;
+  }
+  const comments = res.comments || [];
+  if (!comments.length) {
+    containerEl.innerHTML = `<span class="hint">Chưa có bình luận nào được ghi nhận.</span>`;
+    return;
+  }
+  containerEl.innerHTML = comments
+    .map((c) => {
+      const who = c.shareCommented
+        ? `<span class="lead-badge share-badge">chia sẻ</span>`
+        : `<span class="lead-badge mine-badge">của tôi</span>`;
+      const when = c.commentedAt ? timeAgo(c.commentedAt) : "";
+      return `<div class="pc-cmt-row">
+        ${who}
+        <span class="pc-cmt-time">${esc(when)}</span>
+        <span class="pc-cmt-text">${esc(c.content || "(không có nội dung)")}</span>
       </div>`;
     })
     .join("");

@@ -63,10 +63,23 @@ async function getKnownIds(groupId) {
   return Array.isArray(body?.ids) ? body.ids : [];
 }
 
-/** Lấy toàn bộ bài viết (tùy chọn lọc theo nhóm). Trả về MẢNG (server sort sẵn). */
-async function getAllPosts(groupId) {
-  const body = await apiFetch("/api/posts" + qs({ groupId }));
+/** Lấy toàn bộ bài viết (tùy chọn lọc theo nhóm). Trả về MẢNG (server sort sẵn).
+ * mine=true => chỉ lấy bài DO CHÍNH user crawl (không kéo data người khác chia sẻ). */
+async function getAllPosts(groupId, mine) {
+  const body = await apiFetch(
+    "/api/posts" + qs({ groupId, mine: mine ? 1 : undefined })
+  );
   return Array.isArray(body?.posts) ? body.posts : [];
+}
+
+/** Lấy lịch sử bình luận của MỘT bài viết (ai đã comment, nội dung gì) để AI
+ * tránh trùng lặp. Trả về MẢNG [{id, postId, userId, content, commentedAt, shareCommented}]. */
+async function getPostComments(postId) {
+  if (!postId) return [];
+  const body = await apiFetch(
+    "/api/posts/" + encodeURIComponent(postId) + "/comments"
+  );
+  return Array.isArray(body?.comments) ? body.comments : [];
 }
 
 /** Thống kê: { total, groups:[{groupId, groupName, count}] } — giữ đúng shape cũ. */
@@ -806,6 +819,7 @@ export {
   savePosts,
   getKnownIds,
   getAllPosts,
+  getPostComments,
   getStats,
   clearPosts,
   // groups

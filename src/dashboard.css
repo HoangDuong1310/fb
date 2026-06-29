@@ -839,6 +839,20 @@ textarea { resize: vertical; line-height: 1.55; }
 .lead-badge.lead-support { background: var(--blue-soft); color: var(--blue); }
 .lead-badge.lead-seller { background: var(--surface-3); color: var(--ink-soft); }
 .lead-badge.lead-other { background: var(--surface-3); color: var(--ink-soft); }
+/* Ownership badges — phân biệt bài của mình vs bài người khác chia sẻ */
+.lead-badge.mine-badge  { background: #e8f5e9; color: #2e7d32; }
+.lead-badge.share-badge { background: #fff3e0; color: #e65100; }
+/* Mine-only toggle button active state */
+.btn.ghost.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn.ghost.active:hover { background: var(--accent-bright); border-color: var(--accent-bright); }
+/* Comment history panel per post card */
+.pc-cmt-hist { margin-top: 8px; padding: 8px 10px; background: var(--surface-2); border-radius: 6px; border: 1px solid var(--line); }
+.pc-cmt-hist .pc-cmt-empty { font-size: 12px; color: var(--ink-soft); }
+.pc-cmt-row { display: flex; flex-direction: column; gap: 2px; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.pc-cmt-row:last-child { border-bottom: none; }
+.pc-cmt-row .pc-cmt-meta { color: var(--ink-soft); font-size: 11px; }
+.pc-cmt-row .pc-cmt-content { color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.pc-cmt-row .pc-cmt-shared { display: inline-block; margin-left: 6px; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 99px; background: var(--blue-soft); color: var(--blue); }
 
 /* Modal gợi ý từ khoá */
 .kw-list { max-height: 50vh; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }

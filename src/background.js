@@ -145,8 +145,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "GET_ALL_POSTS": {
-      DB.getAllPosts(msg.groupId)
+      DB.getAllPosts(msg.groupId, msg.mine)
         .then((posts) => sendResponse({ ok: true, posts }))
+        .catch((err) => sendResponse({ ok: false, error: String(err) }));
+      return true;
+    }
+
+    case "GET_POST_COMMENTS": {
+      DB.getPostComments(msg.postId)
+        .then((comments) => sendResponse({ ok: true, comments }))
         .catch((err) => sendResponse({ ok: false, error: String(err) }));
       return true;
     }
@@ -958,6 +965,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           ok: true,
           loggedIn: !!token,
           display_name: (token && authUser && authUser.displayName) || "",
+          userId: (token && authUser && authUser.id) || null,
         });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
