@@ -362,7 +362,13 @@ export async function startBatchCrawl() {
     toast("Chưa chọn nhóm nào để crawl hàng loạt.", "err");
     return;
   }
-  const maxThreads = crawlOpts().maxThreads;
+  // QUAN TRỌNG: crawl TUẦN TỰ 1 nhóm/lần (không song song). Facebook ảo hoá feed
+  // và CHỈ mount bài khi tab đang hiển thị (foreground). Mở nhiều tab nền cùng lúc
+  // bị Chrome bóp ga/đóng băng (throttle/freeze) nên mỗi tab chỉ mount 1–2 bài ->
+  // crawl thiếu. Đã XÁC MINH: crawl 1 nhóm lấy đủ, nhiều nhóm cùng lúc thì thiếu.
+  // Vì chỉ một tab được foreground tại một thời điểm, chạy song song là bất khả thi
+  // với feed ảo hoá -> ép 1 luồng để mỗi nhóm lấy đủ bài.
+  const maxThreads = 1;
   store.batch = {
     queue,
     nextIndex: 0,
@@ -374,7 +380,7 @@ export async function startBatchCrawl() {
   };
   toggleBatchUI(true);
   toast(
-    `Bắt đầu crawl hàng loạt ${queue.length} nhóm (tối đa ${maxThreads} luồng song song, giữ jitter chống checkpoint).`,
+    `Bắt đầu crawl hàng loạt ${queue.length} nhóm (chạy tuần tự từng nhóm để lấy ĐỦ bài; giữ jitter chống checkpoint).`,
     "info",
     3500
   );

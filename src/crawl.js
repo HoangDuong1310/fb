@@ -1248,11 +1248,12 @@ async function processAutoCrawl() {
       (g) => g && (g.groupId || g.id)
     );
     const opts = cfg.options || {};
-    // Số luồng song song: kẹp trong [1, 20] và không vượt quá số nhóm.
-    const threads = Math.max(
-      1,
-      Math.min(20, parseInt(opts.maxThreads, 10) || 1, order.length || 1)
-    );
+    // Crawl TUẦN TỰ 1 nhóm/lần (không song song). Facebook ảo hoá feed và CHỈ mount
+    // bài khi tab đang hiển thị; nhiều tab nền cùng lúc bị Chrome bóp ga/đóng băng nên
+    // mỗi tab chỉ mount 1–2 bài -> crawl thiếu. Đã XÁC MINH: 1 nhóm đủ, nhiều nhóm thiếu.
+    // Chỉ một tab được foreground tại một thời điểm nên song song là bất khả thi với
+    // feed ảo hoá -> ép 1 luồng để mỗi nhóm lấy đủ bài (đánh đổi: chậm hơn nhưng đúng).
+    const threads = 1;
 
     let cursor = 0; // chỉ số nhóm kế tiếp cần xử lý (dùng chung giữa các worker)
 
