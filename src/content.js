@@ -188,6 +188,31 @@
     return location.origin + "/groups/" + groupId + "/posts/" + postId + "/";
   }
 
+  // ---- Vân tay nội dung (id dự phòng cho bài ẩn permalink) ---------------
+
+  /** Băm chuỗi -> id ngắn ổn định (djb2, base36). Không cần mật mã, chỉ cần
+   *  ĐỊNH DANH ỔN ĐỊNH giữa các lần quét. */
+  function hashStr(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) {
+      h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; // h*33 + c, giữ 32-bit không dấu
+    }
+    return h.toString(36);
+  }
+
+  /** Tạo id "vân tay" cho bài CHỈ-CHỮ mà Facebook ẩn permalink (chỉ hiện khi
+   *  hover). Cơ sở = tác giả + text + ảnh đầu, ĐÃ LOẠI timeText (vì thời gian
+   *  tương đối trôi theo lúc quét, đưa vào sẽ làm id đổi mỗi lần). Nhờ vậy bài
+   *  không có permalink vẫn được LƯU và DEDUP đúng giữa các phiên crawl. Trả
+   *  null nếu không đủ dữ liệu (không text, không ảnh) để định danh. */
+  function fingerprintId(groupId, authorName, text, images) {
+    const norm = String(text || "").replace(/\s+/g, " ").trim().slice(0, 240);
+    const img0 = images && images[0] ? String(images[0]).split("?")[0] : "";
+    if (!norm && !img0) return null; // không có gì để định danh ổn định
+    const basis = String(authorName || "") + "|" + norm + "|" + img0;
+    return "fp:" + groupId + ":" + hashStr(basis);
+  }
+
   /**
    * Tìm danh sách "ô bài viết" trong feed.
    * QUAN TRỌNG (theo cấu trúc THỰC TẾ của nhóm này): BÀI VIẾT là MỘT Ô CON của
@@ -638,22 +663,28 @@
 
   // ---- Bóc tách 1 article thành object bài viết --------------------------
 
-  async function extractPost(article, groupInfo, selectors) {
-    const postId = getPostIdFrom(article);
-    if (!postId) return null;
+  async function extractPost(article, groupInfo, selectors, knownPostId) {
+    // postId THẬT (pfbid/số) nếu lấy được. Bài chỉ-chữ ẩn permalink => có thể
+    // null ở đây; ta KHÔNG bỏ bài mà rơi xuống "vân tay nội dung" bên dưới.
+    let postId = knownPostId || getPostIdFrom(article);
     // Node có thể đã bị feed ảo hoá gỡ khỏi DOM giữa lúc quét và lúc bóc tách.
     // Nếu vậy, tìm lại node còn sống theo postId để không bóc tách trên DOM chết.
-    if (!article.isConnected) {
+    if (postId && !article.isConnected) {
       const live = findContainerByPostId(postId);
       if (live) article = live;
     }
-    const permalink = buildPermalink(groupInfo.groupId, postId);
 
     // QUAN TRỌNG: feed Facebook render lười. Bài ngoài tầm nhìn chỉ có phần
     // header (link tác giả/permalink), thân bài (text, ảnh) chưa render =>
     // mọi trường rỗng. Cuộn bài vào giữa màn hình và chờ render trước khi bóc tách.
+    // Chỉ cuộn bài vào tầm nhìn khi nó CHƯA hiện đủ. Cuộn-căn-giữa MỌI bài làm
+    // viewport "giật" lên/xuống liên tục => feed ảo hoá gỡ (unmount) các bài lân
+    // cận chưa kịp quét trong cùng nhịp => mất bài. Tránh giật khi đã thấy bài.
     try {
-      article.scrollIntoView({ block: "center" });
+      const r = article.getBoundingClientRect();
+      const vh = window.innerHeight || 800;
+      const mostlyInView = r.height > 0 && r.top >= 0 && r.top < vh * 0.85;
+      if (!mostlyInView) article.scrollIntoView({ block: "center" });
     } catch (e) {}
     await sleep(450);
 
@@ -683,17 +714,30 @@
     // Chặn selector thời gian sai (vd link bình luận): chỉ nhận khi giống thời gian.
     const aiTimeText = looksLikeTime(ai.timeText) ? ai.timeText : null;
 
+    const finalAuthor = pick(ai.authorName, base.authorName);
+    const finalText = pick(ai.text, base.text);
+    const finalImages = pickArr(ai.images, base.images);
+
+    // CHỐT ĐỊNH DANH: ưu tiên postId THẬT; nếu bài chỉ-chữ ẩn permalink (không
+    // lấy được id), dùng VÂN TAY nội dung -> KHÔNG bỏ sót bài và dedup ổn định.
+    if (!postId) {
+      postId = fingerprintId(groupInfo.groupId, finalAuthor, finalText, finalImages);
+    }
+    if (!postId) return null; // không đủ dữ liệu để định danh => bỏ qua
+    const permalink =
+      postId.indexOf("fp:") === 0 ? null : buildPermalink(groupInfo.groupId, postId);
+
     return {
       postId,
       groupId: groupInfo.groupId,
       groupName: groupInfo.groupName,
       permalink,
-      authorName: pick(ai.authorName, base.authorName),
+      authorName: finalAuthor,
       authorProfile: pick(ai.authorProfile, base.authorProfile),
       timestamp: time.timestamp,
       timeText: pick(aiTimeText, base.timeText),
-      text: pick(ai.text, base.text),
-      images: pickArr(ai.images, base.images),
+      text: finalText,
+      images: finalImages,
       videos: pickArr(ai.videos, base.videos),
       links: extractExternalLinks(article, permalink),
       reactions: pick(ai.reactions, base.reactions),
@@ -823,6 +867,10 @@
     let scrolls = 0;
     let idleScrolls = 0;    // số nhịp cuộn liên tiếp không có bài mới & trang không cao thêm
     let batch = [];
+    // Bộ đếm chẩn đoán: làm RÕ mỗi bài "biến mất" về đâu, thay vì im lặng bỏ.
+    let dropNoContent = 0;   // bóc tách xong nhưng không định danh/không có nội dung
+    let dropError = 0;       // extractPost ném lỗi
+    let usedFingerprint = 0; // số bài phải dùng id vân tay (FB ẩn permalink)
 
     const flush = async () => {
       if (batch.length === 0) return;
@@ -885,15 +933,53 @@
         for (const article of containers) {
           if (state.stopRequested || newCount >= opts.maxNewPosts) break;
 
-          // Lấy nhanh postId để quyết định trước khi bóc tách nặng. Bài chỉ-chữ
-          // ẩn permalink đến khi hover => nếu chưa có thì hover để FB nạp href.
-          let postId = getPostIdFrom(article);
-          if (!postId) postId = await revealPostId(article);
-          if (!postId) continue;
-          if (seenThisRun.has(postId)) continue;
-          seenThisRun.add(postId);
+          // BƯỚC 1 — thử lấy postId THẬT (rẻ) để bỏ qua SỚM bài đã quét/đã biết
+          // mà khỏi bóc tách nặng. Bài chỉ-chữ ẩn permalink => hover để FB nạp
+          // href. QUAN TRỌNG: nếu vẫn không có id, KHÔNG bỏ bài ở đây nữa — sẽ
+          // bóc tách rồi dùng VÂN TAY nội dung làm id (trong extractPost).
+          let realId = getPostIdFrom(article);
+          if (!realId) realId = await revealPostId(article);
 
-          if (known.has(postId)) {
+          if (realId) {
+            if (seenThisRun.has(realId)) continue;
+            if (known.has(realId)) {
+              seenThisRun.add(realId);
+              consecutiveKnown += 1;
+              if (consecutiveKnown >= opts.stopAfterKnown) {
+                await flush();
+                reportProgress({ status: "stopped_known" });
+                state.running = false;
+                send("CRAWL_DONE", {
+                  result: { newCount, reason: "Đã gặp đủ bài cũ liên tiếp — coi như hết bài mới." },
+                });
+                return { ok: true, newCount, reason: "known_limit" };
+              }
+              continue;
+            }
+          }
+
+          // BƯỚC 2 — bóc tách đầy đủ. extractPost tự CHỐT id (thật hoặc vân tay).
+          let post = null;
+          try {
+            post = await extractPost(article, groupInfo, selectors, realId);
+          } catch (e) {
+            dropError += 1;
+          }
+          if (!post || !post.postId) {
+            // Không định danh được / không có nội dung. Nếu có id thật thì đánh
+            // dấu để khỏi lặp lại bài này ở các nhịp sau; đếm lại để chẩn đoán.
+            if (realId) seenThisRun.add(realId);
+            dropNoContent += 1;
+            continue;
+          }
+
+          const id = post.postId;
+          if (seenThisRun.has(id)) continue;
+          seenThisRun.add(id);
+          if (id.indexOf("fp:") === 0) usedFingerprint += 1;
+
+          // Bài đã có trong kho (kể cả khớp theo id vân tay) -> xử như "đã biết".
+          if (known.has(id)) {
             consecutiveKnown += 1;
             if (consecutiveKnown >= opts.stopAfterKnown) {
               await flush();
@@ -907,36 +993,30 @@
             continue;
           }
 
-          // Bài MỚI -> reset chuỗi known, bóc tách đầy đủ.
+          // Bài MỚI -> reset chuỗi known.
           consecutiveKnown = 0;
-          try {
-            const post = await extractPost(article, groupInfo, selectors);
-            if (post && post.postId) {
-              // Lọc theo "Crawl từ ngày": feed mới->cũ nên khi gặp đủ bài cũ
-              // hơn mốc liên tiếp thì coi như đã vượt qua khoảng cần lấy -> dừng.
-              // Bài không xác định được thời gian (timestamp rỗng) vẫn được giữ.
-              if (opts.fromTs && post.timestamp && post.timestamp < opts.fromTs) {
-                consecutiveOld += 1;
-                if (consecutiveOld >= opts.stopAfterKnown) {
-                  await flush();
-                  reportProgress({ status: "stopped_old" });
-                  state.running = false;
-                  send("CRAWL_DONE", {
-                    result: { newCount, reason: "Đã tới bài cũ hơn ngày bắt đầu — dừng theo bộ lọc ngày." },
-                  });
-                  return { ok: true, newCount, reason: "date_limit" };
-                }
-                continue; // bỏ qua bài cũ hơn mốc, không lưu
-              }
-              consecutiveOld = 0;
-              batch.push(post);
-              newCount += 1;
-              if (batch.length >= 10) await flush();
-              reportProgress({ status: "crawling", lastAuthor: post.authorName });
+
+          // Lọc theo "Crawl từ ngày": feed mới->cũ nên khi gặp đủ bài cũ hơn mốc
+          // liên tiếp thì coi như đã vượt khoảng cần lấy -> dừng. Bài không xác
+          // định được thời gian (timestamp rỗng) vẫn được giữ.
+          if (opts.fromTs && post.timestamp && post.timestamp < opts.fromTs) {
+            consecutiveOld += 1;
+            if (consecutiveOld >= opts.stopAfterKnown) {
+              await flush();
+              reportProgress({ status: "stopped_old" });
+              state.running = false;
+              send("CRAWL_DONE", {
+                result: { newCount, reason: "Đã tới bài cũ hơn ngày bắt đầu — dừng theo bộ lọc ngày." },
+              });
+              return { ok: true, newCount, reason: "date_limit" };
             }
-          } catch (e) {
-            // Bỏ qua bài lỗi.
+            continue; // bỏ qua bài cũ hơn mốc, không lưu
           }
+          consecutiveOld = 0;
+          batch.push(post);
+          newCount += 1;
+          if (batch.length >= 10) await flush();
+          reportProgress({ status: "crawling", lastAuthor: post.authorName });
         }
 
         await flush();
@@ -984,7 +1064,11 @@
         ? "Đã đạt giới hạn số bài mới."
         : "Đã cuộn hết feed khả dụng.";
 
-      dlog(`HOÀN TẤT: ${reason} | tổng bài mới lưu=${newCount}, tổng đã quét=${seenThisRun.size}, số nhịp cuộn=${scrolls}`);
+      dlog(
+        `HOÀN TẤT: ${reason} | mới-lưu=${newCount} đã-quét=${seenThisRun.size}` +
+          ` nhịp-cuộn=${scrolls} | dùng-vân-tay=${usedFingerprint}` +
+          ` bỏ-không-nội-dung=${dropNoContent} bỏ-lỗi=${dropError}`
+      );
       reportProgress({ status: "done" });
       send("CRAWL_DONE", { result: { newCount, reason } });
       state.running = false;
