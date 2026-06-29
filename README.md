@@ -45,7 +45,7 @@ Extension Chrome/Edge (Manifest V3) để crawl **chỉ các bài viết MỚI**
 ## Cách dùng
 
 1. Mở nhóm Facebook trong tab: `https://www.facebook.com/groups/<id-nhóm>`.
-2. **Quan trọng:** đặt nhóm về chế độ sắp xếp **"Bài viết mới"** / **"Hoạt động gần đây"** để cơ chế "chỉ lấy bài mới" hoạt động chính xác.
+2. Extension **tự** chuyển nhóm về chế độ **"Bài viết mới"** (thêm `?sorting_setting=CHRONOLOGICAL` vào URL, có lớp dự phòng bấm UI) để cơ chế "chỉ lấy bài mới" chạy đúng. Bạn không cần đặt thủ công nữa.
 3. Bấm vào icon extension để mở popup.
 4. Chỉnh tuỳ chọn nếu cần:
    - **Tối đa số bài mới**: dừng khi đã lấy đủ số này.

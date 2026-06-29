@@ -609,6 +609,65 @@
     };
   }
 
+  // ---- Lớp dự phòng: bấm UI chọn "Bài viết mới" -------------------------
+  // URL ?sorting_setting=CHRONOLOGICAL là cách CHÍNH (đặt ở background). Nhưng đôi
+  // khi FB bỏ qua tham số (đã có cookie sort, A/B layout...). Hàm này bấm trực tiếp
+  // control sắp xếp trên trang để chốt chế độ "Bài viết mới". Best-effort, bọc
+  // try/catch để không bao giờ làm hỏng phiên crawl nếu FB đổi DOM.
+  const SORT_NEWEST_LABELS = [
+    "bài viết mới", "mới nhất", "new posts", "recent posts", "most recent",
+  ];
+  const SORT_TRIGGER_LABELS = [
+    "phù hợp nhất", "hoạt động gần đây", "bài viết mới", "mới nhất",
+    "top posts", "most relevant", "recent activity", "new posts", "sắp xếp", "sort",
+  ];
+  const norm = (s) => (s || "").trim().toLowerCase();
+
+  function findClickable(labels) {
+    const nodes = document.querySelectorAll(
+      '[role="button"], [role="menuitem"], [role="menuitemradio"], [role="option"], span, div'
+    );
+    for (const el of nodes) {
+      // Chỉ xét node lá để tránh khớp container lớn bao text con.
+      if (el.querySelector && el.querySelector("*")) {
+        // vẫn cho qua nếu text ngắn (nút thật), loại container dài.
+      }
+      const t = norm(el.textContent);
+      if (!t || t.length > 40) continue;
+      if (labels.some((l) => t === l || t.startsWith(l))) {
+        const clickable = el.closest('[role="button"], [role="menuitem"], [role="menuitemradio"], [role="option"], a') || el;
+        return clickable;
+      }
+    }
+    return null;
+  }
+
+  async function ensureNewestSort() {
+    try {
+      // Nếu URL đã CHRONOLOGICAL và feed đã có bài thì coi như xong, khỏi đụng UI.
+      if (/[?&]sorting_setting=CHRONOLOGICAL/i.test(location.href)) return true;
+
+      // 1) Mở menu sắp xếp: tìm control hiển thị chế độ sort hiện tại.
+      const trigger = findClickable(SORT_TRIGGER_LABELS);
+      if (!trigger) return false;
+      trigger.click();
+      await sleep(700);
+
+      // 2) Chọn "Bài viết mới" trong menu vừa mở.
+      const option = findClickable(SORT_NEWEST_LABELS);
+      if (!option) {
+        // Đóng menu nếu lỡ mở mà không thấy lựa chọn phù hợp.
+        document.body.click();
+        return false;
+      }
+      option.click();
+      await sleep(1500); // chờ feed tải lại theo chế độ mới
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   // ---- Vòng lặp crawl chính ---------------------------------------------
 
   async function runCrawl(options) {
@@ -690,6 +749,13 @@
     };
 
     reportProgress({ status: "started" });
+
+    // Trước khi quét: đảm bảo feed đang ở chế độ "Bài viết mới" (mới->cũ).
+    // Lớp CHÍNH là URL ?sorting_setting=CHRONOLOGICAL (đặt ở background); đây là
+    // lớp DỰ PHÒNG bấm UI phòng khi FB bỏ qua tham số. Best-effort, không chặn crawl.
+    try {
+      await ensureNewestSort();
+    } catch (e) {}
 
     try {
       while (!state.stopRequested && scrolls < opts.maxScrolls && newCount < opts.maxNewPosts) {

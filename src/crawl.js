@@ -43,6 +43,25 @@ async function removeCrawlTab(tabId) {
   return false;
 }
 
+/* ----------------------- SẮP XẾP FEED "BÀI VIẾT MỚI" -------------------- */
+// Crawl tăng dần CHỈ đúng khi feed nhóm sắp theo THỜI GIAN ĐĂNG (mới->cũ).
+// Mặc định FB trả "Phù hợp nhất" (thuật toán, KHÔNG theo thời gian) => bài mới &
+// bài cũ xen kẽ nhau, khiến cơ chế "dừng sau N bài đã biết liên tiếp" dừng sớm
+// và bỏ sót bài mới. Tham số ?sorting_setting=CHRONOLOGICAL ép FB về đúng chế độ
+// "Bài viết mới". Đây là cách CHÍNH; content.js còn 1 lớp dự phòng bấm UI.
+function withNewestSort(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    u.searchParams.set("sorting_setting", "CHRONOLOGICAL");
+    u.hash = "";
+    return u.toString();
+  } catch (e) {
+    // Fallback nối chuỗi nếu URL không parse được.
+    const sep = rawUrl.includes("?") ? "&" : "?";
+    return rawUrl.split("#")[0] + sep + "sorting_setting=CHRONOLOGICAL";
+  }
+}
+
 /* ------------------------- CRAWL TAB ĐANG MỞ --------------------------- */
 
 /** Tìm tab đang active; nếu là trang nhóm FB thì gửi lệnh bắt đầu crawl tới content script. */
@@ -56,6 +75,19 @@ async function startCrawlInActiveTab(options) {
       error:
         "Tab hiện tại không phải trang nhóm Facebook. Hãy mở đúng nhóm rồi thử lại.",
     };
+  }
+
+  // Ép tab về chế độ "Bài viết mới" (CHRONOLOGICAL) nếu chưa có, để crawl tăng dần
+  // lấy đúng & đủ bài mới. Nếu phải đổi URL thì chờ trang tải lại xong rồi mới crawl.
+  if (!/[?&]sorting_setting=CHRONOLOGICAL/.test(tab.url || "")) {
+    try {
+      const sorted = withNewestSort(tab.url);
+      await chrome.tabs.update(tab.id, { url: sorted });
+      await waitTabComplete(tab.id, 30000);
+      await sleep(2500); // chờ feed render lười
+    } catch (e) {
+      // Không đổi được URL thì vẫn tiếp tục; content.js còn lớp dự phòng bấm UI.
+    }
   }
 
   // Đảm bảo content script đã sẵn sàng (phòng trường hợp trang mở trước khi cài).
@@ -100,7 +132,8 @@ async function stopCrawlInActiveTab() {
 /** Mở tab nhóm rồi khởi động crawl trong tab đó (tiến độ phát qua broadcast). */
 async function crawlGroupInTab(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
-  const url = "https://www.facebook.com/groups/" + groupId + "/";
+  // Ép feed về "Bài viết mới" (CHRONOLOGICAL) để crawl tăng dần lấy đúng & đủ bài mới.
+  const url = withNewestSort("https://www.facebook.com/groups/" + groupId + "/");
   // Mở ở chế độ NỀN để người dùng ở lại dashboard; tiến trình phát qua broadcast.
   const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
   // Ghi nhận tab này do background tự mở để CRAWL_DONE biết đường đóng lại sau khi xong.
@@ -1515,6 +1548,7 @@ async function initReplyWatch() {
 
 export {
   CRAWL_TABS_KEY,
+  withNewestSort,
   getCrawlTabs,
   addCrawlTab,
   removeCrawlTab,
