@@ -871,6 +871,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    // ---- POLL NGAY: kích hoạt pollRemoteCommands() thủ công từ dashboard ----
+    case "POLL_REMOTE_COMMANDS": {
+      (async () => {
+        await readyPromise;
+        await pollRemoteCommands();
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     // ----------------------- XÁC THỰC WEB BACKEND (JWT) ------------------
     // Đăng nhập: gọi POST /api/auth/login, lưu token vào api.js (persist storage),
     // nhớ display_name để AUTH_STATE trả lại, rồi trả về user để UI hiển thị.

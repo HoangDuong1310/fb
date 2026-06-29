@@ -172,23 +172,51 @@ export async function loadRemoteCommandsView() {
     btn.classList.toggle("active", btn.dataset.status === currentStatus);
   });
 
+  // Show which user the extension is authenticated as (diagnostic for wrong-user bug)
+  const hint = $("rcAuthHint");
+  const authRes = await bg("AUTH_STATE");
+  if (hint) {
+    hint.hidden = false;
+    if (authRes && authRes.ok && authRes.loggedIn) {
+      hint.innerHTML =
+        `<span style="color:var(--green,#4caf50)">✓ Extension đang đăng nhập: <strong>${esc(authRes.display_name || "")}</strong></span>` +
+        ` &nbsp;<button id="btnPollNow" class="btn ghost" style="font-size:12px;padding:2px 8px;">Poll ngay</button>`;
+    } else {
+      hint.innerHTML =
+        `<span style="color:var(--warn,#e57373)">✗ Extension chưa đăng nhập tài khoản web.</span>` +
+        ` &nbsp;<button id="btnPollNow" class="btn ghost" style="font-size:12px;padding:2px 8px;" disabled>Poll ngay</button>`;
+    }
+    const btnPoll = document.getElementById("btnPollNow");
+    if (btnPoll) {
+      btnPoll.onclick = async () => {
+        btnPoll.disabled = true;
+        btnPoll.textContent = "Đang poll…";
+        const r = await bg("POLL_REMOTE_COMMANDS");
+        toast(r && r.ok ? "Đã poll lệnh mới!" : "Poll thất bại: " + (r && r.error || "unknown"));
+        btnPoll.textContent = "Poll ngay";
+        btnPoll.disabled = false;
+        loadRemoteCommandsView();
+      };
+    }
+  }
+
   const res = await bg("GET_REMOTE_COMMANDS", {
     status: currentStatus || undefined,
     page: currentPage,
     limit: PAGE_SIZE,
   });
 
-  const hint = $("rcAuthHint");
   if (!res || !res.ok) {
     if (hint) {
-      hint.hidden = false;
-      hint.textContent = (res && res.error) || "Cần đăng nhập tài khoản web để xem lệnh từ server.";
+      const errSpan = document.createElement("span");
+      errSpan.style.cssText = "color:var(--warn,#e57373);margin-left:8px;";
+      errSpan.textContent = " — " + ((res && res.error) || "Lỗi tải danh sách lệnh.");
+      hint.appendChild(errSpan);
     }
     renderCommandList([]);
     return;
   }
 
-  if (hint) hint.hidden = true;
   totalCount = res.total || 0;
   renderCommandList(res.commands || []);
 }
