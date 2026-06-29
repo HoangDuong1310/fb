@@ -27,6 +27,14 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // Log chẩn đoán hiện NGAY trong Console của tab Facebook (content script chạy ở
+  // "isolated world" => console.log này thuộc về tab, không cần gõ lệnh gì).
+  // Muốn tắt: gõ ở Console của tab  ->  window.__FBC_DEBUG = false
+  if (typeof window.__FBC_DEBUG === "undefined") window.__FBC_DEBUG = true;
+  const dlog = (...args) => {
+    if (window.__FBC_DEBUG) console.log("%c[FBC]", "color:#1877f2;font-weight:bold", ...args);
+  };
+
   function send(type, payload) {
     return new Promise((resolve) => {
       try {
@@ -59,13 +67,22 @@
 
   // ---- Trích postId & permalink -----------------------------------------
 
+  // QUAN TRỌNG: Facebook hiện đại dùng token "pfbid..." (chữ + số) cho permalink
+  // bài viết trong nhóm, ví dụ /groups/123/posts/pfbid0AbC.../ — KHÔNG còn là số
+  // thuần. Regex cũ chỉ bắt (\d+) nên BỎ SÓT gần như toàn bộ bài => quét ra 0 ô.
+  // Vì vậy mỗi pattern phải chấp nhận CẢ pfbid… LẪN id số cũ.
+  const PID = "(pfbid[A-Za-z0-9]+|\\d+)";
   const POST_ID_PATTERNS = [
-    /\/groups\/[^/]+\/posts\/(\d+)/,
-    /\/groups\/[^/]+\/permalink\/(\d+)/,
-    /multi_permalinks?=(\d+)/,
-    /[?&]story_fbid=(\d+)/,
-    /\/permalink\/(\d+)/,
-    /\/posts\/(\d+)/,
+    new RegExp("/groups/[^/]+/posts/" + PID),
+    new RegExp("/groups/[^/]+/permalink/" + PID),
+    new RegExp("multi_permalinks?=" + PID),
+    new RegExp("[?&]story_fbid=" + PID),
+    // Bài có ẢNH: link ảnh lộ postId của BÀI qua "...&set=gm.{postId}"
+    // (gm = group post/story id). Đây là nguồn postId TĨNH, không cần hover —
+    // xử lý phần lớn bài rao bán (thường kèm ảnh) ngay lập tức.
+    new RegExp("[?&]set=gm\\." + PID),
+    new RegExp("/permalink/" + PID),
+    new RegExp("/posts/" + PID),
   ];
 
   function extractPostIdFromUrl(url) {
@@ -104,12 +121,63 @@
    *  vì link bình luận vẫn chứa postId của BÀI CHA). */
   function getPostIdFrom(root) {
     if (!root || !root.querySelectorAll) return null;
-    const anchors = root.querySelectorAll(
-      'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="multi_permalink"]'
-    );
+    // Quét MỌI anchor (không chỉ /posts|/permalink|story_fbid|multi_permalink):
+    // bài có ẢNH lộ postId qua link ảnh "...&set=gm.{id}". Link TÁC GIẢ
+    // (/groups/{gid}/user/{uid}) KHÔNG khớp pattern nào nên không gây nhầm; link
+    // BÌNH LUẬN (comment_id) bị loại để khỏi tưởng nhầm bình luận là bài.
+    const anchors = root.querySelectorAll("a[href]");
     for (const a of anchors) {
       const href = a.href || a.getAttribute("href") || "";
+      if (/comment_id=|reply_comment_id=/i.test(href)) continue;
       const id = extractPostIdFromUrl(href);
+      if (id) return id;
+    }
+    return null;
+  }
+
+  /** Một ô con của feed có phải BÀI VIẾT không? Bài LUÔN có link tác giả dạng
+   *  /groups/{gid}/user/{uid}/ — dùng làm dấu hiệu nhận diện kể cả khi permalink
+   *  còn bị FB ẩn (chưa hover). Nhờ vậy không bỏ sót bài chỉ-chữ. */
+  function isPostContainer(el) {
+    if (!el || !el.querySelector) return false;
+    if (getPostIdFrom(el)) return true;
+    return !!el.querySelector('a[href*="/groups/"][href*="/user/"]');
+  }
+
+  /** Bài CHỈ-CHỮ (không ảnh) không lộ set=gm nên permalink bị FB ẩn: href ở thẻ
+   *  thời gian chỉ được gắn khi hover (chống cào). Ta hover thử các ứng viên để
+   *  FB nạp href thật rồi đọc lại postId. Best-effort, có timeout ngắn. */
+  async function revealPostId(container) {
+    if (!container || !container.querySelectorAll) return null;
+    const fire = (el, type, Ctor) => {
+      try {
+        el.dispatchEvent(
+          new Ctor(type, { bubbles: true, cancelable: true, view: window })
+        );
+      } catch (e) {}
+    };
+    // Ứng viên permalink: link có fragment "#", role=link, href rỗng/"#".
+    const cands = [
+      ...container.querySelectorAll(
+        'a[href*="#"], a[role="link"], [role="link"], a[href="#"], a:not([href])'
+      ),
+    ].slice(0, 10);
+    for (const el of cands) {
+      fire(el, "pointerover", PointerEvent);
+      fire(el, "pointerenter", PointerEvent);
+      fire(el, "mouseover", MouseEvent);
+      fire(el, "mouseenter", MouseEvent);
+      fire(el, "mousemove", MouseEvent);
+      if (typeof el.focus === "function") {
+        try {
+          el.focus();
+        } catch (e) {}
+      }
+    }
+    // Chờ FB gắn href (React re-render). Thử đọc lại tối đa ~0.75s.
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      const id = getPostIdFrom(container);
       if (id) return id;
     }
     return null;
@@ -128,15 +196,34 @@
    * feed-child rồi loại vùng bình luận, thay vì duyệt [role="article"].
    */
   function findPostContainers() {
-    const feed = document.querySelector('[role="feed"]');
-    if (feed) {
-      const kids = [...feed.children].filter((c) => c && getPostIdFrom(c));
-      if (kids.length) return kids;
+    // CÓ THỂ có NHIỀU [role="feed"] trên trang (feed bài chính, sidebar nhóm,
+    // danh sách "nổi bật"...). Lấy querySelector đầu tiên dễ trúng nhầm feed phụ
+    // (sidebar/highlights) => quét ra 0 bài dù bài vẫn hiện. Vì vậy duyệt TẤT CẢ
+    // feed và chọn tập ô-bài lớn nhất tìm được. Nhận diện ô bài bằng
+    // isPostContainer (có link tác giả) THAY VÌ bắt buộc có postId: bài chỉ-chữ
+    // ẩn permalink đến khi hover, nếu đòi postId ngay sẽ bỏ sót gần hết bài.
+    const feeds = [...document.querySelectorAll('[role="feed"]')];
+    let best = [];
+    for (const feed of feeds) {
+      const kids = [...feed.children].filter((c) => isPostContainer(c));
+      if (kids.length > best.length) best = kids;
     }
+    if (best.length) return best;
     // Fallback layout cũ: một số nhóm render BÀI bằng [role="article"] cấp cao nhất.
     return [...document.querySelectorAll('[role="article"]')].filter(
-      (a) => !(a.parentElement && a.parentElement.closest('[role="article"]')) && getPostIdFrom(a)
+      (a) => !(a.parentElement && a.parentElement.closest('[role="article"]')) && isPostContainer(a)
     );
+  }
+
+  /** Tìm lại ô bài CÒN SỐNG trong DOM theo postId. Feed FB ảo hoá có thể gỡ
+   *  (unmount) node cũ giữa lúc quét và lúc bóc tách => node đã detach, thân bài
+   *  rỗng. Quét lại feed hiện tại để lấy node mới cho đúng postId. */
+  function findContainerByPostId(postId) {
+    if (!postId) return null;
+    for (const c of findPostContainers()) {
+      if (getPostIdFrom(c) === postId) return c;
+    }
+    return null;
   }
 
   // ---- Trích các trường dữ liệu -----------------------------------------
@@ -554,6 +641,12 @@
   async function extractPost(article, groupInfo, selectors) {
     const postId = getPostIdFrom(article);
     if (!postId) return null;
+    // Node có thể đã bị feed ảo hoá gỡ khỏi DOM giữa lúc quét và lúc bóc tách.
+    // Nếu vậy, tìm lại node còn sống theo postId để không bóc tách trên DOM chết.
+    if (!article.isConnected) {
+      const live = findContainerByPostId(postId);
+      if (live) article = live;
+    }
     const permalink = buildPermalink(groupInfo.groupId, postId);
 
     // QUAN TRỌNG: feed Facebook render lười. Bài ngoài tầm nhìn chỉ có phần
@@ -693,21 +786,23 @@
       const factor = rand(0.7, 1.6);            // 70%..160% so với base
       return Math.round(base * factor);
     };
-    // Cuộn từng đoạn như người thật thay vì nhảy thẳng xuống đáy.
+    // Cuộn TỪNG ĐOẠN NHỎ (KHÔNG nhảy xuống đáy). Feed Facebook ảo hoá: nhảy thẳng
+    // xuống document.body.scrollHeight sẽ gỡ (unmount) hàng loạt bài chưa kịp quét,
+    // nên mỗi nhịp chỉ tiến dưới 1 màn hình rồi để vòng lặp quét lại phần vừa hiện.
     const humanScroll = async () => {
+      const vh = window.innerHeight || 800;
       if (!opts.safeMode) {
-        window.scrollTo(0, document.body.scrollHeight);
+        // Chế độ nhanh: vẫn cuộn từng đoạn (~0.9 màn hình), tuyệt đối không nhảy đáy.
+        window.scrollBy(0, Math.round(vh * 0.9));
         return;
       }
-      const steps = Math.floor(rand(2, 5));     // 2..4 nhịp cuộn nhỏ
+      const steps = Math.floor(rand(1, 3));     // 1..2 nhịp cuộn nhỏ
       for (let i = 0; i < steps; i++) {
         if (state.stopRequested) break;
-        const dy = Math.round(rand(0.5, 0.9) * window.innerHeight);
+        const dy = Math.round(rand(0.45, 0.75) * vh); // tổng < 1 màn hình
         window.scrollBy(0, dy);
         await sleep(Math.round(rand(180, 520)));
       }
-      // Đảm bảo chạm đáy để trigger tải thêm.
-      window.scrollTo(0, document.body.scrollHeight);
     };
     // Thỉnh thoảng "nghỉ" lâu hơn như người dùng dừng đọc.
     let nextRestAt = Math.floor(rand(6, 11));   // sau 6..10 lần cuộn sẽ nghỉ
@@ -726,6 +821,7 @@
     let consecutiveKnown = 0;
     let consecutiveOld = 0; // số bài cũ hơn "fromTs" gặp liên tiếp (feed mới->cũ)
     let scrolls = 0;
+    let idleScrolls = 0;    // số nhịp cuộn liên tiếp không có bài mới & trang không cao thêm
     let batch = [];
 
     const flush = async () => {
@@ -736,16 +832,22 @@
     };
 
     const reportProgress = (extra = {}) => {
-      send("CRAWL_PROGRESS", {
-        progress: {
-          groupId: groupInfo.groupId,
-          groupName: groupInfo.groupName,
-          newCount,
-          scrolls,
-          knownHits: consecutiveKnown,
-          ...extra,
-        },
-      });
+      const progress = {
+        groupId: groupInfo.groupId,
+        groupName: groupInfo.groupName,
+        newCount,
+        scrolls,
+        seen: seenThisRun.size, // tổng bài đã quét (chẩn đoán: so với newCount để thấy tỉ lệ)
+        knownHits: consecutiveKnown,
+        ...extra,
+      };
+      // Log thẳng ra Console của tab Facebook để dễ theo dõi (không cần mở background).
+      dlog(
+        `${progress.status || "tick"} | mới=${newCount} đã-quét=${seenThisRun.size}` +
+          ` cuộn=${scrolls} known-liên-tiếp=${consecutiveKnown}` +
+          (extra.lastAuthor ? ` | ${extra.lastAuthor}` : "")
+      );
+      send("CRAWL_PROGRESS", { progress });
     };
 
     reportProgress({ status: "started" });
@@ -759,13 +861,34 @@
 
     try {
       while (!state.stopRequested && scrolls < opts.maxScrolls && newCount < opts.maxNewPosts) {
+        const seenBefore = seenThisRun.size;
         const containers = findPostContainers();
+        // Chẩn đoán nhẹ: nếu KHÔNG thấy ô bài nào, in nhanh trạng thái DOM để biết
+        // vì sao (tab nền không render? feed chưa tải?). visibilityState quan trọng:
+        // tab ẩn => Facebook ảo hoá không mount bài => quét ra 0.
+        if (!containers.length) {
+          const feeds = [...document.querySelectorAll('[role="feed"]')];
+          const arts = document.querySelectorAll('[role="article"]');
+          let feed = null;
+          for (const f of feeds) {
+            if (!feed || f.children.length > feed.children.length) feed = f;
+          }
+          dlog(
+            `quét nhịp #${scrolls}: thấy 0 ô bài | visibility=${document.visibilityState}` +
+              ` feeds=${feeds.length} feedChildren=${feed ? feed.children.length : 0}` +
+              ` articles=${arts.length} bodyH=${document.body.scrollHeight}`
+          );
+        } else {
+          dlog(`quét nhịp #${scrolls}: thấy ${containers.length} ô bài trong feed`);
+        }
 
         for (const article of containers) {
           if (state.stopRequested || newCount >= opts.maxNewPosts) break;
 
-          // Lấy nhanh postId để quyết định trước khi bóc tách nặng.
-          const postId = getPostIdFrom(article);
+          // Lấy nhanh postId để quyết định trước khi bóc tách nặng. Bài chỉ-chữ
+          // ẩn permalink đến khi hover => nếu chưa có thì hover để FB nạp href.
+          let postId = getPostIdFrom(article);
+          if (!postId) postId = await revealPostId(article);
           if (!postId) continue;
           if (seenThisRun.has(postId)) continue;
           seenThisRun.add(postId);
@@ -818,7 +941,11 @@
 
         await flush();
 
-        // Cuộn để tải thêm bài — mô phỏng thao tác người dùng khi bật safeMode.
+        // Nhịp này có quét được postId MỚI nào không (kể cả bài đã biết/cũ)?
+        // Dùng để phân biệt "đang còn bài chưa quét" với "đã thật sự hết feed".
+        const grewNew = seenThisRun.size > seenBefore;
+
+        // Cuộn từng đoạn để tải thêm bài (humanScroll KHÔNG nhảy xuống đáy nữa).
         const beforeH = document.body.scrollHeight;
         await humanScroll();
         scrolls += 1;
@@ -831,14 +958,22 @@
           nextRestAt = scrolls + Math.floor(rand(6, 11)); // hẹn lần nghỉ kế tiếp
         }
 
-        // Nếu trang không cao thêm sau vài lần => có thể đã hết feed.
+        // Phát hiện hết feed một cách an toàn: CHỈ coi là hết khi ĐỒNG THỜI
+        // (1) không có bài mới nào xuất hiện, (2) trang không cao thêm, và
+        // (3) đã cuộn sát đáy — và phải lặp lại vài nhịp liên tiếp để loại trừ
+        // trường hợp Facebook tải chậm. Nhờ vậy không dừng sớm khi giữa feed.
         const afterH = document.body.scrollHeight;
-        if (afterH <= beforeH) {
+        const grewH = afterH > beforeH;
+        const nearBottom = window.innerHeight + window.scrollY >= afterH - 600;
+        if (!grewNew && !grewH && nearBottom) {
+          idleScrolls += 1;
           await sleep(jitterDelay(opts.scrollDelay)); // chờ thêm 1 nhịp phòng tải chậm
-          if (document.body.scrollHeight <= beforeH) {
-            // Hết bài để tải.
-            if (scrolls > 2) break;
+          if (document.body.scrollHeight <= beforeH && scrolls > 2 && idleScrolls >= 3) {
+            dlog("Đã chạm đáy feed thật sự (3 nhịp liên tiếp không có gì mới) -> dừng.");
+            break; // thực sự hết bài để tải
           }
+        } else {
+          idleScrolls = 0; // còn bài mới hoặc trang còn cao thêm => tiếp tục cuộn
         }
       }
 
@@ -849,6 +984,7 @@
         ? "Đã đạt giới hạn số bài mới."
         : "Đã cuộn hết feed khả dụng.";
 
+      dlog(`HOÀN TẤT: ${reason} | tổng bài mới lưu=${newCount}, tổng đã quét=${seenThisRun.size}, số nhịp cuộn=${scrolls}`);
       reportProgress({ status: "done" });
       send("CRAWL_DONE", { result: { newCount, reason } });
       state.running = false;

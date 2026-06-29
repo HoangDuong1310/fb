@@ -581,8 +581,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const myComment = String(msg.myComment || "").trim();
         if (!url) return sendResponse({ ok: false, error: "Thiếu link bài viết." });
         // Suy ra postId / groupId / commentId từ URL (best-effort).
+        // postId hiện đại có thể là token "pfbid..." (chữ+số), không chỉ số thuần.
+        const PID = "(pfbid[A-Za-z0-9]+|\\d+)";
         const postId =
-          (url.match(/\/posts\/(\d+)/) || url.match(/[?&](?:story_fbid|fbid|multi_permalinks)=(\d+)/) || [])[1] || "";
+          (url.match(new RegExp("/posts/" + PID)) ||
+            url.match(new RegExp("[?&](?:story_fbid|fbid|multi_permalinks)=" + PID)) ||
+            [])[1] || "";
         const groupId = (url.match(/\/groups\/(\d+)/) || [])[1] || "";
         const commentId = (url.match(/[?&]comment_id=(\d+)/) || [])[1] || "";
         // Cần MỘT trong hai để định vị bình luận của ta: hoặc comment_id trích

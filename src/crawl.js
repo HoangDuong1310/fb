@@ -435,13 +435,16 @@ async function runPostInPage(text, images) {
   const findPostUrl = () => {
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
     const needle = norm(text).slice(0, 60);
+    // Facebook hiện đại dùng token "pfbid..." (chữ + số) cho permalink bài viết,
+    // không còn là số thuần. Mỗi pattern phải chấp nhận CẢ pfbid… LẪN id số cũ.
+    const PID = "(pfbid[A-Za-z0-9]+|\\d+)";
     const PATTERNS = [
-      /\/groups\/[^/]+\/posts\/(\d+)/,
-      /\/groups\/[^/]+\/permalink\/(\d+)/,
-      /multi_permalinks?=(\d+)/,
-      /[?&]story_fbid=(\d+)/,
-      /\/permalink\/(\d+)/,
-      /\/posts\/(\d+)/,
+      new RegExp("/groups/[^/]+/posts/" + PID),
+      new RegExp("/groups/[^/]+/permalink/" + PID),
+      new RegExp("multi_permalinks?=" + PID),
+      new RegExp("[?&]story_fbid=" + PID),
+      new RegExp("/permalink/" + PID),
+      new RegExp("/posts/" + PID),
     ];
     const hasId = (href) => PATTERNS.some((re) => re.test(href || ""));
     const permaOf = (root) => {
