@@ -467,7 +467,7 @@ textarea { resize: vertical; line-height: 1.55; }
 .pc-links { display: flex; flex-direction: column; gap: 3px; margin-top: 10px; }
 .pc-links a { font-size: 11.5px; color: var(--accent-ink); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pc-links a:hover { text-decoration: underline; }
-.pc-foot { display: flex; align-items: center; gap: 11px; margin-top: 13px; padding-top: 11px; border-top: 1px solid var(--line-soft); }
+.pc-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 13px; padding-top: 11px; border-top: 1px solid var(--line-soft); }
 .pc-metric { font-size: 12px; color: var(--ink-soft); display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); }
 .pc-metric svg { width: 14px; height: 14px; fill: var(--ink-faint); }
 .pc-foot .btn.sm { padding: 4px 9px; }
@@ -850,8 +850,10 @@ textarea { resize: vertical; line-height: 1.55; }
 .pc-cmt-hist .pc-cmt-empty { font-size: 12px; color: var(--ink-soft); }
 .pc-cmt-row { display: flex; flex-direction: column; gap: 2px; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
 .pc-cmt-row:last-child { border-bottom: none; }
-.pc-cmt-row .pc-cmt-meta { color: var(--ink-soft); font-size: 11px; }
-.pc-cmt-row .pc-cmt-content { color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.pc-cmt-row .pc-cmt-meta,
+.pc-cmt-row .pc-cmt-time { color: var(--ink-soft); font-size: 11px; }
+.pc-cmt-row .pc-cmt-content,
+.pc-cmt-row .pc-cmt-text { color: var(--ink); white-space: pre-wrap; word-break: break-word; }
 .pc-cmt-row .pc-cmt-shared { display: inline-block; margin-left: 6px; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 99px; background: var(--blue-soft); color: var(--blue); }
 
 /* Modal gợi ý từ khoá */

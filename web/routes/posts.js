@@ -94,10 +94,17 @@ router.get("/known-ids", requireAuth, async (req, res) => {
 /* ── GET /api/posts ───────────────────────────────────────────────────────── */
 router.get("/", requireAuth, async (req, res) => {
   const { groupId } = req.query;
+  // mine=1 → only the caller's own crawled posts (ignore shared rows)
+  const mineOnly = String(req.query.mine || "") === "1";
   try {
-    let sql = `SELECT * FROM posts
-               WHERE (crawled_by_user_id = ? OR share_crawled = 1)`;
+    let sql;
     const params = [req.userId];
+    if (mineOnly) {
+      sql = `SELECT * FROM posts WHERE crawled_by_user_id = ?`;
+    } else {
+      sql = `SELECT * FROM posts
+             WHERE (crawled_by_user_id = ? OR share_crawled = 1)`;
+    }
     if (groupId) {
       sql += " AND group_id = ?";
       params.push(groupId);
@@ -137,6 +144,32 @@ router.get("/stats", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("[posts/stats]", err);
+    return res.status(500).json({ error: "Lỗi server." });
+  }
+});
+
+/* ── GET /api/posts/:id/comments ──────────────────────────────────────────── */
+router.get("/:id/comments", requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT id, post_id, user_id, content, commented_at, share_commented
+         FROM comments
+        WHERE post_id = ? AND (user_id = ? OR share_commented = 1)
+        ORDER BY commented_at ASC`,
+      [req.params.id, req.userId]
+    );
+    return res.json({
+      comments: rows.map((r) => ({
+        id: r.id,
+        postId: r.post_id,
+        userId: r.user_id,
+        content: r.content,
+        commentedAt: r.commented_at,
+        shareCommented: !!r.share_commented,
+      })),
+    });
+  } catch (err) {
+    console.error("[posts/comments]", err);
     return res.status(500).json({ error: "Lỗi server." });
   }
 });
@@ -222,7 +255,7 @@ function mapPost(r) {
     images: parseJson(r.images, []),
     timestamp: r.timestamp != null ? Number(r.timestamp) : null,
     permalink: r.permalink,
-    crawledByUserId: r.crawled_by_user_id,
+    crawledBy: r.crawled_by_user_id,
     crawledAt: r.crawled_at,
     updatedAt: r.updated_at,
     shareCrawled: !!r.share_crawled,
