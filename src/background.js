@@ -43,6 +43,7 @@ import {
   startCrawlInActiveTab,
   stopCrawlInActiveTab,
   crawlGroupInTab,
+  crawlGroupApiInTab,
   scanJoinedGroups,
   removeCrawlTab,
   runJob,
@@ -249,6 +250,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case "CRAWL_GROUP": {
       crawlGroupInTab(msg.groupId, msg.options || {})
+        .then((r) => sendResponse(r))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "CRAWL_GROUP_API": {
+      // Crawl QUA API nội bộ FB (sniff + replay). Mở tab nền, gửi START_API_CRAWL.
+      crawlGroupApiInTab(msg.groupId, msg.options || {})
         .then((r) => sendResponse(r))
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;

@@ -1081,6 +1081,296 @@
     }
   }
 
+  // =======================================================================
+  // CHẾ ĐỘ DÒ API (GraphQL nội bộ FB) — phối hợp với fb-api-hook.js (MAIN
+  // world). content.js (isolated world) giữ logic dedup + lưu + replay phân
+  // trang. Ưu điểm so với cuộn DOM: request mạng KHÔNG bị "ảo hoá theo tầm
+  // nhìn" => lấy đủ bài kể cả khi tab nền, và có thể replay nhanh nhiều trang.
+  // =======================================================================
+
+  // Bộ nhớ phiên dò API.
+  const apiSniff = {
+    // Mẫu request feed nhóm GẦN NHẤT bắt được (để replay phân trang).
+    // { url, raw, friendly, fb_dtsg, doc_id, lsd, variables }
+    template: null,
+    // Chunks JSON của response feed nhóm gần nhất (dùng cho TRANG 1 + CAPTURE).
+    lastChunks: [],
+    // Số gói GraphQL feed nhóm đã thấy (chẩn đoán).
+    feedCount: 0,
+    // Cờ đang chạy crawl API.
+    apiRunning: false,
+    // Map id -> callback chờ kết quả replay.
+    replayWaiters: new Map(),
+  };
+
+  // Import động gql-parse.js (web_accessible_resources). Cache lại sau lần đầu.
+  let _gqlMod = null;
+  async function loadGqlModule() {
+    if (_gqlMod) return _gqlMod;
+    const url = chrome.runtime.getURL("src/gql-parse.js");
+    _gqlMod = await import(url);
+    return _gqlMod;
+  }
+
+  // Nhờ MAIN world fetch hộ (để dùng đúng credential/header của trang), chờ
+  // kết quả theo id. fb-api-hook.js trả __FBC_GQL_REPLAY_RES.
+  function replayViaPage({ url, body, friendly }, timeoutMs = 20000) {
+    return new Promise((resolve) => {
+      const id = "rp_" + Date.now() + "_" + Math.random().toString(36).slice(2);
+      const timer = setTimeout(() => {
+        apiSniff.replayWaiters.delete(id);
+        resolve({ ok: false, error: "replay timeout" });
+      }, timeoutMs);
+      apiSniff.replayWaiters.set(id, (res) => {
+        clearTimeout(timer);
+        resolve(res);
+      });
+      window.postMessage({ __FBC_GQL_REPLAY: 1, id, url, body, friendly }, "*");
+    });
+  }
+
+  // Dựng body replay: GIỮ NGUYÊN body gốc (mọi field FB cần), chỉ thay
+  // 'variables' bằng bản đã gắn cursor. Bền hơn việc tự dựng lại từ đầu.
+  function buildReplayBody(tpl, vars) {
+    const p = new URLSearchParams(tpl.raw || "");
+    p.set("variables", JSON.stringify(vars));
+    return p.toString();
+  }
+
+  // Gắn cursor phân trang vào variables. Feed nhóm thường dùng 'cursor'; vài
+  // query dùng 'after'. Đặt cả hai nếu có để chắc ăn.
+  function setCursorInVariables(vars, cursor) {
+    if (!vars || cursor == null) return;
+    if ("after" in vars) vars.after = cursor;
+    // 'cursor' là tên phổ biến nhất của feed nhóm => luôn đặt.
+    vars.cursor = cursor;
+  }
+
+  // Lắng nghe message từ MAIN world hook.
+  // LƯU: KHÔNG check `ev.source !== window` — vì MAIN world và isolated world
+  // có 2 đối tượng `window` khác nhau. Khi MAIN world postMessage, ev.source
+  // là page window còn `window` ở đây là isolated window => check đó LUÔN
+  // đúng => listener return sớm => MẤT HẾT message từ hook. Chỉ cần check
+  // ev.data có đúng "dấu hiệu" (__FBC_GQL / __FBC_GQL_REPLAY_RES) là đủ.
+  window.addEventListener("message", async (ev) => {
+    const d = ev.data;
+    if (!d || typeof d !== "object") return;
+
+    // (1) Gói GraphQL bắt thụ động từ trang.
+    if (d.__FBC_GQL === 1) {
+      try {
+        const mod = await loadGqlModule();
+        const req = mod.parseGqlRequestBody(d.reqBody);
+        if (mod.isGroupFeedRequest(req.friendly, req.variables)) {
+          apiSniff.feedCount += 1;
+          // Chỉ giữ mẫu MỚI NHẤT (fb_dtsg/cursor xoay vòng theo thời gian).
+          apiSniff.template = {
+            url: d.url,
+            raw: req.raw,
+            friendly: req.friendly,
+            fb_dtsg: req.fb_dtsg,
+            doc_id: req.doc_id,
+            lsd: req.lsd,
+            variables: req.variables,
+          };
+          apiSniff.lastChunks = Array.isArray(d.chunks) ? d.chunks : [];
+          dlog(
+            `[API] bắt feed nhóm #${apiSniff.feedCount}` +
+              ` | friendly=${req.friendly} doc_id=${req.doc_id}`
+          );
+        }
+      } catch (e) {}
+      return;
+    }
+
+    // (2) Kết quả replay trả về từ MAIN world.
+    if (d.__FBC_GQL_REPLAY_RES === 1) {
+      const cb = apiSniff.replayWaiters.get(d.id);
+      if (cb) {
+        apiSniff.replayWaiters.delete(d.id);
+        cb({ ok: !!d.ok, chunks: d.chunks || [], error: d.error });
+      }
+      return;
+    }
+  });
+
+  // Chạy crawl qua API: TRANG 1 dùng chunks đã sniff, các trang sau replay
+  // bằng end_cursor cho tới khi đủ maxNewPosts hoặc hết trang.
+  async function runApiCrawl(options) {
+    if (apiSniff.apiRunning) return { ok: false, error: "Đang chạy API crawl rồi." };
+    apiSniff.apiRunning = true;
+    state.stopRequested = false;
+
+    const opts = {
+      maxNewPosts: options.maxNewPosts || 100, // dừng khi đủ N bài mới
+      maxPages: options.maxPages || 60,        // chặn vô hạn
+      pageDelay: options.pageDelay || 800,     // ms nghỉ giữa các trang replay
+      ...options,
+    };
+
+    const groupInfo = getGroupInfo();
+    const origin = location.origin;
+
+    const apiReport = (extra = {}) => {
+      const progress = {
+        groupId: groupInfo.groupId,
+        groupName: groupInfo.groupName,
+        mode: "api",
+        ...extra,
+      };
+      dlog(
+        `[API] ${progress.status || "tick"}` +
+          ` | mới=${progress.newCount ?? "?"} trang=${progress.pages ?? "?"}`
+      );
+      send("CRAWL_PROGRESS", { progress });
+    };
+
+    try {
+      const mod = await loadGqlModule();
+
+      // Lấy ID đã biết để lọc trùng (giống DOM crawl => lưu cùng pipeline).
+      const knownRes = await send("GET_KNOWN_IDS", { groupId: groupInfo.groupId });
+      const known = new Set((knownRes && knownRes.ok && knownRes.ids) || []);
+
+      apiReport({ status: "started", newCount: 0, pages: 0 });
+
+      // Cần mẫu request đã sniff để replay. Nếu chưa có, chờ FB tự bắn feed request.
+      // FB thường mất 3-8s sau khi load trang nhóm mới gọi feed request đầu tiên
+      // (đặc biệt với nhóm lớn hoặc mạng chậm). Ta chờ tối đa ~15s, mỗi 1.5s
+      // cuộn nhẹ 1 lần để kích hoạt lazy load. Nếu vẫn không có thì thử click
+      // nút "Mới nhất" để ép FB gọi lại feed request. Cuối cùng mới báo lỗi.
+      const TEMPLATE_WAIT_MS = 15000;
+      const TEMPLATE_POLL_MS = 1500;
+      const tplStart = Date.now();
+      let tplScrolls = 0;
+      let tplTriedSort = false;
+      while (
+        (!apiSniff.template || !apiSniff.template.doc_id) &&
+        Date.now() - tplStart < TEMPLATE_WAIT_MS
+      ) {
+        if (tplScrolls < 6) {
+          window.scrollBy(0, Math.round((window.innerHeight || 800) * 0.6));
+          tplScrolls += 1;
+        }
+        // Sau ~6s không có template, thử click "Mới nhất" để ép FB gọi feed request.
+        if (
+          !tplTriedSort &&
+          Date.now() - tplStart > 6000 &&
+          typeof ensureNewestSort === "function"
+        ) {
+          tplTriedSort = true;
+          try {
+            await ensureNewestSort();
+          } catch (_) {}
+        }
+        await sleep(TEMPLATE_POLL_MS);
+      }
+      if (!apiSniff.template || !apiSniff.template.doc_id) {
+        apiSniff.apiRunning = false;
+        apiReport({
+          status: "error",
+          error:
+            "Chưa bắt được request feed nhóm sau " +
+            Math.round(TEMPLATE_WAIT_MS / 1000) +
+            "s. Hãy cuộn feed 1-2 nhịp rồi chạy lại.",
+        });
+        send("CRAWL_DONE", {
+          result: { newCount: 0, reason: "Chưa có mẫu request API." },
+        });
+        return { ok: false, error: "no template" };
+      }
+
+      const seenThisRun = new Set();
+      let newCount = 0;
+      let pages = 0;
+      let batch = [];
+
+      const flush = async () => {
+        if (batch.length === 0) return;
+        const toSave = batch;
+        batch = [];
+        await send("SAVE_POSTS", { posts: toSave });
+      };
+
+      // Bóc bài từ 1 mảng chunk -> dedup (trong phiên + với DB) -> xếp vào batch.
+      // Trả pageInfo để biết cursor trang kế.
+      const ingestChunks = (chunks) => {
+        const { posts, pageInfo } = mod.extractPostsFromChunks(chunks, {
+          groupId: groupInfo.groupId,
+          groupName: groupInfo.groupName,
+          origin,
+        });
+        for (const p of posts) {
+          if (seenThisRun.has(p.postId)) continue;
+          seenThisRun.add(p.postId);
+          if (known.has(p.postId)) continue; // đã có trong DB => bỏ
+          batch.push(p);
+          newCount += 1;
+        }
+        return pageInfo;
+      };
+
+      // TRANG 1: dùng luôn chunks bắt được gần nhất (khỏi gọi lại mạng).
+      let cursor = null;
+      if (apiSniff.lastChunks && apiSniff.lastChunks.length) {
+        const pi = ingestChunks(apiSniff.lastChunks);
+        cursor = pi.endCursor;
+        pages += 1;
+        await flush();
+        apiReport({ status: "page", newCount, pages, hasNext: pi.hasNext });
+      }
+
+      // CÁC TRANG SAU: replay với cursor tăng dần.
+      const tpl = apiSniff.template;
+      while (
+        !state.stopRequested &&
+        newCount < opts.maxNewPosts &&
+        pages < opts.maxPages
+      ) {
+        if (!cursor) {
+          dlog("[API] không có cursor cho trang kế => dừng.");
+          break;
+        }
+        const vars = JSON.parse(JSON.stringify(tpl.variables || {}));
+        setCursorInVariables(vars, cursor);
+        const body = buildReplayBody(tpl, vars);
+
+        const res = await replayViaPage({ url: tpl.url, body, friendly: tpl.friendly });
+        if (!res.ok) {
+          dlog("[API] replay lỗi:", res.error);
+          break;
+        }
+        const pi = ingestChunks(res.chunks);
+        pages += 1;
+        await flush();
+        apiReport({ status: "page", newCount, pages, hasNext: pi.hasNext });
+
+        if (!pi.hasNext || !pi.endCursor || pi.endCursor === cursor) {
+          dlog("[API] hết trang (không còn cursor mới).");
+          break;
+        }
+        cursor = pi.endCursor;
+        await sleep(opts.pageDelay);
+      }
+
+      await flush();
+      const reason = state.stopRequested
+        ? "Đã dừng theo yêu cầu."
+        : newCount >= opts.maxNewPosts
+        ? "Đã đạt giới hạn số bài mới."
+        : "Đã hết trang feed (API).";
+      dlog(`[API] HOÀN TẤT: ${reason} | mới-lưu=${newCount} trang=${pages}`);
+      apiReport({ status: "done", newCount, pages });
+      send("CRAWL_DONE", { result: { newCount, reason } });
+      apiSniff.apiRunning = false;
+      return { ok: true, newCount, reason };
+    } catch (err) {
+      apiSniff.apiRunning = false;
+      send("CRAWL_DONE", { result: { newCount: 0, reason: "Lỗi API: " + String(err) } });
+      return { ok: false, error: String(err) };
+    }
+  }
+
   // ---- Lắng nghe lệnh từ background/popup --------------------------------
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -1090,6 +1380,36 @@
       // Trả lời ngay rằng đã nhận; tiến độ gửi qua CRAWL_PROGRESS.
       runCrawl(msg.options || {});
       sendResponse({ ok: true, started: true });
+      return false;
+    }
+
+    if (msg.type === "START_API_CRAWL") {
+      // Quét qua API nội bộ của FB (sniff + replay). Tiến độ gửi qua CRAWL_PROGRESS.
+      runApiCrawl(msg.options || {});
+      sendResponse({ ok: true, started: true, mode: "api" });
+      return false;
+    }
+
+    if (msg.type === "CAPTURE_GQL") {
+      // Probe xác minh runtime: in ra shape thật của response feed FB đã bắt được.
+      const t = apiSniff.template;
+      const sample = apiSniff.lastChunks && apiSniff.lastChunks.length ? apiSniff.lastChunks[0] : null;
+      console.log("[FBC][CAPTURE_GQL]", {
+        feedCount: apiSniff.feedCount,
+        hasTemplate: !!(t && t.doc_id),
+        friendly: t ? t.friendly : null,
+        doc_id: t ? t.doc_id : null,
+        hasFbDtsg: !!(t && t.fb_dtsg),
+        variables: t ? t.variables : null,
+        sampleChunk: sample,
+      });
+      sendResponse({
+        ok: true,
+        feedCount: apiSniff.feedCount,
+        hasTemplate: !!(t && t.doc_id),
+        friendly: t ? t.friendly : null,
+        chunkCount: apiSniff.lastChunks ? apiSniff.lastChunks.length : 0,
+      });
       return false;
     }
 

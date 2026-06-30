@@ -30,6 +30,8 @@ import {
   scanGroups,
   addGroupManual,
   crawlGroup,
+  crawlGroupApi,
+  testApiAuto,
   setCrawlStatus,
   saveAutoCrawl,
   loadAutoCrawl,
@@ -154,6 +156,8 @@ function bindEvents() {
   // Nhóm
   $("btnScanGroups").addEventListener("click", scanGroups);
   $("btnAddGroup").addEventListener("click", addGroupManual);
+  if ($("btnTestApiAuto"))
+    $("btnTestApiAuto").addEventListener("click", testApiAuto);
   $("groupSearch").addEventListener("input", renderGroups);
   // Cấu hình crawl: tự lưu mỗi khi thay đổi (giữ nguyên sau F5)
   CRAWL_FIELDS.forEach((id) => {
@@ -661,6 +665,29 @@ chrome.runtime.onMessage.addListener((msg) => {
     }
     setCrawlStatus(`Xong: +${msg.result.newCount} bài mới. ${msg.result.reason || ""}`, false);
     toast(`Crawl xong: +${msg.result.newCount} bài. ${msg.result.reason || ""}`, "ok", 4500);
+    // Nếu testApiAuto() đang chờ, tự chuyển sang view "posts" và lọc theo
+    // groupId đã đánh dấu để người dùng thấy ngay các bài vừa lấy được.
+    const pendingGroupId = store.pendingPostsView;
+    if (pendingGroupId) {
+      store.pendingPostsView = null;
+      const sel = $("postsGroupFilter");
+      if (sel) {
+        // Đảm bảo option cho groupId này tồn tại (kể cả khi chưa có trong store.groups).
+        let opt = Array.from(sel.options).find((o) => o.value === pendingGroupId);
+        if (!opt) {
+          opt = document.createElement("option");
+          opt.value = pendingGroupId;
+          opt.textContent = pendingGroupId + " (test)";
+          sel.appendChild(opt);
+        }
+        sel.value = pendingGroupId;
+      }
+      loadGroups().then(() => {
+        switchView("posts");
+        toast(`Đã mở view Bài viết, lọc theo nhóm test ${pendingGroupId}.`, "info", 3500);
+      });
+      return;
+    }
     loadGroups().then(() => {
       const active = document.querySelector(".nav-item.active");
       if (active && ["posts", "overview", "groups"].includes(active.dataset.view)) {

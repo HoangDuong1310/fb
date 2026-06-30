@@ -269,6 +269,46 @@ export async function crawlGroup(groupId) {
   }
 }
 
+/**
+ * Crawl QUA API nội bộ FB (sniff + replay). Mở tab nền, gửi START_API_CRAWL.
+ * Tiến trình phát qua broadcast CRAWL_PROGRESS / CRAWL_DONE.
+ */
+export async function crawlGroupApi(groupId) {
+  const g = store.groups.find((x) => x.groupId === groupId);
+  const name = (g && (g.groupName || g.groupId)) || groupId;
+  setCrawlStatus(`[API] Đang mở nhóm "${name}" ở tab nền và khởi động crawl API...`, true);
+  toast("Đã bắt đầu crawl API ở tab nền. Theo dõi tiến trình ngay tại đây.", "info", 3000);
+  const res = await bg("CRAWL_GROUP_API", { groupId, options: crawlOpts() });
+  if (!res || !res.ok) {
+    setCrawlStatus((res && res.error) || "Không bắt đầu được crawl API.", false);
+    toast((res && res.error) || "Không bắt đầu được crawl API.", "err", 5000);
+  }
+}
+
+/**
+ * Test tự động hoàn toàn: mở nhóm 95043770832783 ở tab nền, bắt API, parse, lưu.
+ * Người dùng chỉ cần bấm 1 nút — mọi thứ còn lại tự chạy.
+ */
+export async function testApiAuto() {
+  const TEST_GROUP_ID = "381914474762181";
+  // Đánh dấu: khi CRAWL_DONE về, dashboard sẽ tự chuyển sang view "posts"
+  // và lọc theo groupId này để người dùng thấy ngay các bài vừa lấy được.
+  store.pendingPostsView = TEST_GROUP_ID;
+  setCrawlStatus(`[API TEST] Đang tự động mở nhóm ${TEST_GROUP_ID} ở tab nền...`, true);
+  toast("Đang chạy test API tự động. Mọi thứ sẽ tự chạy — bạn không cần làm gì thêm.", "info", 4000);
+  const res = await bg("CRAWL_GROUP_API", {
+    groupId: TEST_GROUP_ID,
+    options: { ...crawlOpts(), maxNewPosts: 30, stopAfterKnown: 3 },
+  });
+  if (!res || !res.ok) {
+    setCrawlStatus((res && res.error) || "Không bắt đầu được test API.", false);
+    toast((res && res.error) || "Không bắt đầu được test API.", "err", 5000);
+    store.pendingPostsView = null;
+  } else {
+    setCrawlStatus(`[API TEST] Đã mở tab #${res.tabId}. Đang bắt API và parse...`, true);
+  }
+}
+
 /* ===================== TỰ ĐỘNG CRAWL NỀN THEO CHU KỲ ===================== */
 export function saveAutoCrawl() {
   const enabled = !!($("autoCrawlEnabled") && $("autoCrawlEnabled").checked);

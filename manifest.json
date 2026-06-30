@@ -31,8 +31,26 @@
         "https://www.facebook.com/groups/*",
         "https://web.facebook.com/groups/*"
       ],
+      "js": ["src/fb-api-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.facebook.com/groups/*",
+        "https://web.facebook.com/groups/*"
+      ],
       "js": ["src/content.js"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/gql-parse.js"],
+      "matches": [
+        "https://www.facebook.com/*",
+        "https://web.facebook.com/*"
+      ]
     }
   ]
 }

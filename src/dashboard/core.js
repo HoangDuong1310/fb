@@ -100,6 +100,10 @@ export const store = {
   jobs: [],
   selected: new Set(), // groupId đang được chọn để crawl hàng loạt
   batch: null, // { queue:[groupId], index, total, stop } khi đang crawl hàng loạt
+  // Khi testApiAuto() chạy, đặt groupId vào đây. Khi CRAWL_DONE về, dashboard
+  // sẽ tự chuyển sang view "posts" và lọc theo groupId này để người dùng thấy
+  // ngay các bài vừa lấy được (không cần tự bấm chuyển trang).
+  pendingPostsView: null,
 };
 
 // Map sourceId -> toast handle "dính" đang theo dõi tiến trình đồng bộ.

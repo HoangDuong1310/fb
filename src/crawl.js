@@ -162,6 +162,44 @@ async function crawlGroupInTab(groupId, options) {
   }
 }
 
+/* ----------------------- CRAWL QUA API (GraphQL nội bộ FB) ---------------- */
+
+/**
+ * Mở tab nhóm rồi khởi động crawl QUA API (sniff + replay) trong tab đó.
+ * Khác crawlGroupInTab ở chỗ gửi START_API_CRAWL thay vì START_CRAWL.
+ * Tiến trình phát qua broadcast CRAWL_PROGRESS / CRAWL_DONE.
+ */
+async function crawlGroupApiInTab(groupId, options) {
+  if (!groupId) return { ok: false, error: "Thiếu groupId." };
+  // Ép feed về "Bài viết mới" (CHRONOLOGICAL) để replay phân trang lấy đúng thứ tự.
+  const url = withNewestSort("https://www.facebook.com/groups/" + groupId + "/");
+  // Mở ở chế độ NỀN để người dùng ở lại dashboard; tiến trình phát qua broadcast.
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  // Ghi nhận tab này do background tự mở để CRAWL_DONE biết đường đóng lại sau khi xong.
+  await addCrawlTab(tab.id);
+  await waitTabComplete(tab.id, 30000);
+  await sleep(2500); // chờ feed render lười
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ["src/content.js"],
+    });
+  } catch (e) {}
+  try {
+    const res = await chrome.tabs.sendMessage(tab.id, {
+      type: "START_API_CRAWL",
+      options: options || {},
+    });
+    return { ok: true, tabId: tab.id, started: !!(res && res.ok), mode: "api" };
+  } catch (e) {
+    return {
+      ok: false,
+      tabId: tab.id,
+      error: "Không gửi được lệnh crawl API tới tab nhóm: " + String(e),
+    };
+  }
+}
+
 /* ----------------------- QUÉT NHÓM ĐÃ THAM GIA -------------------------- */
 
 /** Hàm tự-chứa chạy trong trang "Nhóm của bạn" để thu thập (groupId, groupName). */
@@ -1559,6 +1597,7 @@ export {
   startCrawlInActiveTab,
   stopCrawlInActiveTab,
   crawlGroupInTab,
+  crawlGroupApiInTab,
   scanJoinedGroups,
   runJob,
   executeDeletePost,
