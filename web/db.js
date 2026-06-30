@@ -55,6 +55,8 @@ export async function runMigrations() {
       \`text\`            MEDIUMTEXT,
       images              JSON,
       \`timestamp\`       BIGINT       DEFAULT NULL,
+      reactions           BIGINT       DEFAULT NULL,
+      comments            BIGINT       DEFAULT NULL,
       permalink           VARCHAR(512) NOT NULL DEFAULT '',
       crawled_by_user_id  INT UNSIGNED DEFAULT NULL,
       crawled_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -203,5 +205,39 @@ export async function runMigrations() {
   for (const sql of stmts) {
     await pool.execute(sql);
   }
+
+  // Auto-migrate existing tables: thêm cột mới vào bảng đã tồn tại trên DB cũ.
+  await ensureColumns(pool, "posts", [
+    { name: "reactions", ddl: "reactions BIGINT DEFAULT NULL" },
+    { name: "comments", ddl: "comments BIGINT DEFAULT NULL" },
+  ]);
+
   console.log("[db] migrations complete");
+}
+
+/**
+ * Idempotent ALTER TABLE ... ADD COLUMN cho các cột còn thiếu.
+ * Dùng cho DB đã tồn tại từ trước (runMigrations chỉ CREATE TABLE IF NOT EXISTS,
+ * không tự thêm cột mới vào bảng cũ).
+ *
+ * @param {import("mysql2/promise").Pool} pool
+ * @param {string} table
+ * @param {{ name: string, ddl: string }[]} columns
+ */
+async function ensureColumns(pool, table, columns) {
+  const [rows] = await pool.query(
+    `SELECT COLUMN_NAME AS name FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+    [table]
+  );
+  const have = new Set(rows.map((r) => String(r.name).toLowerCase()));
+  for (const col of columns) {
+    if (have.has(col.name.toLowerCase())) continue;
+    try {
+      await pool.query(`ALTER TABLE \`${table}\` ADD COLUMN ${col.ddl}`);
+    } catch (e) {
+      // ER_DUP_FIELDNAME (cột đã tồn tại do chạy song song) -> bỏ qua an toàn.
+      if (e && e.code !== "ER_DUP_FIELDNAME") throw e;
+    }
+  }
 }

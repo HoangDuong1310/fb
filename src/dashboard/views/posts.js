@@ -104,11 +104,22 @@ export function renderPosts() {
   const all = store.posts;
   // Sắp xếp bài viết từ mới nhất đến cũ nhất theo thời gian đăng gốc (timestamp từ API).
   // Bài thiếu timestamp rơi về crawledAt; bài thiếu cả 2 rơi về 0 (cuối danh sách).
-  const sorted = all.slice().sort((a, b) => {
-    const ta = a.timestamp || a.crawledAt || 0;
-    const tb = b.timestamp || b.crawledAt || 0;
-    return tb - ta;
-  });
+  // Lưu ý: timestamp là số (epoch giây/ms), còn crawledAt từ backend là chuỗi DATETIME
+  // ("YYYY-MM-DD HH:MM:SS"). Phải ép cả hai về số (ms) trước khi trừ, nếu không
+  // phép trừ chuỗi sẽ ra NaN khiến thứ tự sắp xếp sai.
+  const sortKey = (p) => {
+    if (p.timestamp != null && p.timestamp !== "") {
+      const n = Number(p.timestamp);
+      // timestamp dạng giây (10 chữ số) → đổi sang ms để so cùng đơn vị với Date.
+      if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n;
+    }
+    if (p.crawledAt) {
+      const t = new Date(p.crawledAt).getTime();
+      if (Number.isFinite(t)) return t;
+    }
+    return 0;
+  };
+  const sorted = all.slice().sort((a, b) => sortKey(b) - sortKey(a));
   const list = sorted.filter((p) => {
     // Lọc thông minh theo phân loại nhu cầu (chạy trên máy, không gọi AI).
     if (mode !== "all") {

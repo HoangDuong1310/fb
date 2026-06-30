@@ -670,19 +670,23 @@ chrome.runtime.onMessage.addListener((msg) => {
     const pendingGroupId = store.pendingPostsView;
     if (pendingGroupId) {
       store.pendingPostsView = null;
-      const sel = $("postsGroupFilter");
-      if (sel) {
-        // Đảm bảo option cho groupId này tồn tại (kể cả khi chưa có trong store.groups).
-        let opt = Array.from(sel.options).find((o) => o.value === pendingGroupId);
-        if (!opt) {
-          opt = document.createElement("option");
-          opt.value = pendingGroupId;
-          opt.textContent = pendingGroupId + " (test)";
-          sel.appendChild(opt);
-        }
-        sel.value = pendingGroupId;
-      }
+      // QUAN TRỌNG: nạp lại nhóm TRƯỚC, vì loadGroups()->fillGroupSelects()
+      // dựng lại innerHTML của #postsGroupFilter (xoá mọi option + value đã set).
+      // Sau khi select đã được dựng lại mới gán value, rồi mới switchView để
+      // loadPosts() đọc đúng groupId vừa crawl (nếu set trước sẽ bị xoá mất).
       loadGroups().then(() => {
+        const sel = $("postsGroupFilter");
+        if (sel) {
+          // Đảm bảo option cho groupId này tồn tại (kể cả khi chưa có trong store.groups).
+          let opt = Array.from(sel.options).find((o) => o.value === pendingGroupId);
+          if (!opt) {
+            opt = document.createElement("option");
+            opt.value = pendingGroupId;
+            opt.textContent = pendingGroupId + " (test)";
+            sel.appendChild(opt);
+          }
+          sel.value = pendingGroupId;
+        }
         switchView("posts");
         toast(`Đã mở view Bài viết, lọc theo nhóm test ${pendingGroupId}.`, "info", 3500);
       });

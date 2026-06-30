@@ -40,8 +40,9 @@ router.post("/", requireAuth, async (req, res) => {
     const [result] = await pool.execute(
       `INSERT INTO posts
          (post_id, group_id, group_name, author_name, author_profile, \`text\`,
-          images, \`timestamp\`, permalink, crawled_by_user_id, share_crawled)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          images, \`timestamp\`, permalink, reactions, comments,
+          crawled_by_user_id, share_crawled)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          group_name         = VALUES(group_name),
          author_name        = VALUES(author_name),
@@ -50,6 +51,8 @@ router.post("/", requireAuth, async (req, res) => {
          images             = VALUES(images),
          \`timestamp\`      = VALUES(\`timestamp\`),
          permalink          = VALUES(permalink),
+         reactions          = VALUES(reactions),
+         comments           = VALUES(comments),
          updated_at         = CURRENT_TIMESTAMP`,
       [
         String(p.postId),
@@ -61,6 +64,8 @@ router.post("/", requireAuth, async (req, res) => {
         images,
         p.timestamp != null ? Number(p.timestamp) : null,
         String(p.permalink || ""),
+        p.reactions != null ? Number(p.reactions) : null,
+        p.comments != null ? Number(p.comments) : null,
         req.userId,
         shareCrawled,
       ]
@@ -255,6 +260,8 @@ function mapPost(r) {
     images: parseJson(r.images, []),
     timestamp: r.timestamp != null ? Number(r.timestamp) : null,
     permalink: r.permalink,
+    reactions: r.reactions != null ? Number(r.reactions) : null,
+    comments: r.comments != null ? Number(r.comments) : null,
     crawledBy: r.crawled_by_user_id,
     crawledAt: r.crawled_at,
     updatedAt: r.updated_at,

@@ -294,6 +294,19 @@ function extractReactionsFromNode(node) {
 
 /** Số bình luận. */
 function extractCommentsFromNode(node) {
+  // 1) Field phổ biến nhất trong feedback object thực tế của FB:
+  //    total_comment_count là MỘT number nằm ngay cạnh reaction_count.
+  //    (Đây là lý do reactions chạy đúng còn comments luôn = 0: trước đây
+  //     ta chỉ tìm comment_count.total_count vốn KHÔNG tồn tại trong response thật.)
+  const direct = deepFind(
+    node,
+    (v, k) =>
+      (k === "total_comment_count" || k === "comment_count_reduced") &&
+      typeof v === "number"
+  );
+  if (typeof direct === "number") return direct;
+
+  // 2) Object comment_count / i18n_comment_count với total_count | count.
   const c = deepFind(
     node,
     (v, k) =>
@@ -302,8 +315,32 @@ function extractCommentsFromNode(node) {
       typeof v === "object" &&
       (typeof v.total_count === "number" || typeof v.count === "number")
   );
-  if (!c) return 0;
-  return typeof c.total_count === "number" ? c.total_count : typeof c.count === "number" ? c.count : 0;
+  if (c) {
+    return typeof c.total_count === "number"
+      ? c.total_count
+      : typeof c.count === "number"
+      ? c.count
+      : 0;
+  }
+
+  // 3) comment_rendering_instance...comments.{total_count|count}
+  const inst = deepFind(
+    node,
+    (v, k) =>
+      k === "comments" &&
+      v &&
+      typeof v === "object" &&
+      (typeof v.total_count === "number" || typeof v.count === "number")
+  );
+  if (inst) {
+    return typeof inst.total_count === "number"
+      ? inst.total_count
+      : typeof inst.count === "number"
+      ? inst.count
+      : 0;
+  }
+
+  return 0;
 }
 
 /** Thời điểm đăng (creation_time / publish_time -> ms). GIÁ TRỊ number qua KEY. */

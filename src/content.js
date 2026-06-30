@@ -1300,6 +1300,15 @@
           groupName: groupInfo.groupName,
           origin,
         });
+        // Log mẫu bài đầu tiên mỗi trang để kiểm tra API thực tế có trả reactions/comments/timestamp không.
+        if (posts.length > 0) {
+          const s = posts[0];
+          dlog(
+            `[API] sample post: reactions=${s.reactions} comments=${s.comments}` +
+            ` ts=${s.timestamp} timeText=${s.timeText}` +
+            ` postId=${s.postId} text="${(s.text || "").slice(0, 50)}"`
+          );
+        }
         for (const p of posts) {
           if (seenThisRun.has(p.postId)) continue;
           seenThisRun.add(p.postId);

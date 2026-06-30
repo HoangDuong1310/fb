@@ -315,6 +315,43 @@ test("mapEdgeToPost: trả null khi không đủ định danh (không text, khô
   assert.equal(post, null);
 });
 
+// REGRESSION: response THẬT của FB để số comment ở key `total_comment_count`
+// (một number nằm cạnh reaction_count), KHÔNG phải comment_count.total_count.
+// Trước khi fix, parser luôn trả comments=0 cho dữ liệu thật.
+test("mapEdgeToPost: đọc comment qua total_comment_count (cấu trúc FB thật)", () => {
+  const node = {
+    __typename: "Story",
+    post_id: "pfbidREAL1",
+    comet_sections: {
+      content: {
+        story: {
+          comet_sections: {
+            message: { story: { message: { text: "Bán iPhone 13 còn bảo hành" } } },
+          },
+        },
+      },
+      feedback: {
+        story: {
+          feedback_context: {
+            feedback_target_with_context: {
+              comet_ufi_summary_and_actions_renderer: {
+                feedback: {
+                  reaction_count: { count: 7 },
+                  total_comment_count: 23,
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+  const post = mapEdgeToPost(node, { groupId: GROUP_ID, origin: ORIGIN });
+  assert.ok(post, "phải trả về post");
+  assert.equal(post.reactions, 7);
+  assert.equal(post.comments, 23, "comments phải đọc từ total_comment_count");
+});
+
 /* --------------------------- extractPostsFromChunks ---------------------- */
 
 test("extractPostsFromChunks: gộp nhiều chunk + dedup + pageInfo", () => {
