@@ -102,7 +102,14 @@ export function renderPosts() {
   }
   const mode = store.postsLeadMode || "all";
   const all = store.posts;
-  const list = all.filter((p) => {
+  // Sắp xếp bài viết từ mới nhất đến cũ nhất theo thời gian đăng gốc (timestamp từ API).
+  // Bài thiếu timestamp rơi về crawledAt; bài thiếu cả 2 rơi về 0 (cuối danh sách).
+  const sorted = all.slice().sort((a, b) => {
+    const ta = a.timestamp || a.crawledAt || 0;
+    const tb = b.timestamp || b.crawledAt || 0;
+    return tb - ta;
+  });
+  const list = sorted.filter((p) => {
     // Lọc thông minh theo phân loại nhu cầu (chạy trên máy, không gọi AI).
     if (mode !== "all") {
       const lead = classifyLead(p.text || "");
