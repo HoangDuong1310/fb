@@ -3,7 +3,7 @@
   "name": "FB Group New Posts Crawler",
   "version": "1.0.0",
   "description": "Crawl chỉ các bài viết MỚI từ nhóm Facebook đã tham gia và lưu dữ liệu đầy đủ (IndexedDB + xuất JSON/CSV).",
-  "permissions": ["storage", "tabs", "scripting", "activeTab", "alarms"],
+  "permissions": ["storage", "tabs", "scripting", "activeTab", "alarms", "declarativeNetRequestWithHostAccess"],
   "host_permissions": [
     "http://14.225.206.162:3000/*",
     "http://localhost:3300/*",

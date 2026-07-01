@@ -4,8 +4,15 @@
  * đồng bộ giá (autoSync). Tách từ background.js (B3 — chia module theo domain).
  */
 import * as DB from "./db.js";
-import { getActiveTab, waitTabComplete, sleep, broadcast } from "./util.js";
+import {
+  getActiveTab,
+  waitTabComplete,
+  sleep,
+  broadcast,
+  fetchWithTimeout,
+} from "./util.js";
 import { syncAllSources } from "./prices.js";
+import { extractPostsFromChunks } from "./gql-parse.js";
 
 /* ------------------------- QUẢN LÝ TAB CRAWL --------------------------- */
 // Lưu danh sách tab do background tự mở vào chrome.storage.session để sống sót khi
@@ -165,6 +172,94 @@ async function crawlGroupInTab(groupId, options) {
 /* ----------------------- CRAWL QUA API (GraphQL nội bộ FB) ---------------- */
 
 /**
+ * Mở 1 TAB trong CỬA SỔ HIỆN TẠI của trình duyệt để BẮT KHUÔN GQL LẦN ĐẦU.
+ * KHÔNG dùng cho mọi lần crawl — chỉ gọi khi storage CHƯA có khuôn (xem
+ * crawlGroupApiSmart). Sau khi bắt được khuôn, mọi nhóm khác crawl qua
+ * crawlGroupApiTabless (KHÔNG mở tab, KHÔNG đụng tab/cửa sổ của người dùng).
+ *
+ * Có CHỐNG LỖI:
+ *  - LUÔN kiểm tra chrome.runtime.lastError: khi tạo thất bại, callback có thể
+ *    trả về undefined => phải bắt để không "nuốt" lỗi.
+ *  - Có retry ngắn phòng khi tạo tab trượt.
+ *
+ * QUAN TRỌNG — TAB PHẢI ACTIVE + CỬA SỔ PHẢI FOCUSED:
+ *  Gốc rễ đã xác nhận qua nhiều lần probe: tab/cửa sổ KHÔNG được foreground thì
+ *  Chrome throttle requestAnimationFrame / IntersectionObserver-batching — đúng
+ *  cơ chế mà Facebook Comet dùng để lazy-load feed khi cuộn. Hậu quả: seen đứng
+ *  yên, scrollH thấp, KHÔNG có GroupsCometFeedRegularStoriesPaginationQuery.
+ *  Vì vậy tab crawl phải là tab ACTIVE của một cửa sổ ĐANG FOCUS.
+ *
+ *  Đánh đổi (user đã đồng ý, chỉ xảy ra 1 LẦN cho tới khi khuôn hết hạn/bị FB
+ *  đổi doc_id): tab crawl nhấp lên foreground vài giây để bắt khuôn. KHÔNG ép
+ *  `state` cửa sổ (không resize/un-maximize cửa sổ của người dùng).
+ *
+ * Trả về { tab, windowId, kind:"tab" } khi thành công, hoặc { error } khi thất bại.
+ */
+async function openHiddenCrawlTab(url) {
+  // Tìm cửa sổ trình duyệt "normal" đang/được focus gần nhất để đặt tab crawl
+  // vào đó (thay vì bung một popup mới). Nếu không có, chrome.tabs.create sẽ tự
+  // dùng cửa sổ hiện tại (hoặc tạo mới) — vẫn chấp nhận được.
+  const getFocusedNormalWindow = () =>
+    new Promise((resolve) => {
+      try {
+        chrome.windows.getLastFocused({ windowTypes: ["normal"] }, (win) => {
+          void chrome.runtime.lastError;
+          resolve(win && win.id ? win : null);
+        });
+      } catch (_) {
+        resolve(null);
+      }
+    });
+
+  const createTab = (opts) =>
+    new Promise((resolve) => {
+      try {
+        chrome.tabs.create(opts, (tab) => {
+          const err = chrome.runtime.lastError;
+          if (err || !tab) return resolve({ tab: null, err: err && err.message });
+          resolve({ tab, err: null });
+        });
+      } catch (e) {
+        resolve({ tab: null, err: String(e) });
+      }
+    });
+
+  // Ép focus ở cấp OS để tab không bị coi là background (KHÔNG kèm `state` —
+  // tránh resize/un-maximize cửa sổ hiện tại của người dùng).
+  const focusWindow = (windowId) =>
+    new Promise((resolve) => {
+      try {
+        chrome.windows.update(windowId, { focused: true }, () => {
+          void chrome.runtime.lastError;
+          resolve();
+        });
+      } catch (_) {
+        resolve();
+      }
+    });
+
+  const target = await getFocusedNormalWindow();
+  // active:true => tab thành tab foreground của cửa sổ => không bị throttle.
+  const tabOpts = { url, active: true };
+  if (target && target.id) tabOpts.windowId = target.id;
+
+  let lastErr = "";
+  for (let round = 0; round < 2; round++) {
+    const { tab, err } = await createTab(tabOpts);
+    if (err) lastErr = err;
+    if (tab) {
+      await focusWindow(tab.windowId);
+      return { tab, windowId: tab.windowId, kind: "tab" };
+    }
+    await sleep(400); // nghỉ ngắn rồi thử lại
+  }
+  return {
+    error:
+      "Không mở được tab để crawl API." + (lastErr ? " (" + lastErr + ")" : ""),
+  };
+}
+
+/**
  * Mở tab nhóm rồi khởi động crawl QUA API (sniff + replay) trong tab đó.
  * Khác crawlGroupInTab ở chỗ gửi START_API_CRAWL thay vì START_CRAWL.
  * Tiến trình phát qua broadcast CRAWL_PROGRESS / CRAWL_DONE.
@@ -173,9 +268,20 @@ async function crawlGroupApiInTab(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
   // Ép feed về "Bài viết mới" (CHRONOLOGICAL) để replay phân trang lấy đúng thứ tự.
   const url = withNewestSort("https://www.facebook.com/groups/" + groupId + "/");
-  // Mở ở chế độ NỀN để người dùng ở lại dashboard; tiến trình phát qua broadcast.
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  // Mở 1 TAB ACTIVE trong cửa sổ hiện tại (không popup riêng). Tab foreground =>
+  // Chrome không throttle rAF/IntersectionObserver => FB lazy-load feed bình thường.
+  // IP/fingerprint THẬT của trình duyệt user => giảm rủi ro checkpoint.
+  // Vì crawl API chạy TUẦN TỰ nên chỉ 1 tab active tại một thời điểm.
+  const opened = await openHiddenCrawlTab(url);
+  const tab = opened && opened.tab;
+  if (!tab) {
+    return {
+      ok: false,
+      error: (opened && opened.error) || "Không mở được cửa sổ ẩn để crawl API.",
+    };
+  }
   // Ghi nhận tab này do background tự mở để CRAWL_DONE biết đường đóng lại sau khi xong.
+  // (Đóng tab cuối của popup => Chrome tự đóng luôn cửa sổ ẩn.)
   await addCrawlTab(tab.id);
   await waitTabComplete(tab.id, 30000);
   await sleep(2500); // chờ feed render lười
@@ -197,6 +303,327 @@ async function crawlGroupApiInTab(groupId, options) {
       tabId: tab.id,
       error: "Không gửi được lệnh crawl API tới tab nhóm: " + String(e),
     };
+  }
+}
+
+/**
+ * BỘ ĐỊNH TUYẾN crawl API — quyết định mở tab hay chạy ẩn:
+ *  - ĐÃ CÓ khuôn GQL trong storage => crawlGroupApiTabless: KHÔNG mở tab, KHÔNG
+ *    đụng tới tab/cửa sổ của người dùng (không resize, không nhảy tab). Khuôn
+ *    dùng chung cho MỌI nhóm nên chỉ cần bắt 1 lần.
+ *  - CHƯA CÓ khuôn => phải mở 1 tab foreground 1 LẦN (crawlGroupApiInTab) để FB
+ *    bắn feed query mà hook bắt lấy khuôn (content.js tự lưu vào storage). Các
+ *    lần crawl sau sẽ tự động chuyển sang nhánh tabless ở trên.
+ *
+ * Nhờ vậy, trải nghiệm mặc định là "cào ngầm" — người dùng không bị giật tab
+ * hay đổi kích thước cửa sổ ở mỗi lần crawl.
+ */
+async function crawlGroupApiSmart(groupId, options) {
+  if (!groupId) return { ok: false, error: "Thiếu groupId." };
+  const tpl = await getStoredGqlTemplate();
+  if (tpl && tpl.doc_id) {
+    // Đường ẩn hoàn toàn: replay khuôn qua backend relay, không mở tab.
+    return crawlGroupApiTabless(groupId, options);
+  }
+  // Chưa có khuôn: mở tab 1 lần để bắt khuôn (đồng thời cũng cào luôn nhóm này).
+  return crawlGroupApiInTab(groupId, options);
+}
+
+/* ----------------------- CRAWL KHÔNG-TAB (Mức B) ------------------------- */
+
+/** Đọc khuôn GQL đã được content.js lưu vào chrome.storage.local. */
+function getStoredGqlTemplate() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get("fbcGqlTemplate", (o) =>
+        resolve((o && o.fbcGqlTemplate) || null)
+      );
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+/** Tách response GraphQL thành các chunk JSON (port từ fb-api-hook.js). */
+function splitGqlChunks(text) {
+  const out = [];
+  if (!text) return out;
+  for (const line of String(text).split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      out.push(JSON.parse(t));
+    } catch (e) {}
+  }
+  if (out.length === 0) {
+    try {
+      out.push(JSON.parse(text));
+    } catch (e) {}
+  }
+  return out;
+}
+
+/** Trích fb_dtsg + lsd mới từ HTML nhóm để làm tươi token. */
+function extractTokensFromHtml(html) {
+  const out = { fb_dtsg: "", lsd: "" };
+  if (!html) return out;
+  const dtsg =
+    html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/) ||
+    html.match(/name="fb_dtsg"\s+value="([^"]+)"/) ||
+    html.match(/"dtsg":\{"token":"([^"]+)"/);
+  if (dtsg) out.fb_dtsg = dtsg[1];
+  const lsd =
+    html.match(/"LSD",\[\],\{"token":"([^"]+)"/) ||
+    html.match(/"lsd":\{"token":"([^"]+)"/);
+  if (lsd) out.lsd = lsd[1];
+  return out;
+}
+
+/** Đặt cursor vào variables (giống content.js setCursorInVariables). */
+function setCursorInVars(vars, cursor) {
+  if (!vars || cursor == null) return;
+  if ("after" in vars) vars.after = cursor;
+  vars.cursor = cursor;
+}
+
+// ID cố định cho session-rule DNR chèn header khi crawl API không-tab.
+const FB_GQL_RULE_ID = 8577;
+
+/**
+ * Bật session-rule DNR chèn các header BỊ CẤM (Origin/Referer/sec-fetch-*) mà
+ * service worker MV3 không thể tự đặt qua fetch. Chỉ nhắm request nền của chính
+ * extension (tabIds:[-1] = request không gắn tab) tới /api/graphql/ nên KHÔNG
+ * đụng tới traffic người dùng tự lướt Facebook. Nhờ vậy request cào đi THẲNG từ
+ * máy người dùng (đúng IP, đúng cookie phiên) — không cần relay qua server, loại
+ * bỏ rủi ro checkpoint do IP datacenter + không đẩy cookie ra ngoài.
+ */
+async function ensureFbGqlHeaderRule(referer) {
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [FB_GQL_RULE_ID],
+      addRules: [
+        {
+          id: FB_GQL_RULE_ID,
+          priority: 1,
+          action: {
+            type: "modifyHeaders",
+            requestHeaders: [
+              { header: "origin", operation: "set", value: "https://www.facebook.com" },
+              { header: "referer", operation: "set", value: referer || "https://www.facebook.com/" },
+              { header: "sec-fetch-site", operation: "set", value: "same-origin" },
+              { header: "sec-fetch-mode", operation: "set", value: "cors" },
+              { header: "sec-fetch-dest", operation: "set", value: "empty" },
+            ],
+          },
+          condition: {
+            urlFilter: "||facebook.com/api/graphql/",
+            resourceTypes: ["xmlhttprequest"],
+            // -1 = request không gắn tab (tức fetch từ service worker của extension).
+            tabIds: [-1],
+          },
+        },
+      ],
+    });
+  } catch (e) {
+    try {
+      console.warn("[FBC][DNR] ensureFbGqlHeaderRule lỗi:", String(e));
+    } catch (_) {}
+  }
+}
+
+/** Gỡ session-rule DNR sau khi crawl xong (dọn dẹp, tránh sót rule). */
+async function removeFbGqlHeaderRule() {
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [FB_GQL_RULE_ID],
+    });
+  } catch (_) {}
+}
+
+/**
+ * Cào nhóm KHÔNG mở tab — chạy thẳng trong background service worker.
+ * Lấy khuôn request (doc_id/friendly/raw/variables) mà content.js đã lưu vào
+ * chrome.storage.local khi sniff feed của 1 nhóm bất kỳ, rồi POST /api/graphql/
+ * trực tiếp (cookie tự đính theo host_permissions) như các dịch vụ ngoài.
+ * Token fb_dtsg/lsd được làm mới từ HTML nhóm. groupId đích được nhét vào
+ * variables.id (1 khuôn dùng chung cho MỌI nhóm).
+ */
+async function crawlGroupApiTabless(groupId, options) {
+  if (!groupId) return { ok: false, error: "Thiếu groupId." };
+  const opts = {
+    maxNewPosts: (options && options.maxNewPosts) || 100,
+    maxPages: (options && options.maxPages) || 60,
+    pageDelay: (options && options.pageDelay) || 800,
+    ...(options || {}),
+  };
+
+  const tpl = await getStoredGqlTemplate();
+  if (!tpl || !tpl.doc_id) {
+    const msg =
+      "Chưa có mẫu request feed nhóm. Hãy mở 1 nhóm FB và cuộn feed 1-2 nhịp" +
+      " (để bắt khuôn request), rồi chạy lại crawl không-tab.";
+    broadcast("CRAWL_DONE", { result: { newCount: 0, reason: msg } });
+    return { ok: false, error: "no template" };
+  }
+
+  const groupUrl = "https://www.facebook.com/groups/" + groupId + "/";
+  const apiReport = (extra = {}) =>
+    broadcast("CRAWL_PROGRESS", { progress: { groupId, mode: "api", ...extra } });
+
+  try {
+    // Làm mới token từ HTML nhóm (cookie phiên tự đính theo host_permissions).
+    let fb_dtsg = tpl.fb_dtsg || "";
+    let lsd = tpl.lsd || "";
+    try {
+      const htmlRes = await fetchWithTimeout(
+        withNewestSort(groupUrl),
+        { credentials: "include" },
+        25000
+      );
+      const tok = extractTokensFromHtml(await htmlRes.text());
+      if (tok.fb_dtsg) fb_dtsg = tok.fb_dtsg;
+      if (tok.lsd) lsd = tok.lsd;
+    } catch (e) {}
+
+    const known = new Set(await DB.getKnownIds(groupId));
+    apiReport({ status: "started", newCount: 0, pages: 0 });
+
+    const seenThisRun = new Set();
+    let newCount = 0;
+    let pages = 0;
+    let batch = [];
+    const flush = async () => {
+      if (batch.length === 0) return;
+      const toSave = batch;
+      batch = [];
+      await DB.savePosts(toSave);
+    };
+    const ingestChunks = (chunks) => {
+      const { posts, pageInfo } = extractPostsFromChunks(chunks, {
+        groupId,
+        groupName: "",
+        origin: "https://www.facebook.com",
+      });
+      for (const p of posts) {
+        if (seenThisRun.has(p.postId)) continue;
+        seenThisRun.add(p.postId);
+        if (known.has(p.postId)) continue;
+        batch.push(p);
+        newCount += 1;
+      }
+      return pageInfo;
+    };
+
+    const buildBody = (cursor) => {
+      const vars = JSON.parse(JSON.stringify(tpl.variables || {}));
+      vars.id = groupId; // nhét groupId đích vào khuôn dùng chung
+      if (cursor) {
+        setCursorInVars(vars, cursor);
+      } else {
+        // Trang 1: bỏ cursor/after còn sót từ khuôn nhóm khác.
+        delete vars.cursor;
+        if ("after" in vars) vars.after = null;
+      }
+      const p = new URLSearchParams(tpl.raw || "");
+      if (fb_dtsg) p.set("fb_dtsg", fb_dtsg);
+      if (lsd) p.set("lsd", lsd);
+      p.set("variables", JSON.stringify(vars));
+      return p.toString();
+    };
+
+    const friendly =
+      tpl.friendly || "GroupsCometFeedRegularStoriesPaginationQuery";
+    // Chẩn đoán phản hồi /api/graphql/ trang gần nhất (để soi vì sao +0 bài).
+    let lastDiag = null;
+
+    // Bật rule DNR chèn header bị cấm (Origin/Referer/sec-fetch-*) cho ĐÚNG
+    // request nền tới /api/graphql/. Request đi THẲNG từ máy bạn (cookie tự đính
+    // theo host_permissions) nên KHÔNG lộ cookie ra server, KHÔNG dùng IP
+    // datacenter => không dính rủi ro checkpoint của kiểu relay.
+    await ensureFbGqlHeaderRule(withNewestSort(groupUrl));
+
+    const fetchPage = async (cursor) => {
+      // x-fb-* là header tuỳ biến — fetch tự đặt được. Origin/Referer/sec-fetch-*
+      // do DNR chèn hộ (service worker bị cấm tự đặt). credentials:"include" để
+      // cookie phiên facebook.com tự đính (đúng phiên, đúng IP của người dùng).
+      const headers = {
+        "content-type": "application/x-www-form-urlencoded",
+        "x-fb-friendly-name": friendly,
+      };
+      if (lsd) headers["x-fb-lsd"] = lsd;
+      if (tpl.doc_id) headers["x-fb-doc-id"] = tpl.doc_id;
+      const res = await fetchWithTimeout(
+        "https://www.facebook.com/api/graphql/",
+        {
+          method: "POST",
+          credentials: "include",
+          headers,
+          body: buildBody(cursor),
+        },
+        25000
+      );
+      const txt = await res.text();
+      const chunks = splitGqlChunks(txt);
+      lastDiag = {
+        status: res.status,
+        len: txt.length,
+        chunks: chunks.length,
+        sample: String(txt).slice(0, 300).replace(/\s+/g, " "),
+        friendly,
+        doc_id: tpl.doc_id,
+        hadLsd: !!lsd,
+        hadDtsg: !!fb_dtsg,
+      };
+      try {
+        console.log("[FBC][API-DIRECT] /api/graphql/ resp:", lastDiag);
+      } catch (_) {}
+      return chunks;
+    };
+
+    // Trang 1 (không cursor).
+    let cursor = null;
+    {
+      const pi = ingestChunks(await fetchPage(null));
+      cursor = pi.endCursor;
+      pages += 1;
+      await flush();
+      apiReport({ status: "page", newCount, pages, hasNext: pi.hasNext });
+      if (!pi.hasNext || !pi.endCursor) cursor = null;
+    }
+
+    while (cursor && newCount < opts.maxNewPosts && pages < opts.maxPages) {
+      await sleep(opts.pageDelay);
+      const pi = ingestChunks(await fetchPage(cursor));
+      pages += 1;
+      await flush();
+      apiReport({ status: "page", newCount, pages, hasNext: pi.hasNext });
+      if (!pi.hasNext || !pi.endCursor || pi.endCursor === cursor) break;
+      cursor = pi.endCursor;
+    }
+
+    await flush();
+    let reason =
+      newCount >= opts.maxNewPosts
+        ? "Đã đạt giới hạn số bài mới."
+        : "Đã hết trang feed (API không-tab).";
+    // Khi +0 bài, đính chẩn đoán phản hồi để soi lý do ngay trên UI (khỏi mở devtools).
+    if (newCount === 0 && lastDiag) {
+      reason +=
+        ` [chẩn đoán: HTTP ${lastDiag.status}, dài ${lastDiag.len}B, ` +
+        `${lastDiag.chunks} mảnh, lsd=${lastDiag.hadLsd ? 1 : 0}, ` +
+        `dtsg=${lastDiag.hadDtsg ? 1 : 0} · ${lastDiag.sample}]`;
+    }
+    apiReport({ status: "done", newCount, pages });
+    broadcast("CRAWL_DONE", { result: { newCount, reason, diag: lastDiag } });
+    return { ok: true, newCount, reason, mode: "api-tabless", diag: lastDiag };
+  } catch (err) {
+    broadcast("CRAWL_DONE", {
+      result: { newCount: 0, reason: "Lỗi API không-tab: " + String(err) },
+    });
+    return { ok: false, error: String(err) };
+  } finally {
+    // Luôn gỡ rule DNR sau khi crawl xong (kể cả khi lỗi) để không sót rule.
+    await removeFbGqlHeaderRule();
   }
 }
 
@@ -1286,12 +1713,16 @@ async function processAutoCrawl() {
       (g) => g && (g.groupId || g.id)
     );
     const opts = cfg.options || {};
-    // Crawl TUẦN TỰ 1 nhóm/lần (không song song). Facebook ảo hoá feed và CHỈ mount
-    // bài khi tab đang hiển thị; nhiều tab nền cùng lúc bị Chrome bóp ga/đóng băng nên
-    // mỗi tab chỉ mount 1–2 bài -> crawl thiếu. Đã XÁC MINH: 1 nhóm đủ, nhiều nhóm thiếu.
-    // Chỉ một tab được foreground tại một thời điểm nên song song là bất khả thi với
-    // feed ảo hoá -> ép 1 luồng để mỗi nhóm lấy đủ bài (đánh đổi: chậm hơn nhưng đúng).
+    const isApi = opts.method === "api";
+    // QUAN TRỌNG về số luồng — CẢ DOM lẫn API đều phải crawl TUẦN TỰ 1 nhóm/lần:
+    // - DOM scroll: Facebook ảo hoá feed, chỉ mount bài khi tab đang hiển thị.
+    // - API (sniff+replay GraphQL): pha CAPTURE template CẦN tab foreground để FB
+    //   bắn GroupsCometFeedRegularStoriesPaginationQuery. Focus là tài nguyên
+    //   SINGLETON => nhiều tab foreground song song sẽ cướp focus của nhau, chỉ
+    //   nhóm được focus cuối cùng bắt được template. Đã XÁC MINH: 1 nhóm chạy tốt,
+    //   2+ nhóm cùng lúc chỉ ăn 1 nhóm. Vì vậy ÉP 1 LUỒNG cho cả API.
     const threads = 1;
+    const crawlFn = isApi ? crawlGroupApiSmart : crawlGroupInTab;
 
     let cursor = 0; // chỉ số nhóm kế tiếp cần xử lý (dùng chung giữa các worker)
 
@@ -1304,7 +1735,7 @@ async function processAutoCrawl() {
         const gid = g && (g.groupId || g.id);
         if (!gid) continue;
         try {
-          await crawlGroupInTab(gid, opts);
+          await crawlFn(gid, opts);
         } catch (e) {
           // bỏ qua nhóm lỗi, tiếp tục nhóm sau
         }
@@ -1598,6 +2029,8 @@ export {
   stopCrawlInActiveTab,
   crawlGroupInTab,
   crawlGroupApiInTab,
+  crawlGroupApiTabless,
+  crawlGroupApiSmart,
   scanJoinedGroups,
   runJob,
   executeDeletePost,

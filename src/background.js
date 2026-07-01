@@ -44,6 +44,8 @@ import {
   stopCrawlInActiveTab,
   crawlGroupInTab,
   crawlGroupApiInTab,
+  crawlGroupApiTabless,
+  crawlGroupApiSmart,
   scanJoinedGroups,
   removeCrawlTab,
   runJob,
@@ -256,8 +258,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "CRAWL_GROUP_API": {
-      // Crawl QUA API nội bộ FB (sniff + replay). Mở tab nền, gửi START_API_CRAWL.
-      crawlGroupApiInTab(msg.groupId, msg.options || {})
+      // Crawl QUA API nội bộ FB (sniff + replay). Định tuyến qua crawlGroupApiSmart:
+      //  - ĐÃ CÓ khuôn GQL trong storage => chạy NGẦM hoàn toàn (tabless), KHÔNG mở
+      //    tab, KHÔNG resize/nhảy tab của người dùng.
+      //  - CHƯA CÓ khuôn => mở 1 tab foreground DUY NHẤT 1 lần để bắt khuôn; các lần
+      //    sau tự động chuyển sang nhánh ngầm.
+      const apiOpts = msg.options || {};
+      crawlGroupApiSmart(msg.groupId, apiOpts)
         .then((r) => sendResponse(r))
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;

@@ -236,7 +236,11 @@ export function crawlOpts() {
     const t = new Date(fromStr + "T00:00:00").getTime();
     if (!isNaN(t)) fromTs = t;
   }
+  // Phương thức crawl: "api" (sniff+replay GraphQL nội bộ FB) hoặc "dom" (cuộn DOM).
+  // Mặc định "api". Lưu ý: DOM chỉ chạy 1 luồng (FB ảo hoá feed, tab nền bị bóp ga).
+  const method = ($("crawlMethod") && $("crawlMethod").value) === "dom" ? "dom" : "api";
   return {
+    method,
     maxNewPosts: num("crawlMax", 100, 1, 2000),
     stopAfterKnown: num("crawlStopKnown", 8, 1, 100),
     scrollDelay: num("crawlDelay", 1500, 400, 8000),
@@ -260,9 +264,14 @@ export function setCrawlStatus(text, busy) {
 export async function crawlGroup(groupId) {
   const g = store.groups.find((x) => x.groupId === groupId);
   const name = (g && (g.groupName || g.groupId)) || groupId;
-  setCrawlStatus(`Đang mở nhóm "${name}" ở tab nền và khởi động crawl...`, true);
+  const opts = crawlOpts();
+  // Chọn pipeline theo phương thức trong Cài đặt: "api" -> CRAWL_GROUP_API, "dom" -> CRAWL_GROUP.
+  const isApi = opts.method === "api";
+  const handler = isApi ? "CRAWL_GROUP_API" : "CRAWL_GROUP";
+  const label = isApi ? "[API] " : "";
+  setCrawlStatus(`${label}Đang mở nhóm "${name}" ở tab nền và khởi động crawl...`, true);
   toast("Đã bắt đầu crawl ở tab nền. Theo dõi tiến trình ngay tại đây.", "info", 3000);
-  const res = await bg("CRAWL_GROUP", { groupId, options: crawlOpts() });
+  const res = await bg(handler, { groupId, options: opts });
   if (!res || !res.ok) {
     setCrawlStatus((res && res.error) || "Không bắt đầu được crawl.", false);
     toast((res && res.error) || "Không bắt đầu được crawl.", "err", 5000);
@@ -402,12 +411,14 @@ export async function startBatchCrawl() {
     toast("Chưa chọn nhóm nào để crawl hàng loạt.", "err");
     return;
   }
-  // QUAN TRỌNG: crawl TUẦN TỰ 1 nhóm/lần (không song song). Facebook ảo hoá feed
-  // và CHỈ mount bài khi tab đang hiển thị (foreground). Mở nhiều tab nền cùng lúc
-  // bị Chrome bóp ga/đóng băng (throttle/freeze) nên mỗi tab chỉ mount 1–2 bài ->
-  // crawl thiếu. Đã XÁC MINH: crawl 1 nhóm lấy đủ, nhiều nhóm cùng lúc thì thiếu.
-  // Vì chỉ một tab được foreground tại một thời điểm, chạy song song là bất khả thi
-  // với feed ảo hoá -> ép 1 luồng để mỗi nhóm lấy đủ bài.
+  // Chốt phương thức + tuỳ chọn MỘT LẦN cho cả mẻ để mọi luồng dùng chung.
+  const opts = crawlOpts();
+  const isApi = opts.method === "api";
+  // QUAN TRỌNG: cả DOM scroll lẫn API đều phải crawl TUẦN TỰ 1 nhóm/lần (không
+  // song song). Facebook ảo hoá feed và CHỈ mount/bắn feed query khi tab đang
+  // foreground. Focus là tài nguyên SINGLETON => nhiều tab foreground cùng lúc
+  // cướp focus của nhau nên chỉ 1 nhóm bắt được bài. Đã XÁC MINH cho cả 2 chế độ:
+  // 1 nhóm chạy tốt, 2+ nhóm cùng lúc chỉ ăn 1 nhóm. -> ép 1 luồng.
   const maxThreads = 1;
   store.batch = {
     queue,
@@ -417,10 +428,14 @@ export async function startBatchCrawl() {
     done: 0,
     stop: false,
     maxThreads,
+    method: opts.method,
+    options: opts,
   };
   toggleBatchUI(true);
   toast(
-    `Bắt đầu crawl hàng loạt ${queue.length} nhóm (chạy tuần tự từng nhóm để lấy ĐỦ bài; giữ jitter chống checkpoint).`,
+    isApi
+      ? `Bắt đầu crawl hàng loạt ${queue.length} nhóm qua API (chạy tuần tự từng nhóm; giữ jitter chống checkpoint).`
+      : `Bắt đầu crawl hàng loạt ${queue.length} nhóm bằng cuộn DOM (chạy tuần tự từng nhóm để lấy ĐỦ bài; giữ jitter chống checkpoint).`,
     "info",
     3500
   );
@@ -458,8 +473,11 @@ export async function launchNext() {
   b.active += 1;
   const g = store.groups.find((x) => x.groupId === groupId);
   const name = (g && (g.groupName || g.groupId)) || groupId;
-  updateBatchStatus(`mở "${name}"`);
-  const res = await bg("CRAWL_GROUP", { groupId, options: crawlOpts() });
+  // Dùng phương thức + tuỳ chọn đã chốt ở startBatchCrawl để mọi luồng nhất quán.
+  const handler = b.method === "api" ? "CRAWL_GROUP_API" : "CRAWL_GROUP";
+  const tag = b.method === "api" ? "[API] " : "";
+  updateBatchStatus(`mở ${tag}"${name}"`);
+  const res = await bg(handler, { groupId, options: b.options || crawlOpts() });
   if (!res || !res.ok) {
     // Tab không mở được: nhả slot, tính như đã xử lý, rồi lấp tiếp
     toast(`Nhóm "${name}" lỗi: ${(res && res.error) || "không rõ"}. Bỏ qua.`, "err", 4000);

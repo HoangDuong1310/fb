@@ -1129,6 +1129,17 @@
     });
   }
 
+  // Yêu cầu MAIN world hook PHÁT LẠI mọi gói GraphQL đã đệm. Cần vì hook chạy
+  // ở document_start (bắt feed FB rất sớm) còn content.js chỉ chạy ở
+  // document_idle => gói feed đầu tiên có thể đã bắn TRƯỚC khi listener này gắn.
+  // Gọi pull để "kéo" lại các gói đó thay vì chờ FB tự bắn lại (không xảy ra
+  // trong tab nền/ẩn bị throttle).
+  function pullBufferedGql() {
+    try {
+      window.postMessage({ __FBC_GQL_PULL: 1 }, "*");
+    } catch (e) {}
+  }
+
   // Dựng body replay: GIỮ NGUYÊN body gốc (mọi field FB cần), chỉ thay
   // 'variables' bằng bản đã gắn cursor. Bền hơn việc tự dựng lại từ đầu.
   function buildReplayBody(tpl, vars) {
@@ -1174,6 +1185,24 @@
             variables: req.variables,
           };
           apiSniff.lastChunks = Array.isArray(d.chunks) ? d.chunks : [];
+          // Lưu mẫu ra chrome.storage.local để background service worker dùng lại
+          // cho CRAWL KHÔNG-TAB (Mức B): POST /api/graphql/ trực tiếp. Token
+          // fb_dtsg/lsd sẽ được làm mới (lấy từ HTML nhóm) lúc crawl, nên ở đây
+          // chỉ cần lưu doc_id/friendly/raw/variables làm khuôn.
+          try {
+            chrome.storage.local.set({
+              fbcGqlTemplate: {
+                url: d.url,
+                raw: req.raw,
+                friendly: req.friendly,
+                fb_dtsg: req.fb_dtsg,
+                doc_id: req.doc_id,
+                lsd: req.lsd,
+                variables: req.variables,
+                capturedAt: Date.now(),
+              },
+            });
+          } catch (e) {}
           dlog(
             `[API] bắt feed nhóm #${apiSniff.feedCount}` +
               ` | friendly=${req.friendly} doc_id=${req.doc_id}`
@@ -1233,6 +1262,11 @@
       const known = new Set((knownRes && knownRes.ok && knownRes.ids) || []);
 
       apiReport({ status: "started", newCount: 0, pages: 0 });
+
+      // Kéo lại các gói feed hook đã đệm TRƯỚC khi content.js gắn listener
+      // (hook chạy document_start, content.js chạy document_idle => dễ lỡ gói
+      // feed đầu tiên). Đây là mấu chốt để tab ẩn/nền vẫn có template mà crawl.
+      pullBufferedGql();
 
       // Cần mẫu request đã sniff để replay. Nếu chưa có, chờ FB tự bắn feed request.
       // FB thường mất 3-8s sau khi load trang nhóm mới gọi feed request đầu tiên
@@ -1396,29 +1430,6 @@
       // Quét qua API nội bộ của FB (sniff + replay). Tiến độ gửi qua CRAWL_PROGRESS.
       runApiCrawl(msg.options || {});
       sendResponse({ ok: true, started: true, mode: "api" });
-      return false;
-    }
-
-    if (msg.type === "CAPTURE_GQL") {
-      // Probe xác minh runtime: in ra shape thật của response feed FB đã bắt được.
-      const t = apiSniff.template;
-      const sample = apiSniff.lastChunks && apiSniff.lastChunks.length ? apiSniff.lastChunks[0] : null;
-      console.log("[FBC][CAPTURE_GQL]", {
-        feedCount: apiSniff.feedCount,
-        hasTemplate: !!(t && t.doc_id),
-        friendly: t ? t.friendly : null,
-        doc_id: t ? t.doc_id : null,
-        hasFbDtsg: !!(t && t.fb_dtsg),
-        variables: t ? t.variables : null,
-        sampleChunk: sample,
-      });
-      sendResponse({
-        ok: true,
-        feedCount: apiSniff.feedCount,
-        hasTemplate: !!(t && t.doc_id),
-        friendly: t ? t.friendly : null,
-        chunkCount: apiSniff.lastChunks ? apiSniff.lastChunks.length : 0,
-      });
       return false;
     }
 

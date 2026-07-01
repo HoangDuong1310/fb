@@ -82,23 +82,116 @@
     return out;
   };
 
-  // Gửi gói bắt được sang content.js.
+  // Bộ đệm các gói GraphQL bắt được GẦN NHẤT.
+  //
+  // VÌ SAO cần đệm: hook này chạy ở document_start (sớm), còn content.js (nơi
+  // lắng nghe __FBC_GQL để lưu template) chỉ chạy ở document_idle (muộn hơn).
+  // Facebook thường bắn request feed nhóm ĐẦU TIÊN trong khoảng document_start
+  // -> document_idle. Nếu ta chỉ postMessage đúng LÚC bắt được, content.js chưa
+  // kịp gắn listener => MẤT gói đó => runApiCrawl chờ template mãi không có =>
+  // "không crawl được gì". Giải pháp: đệm lại vài gói gần nhất; khi content.js
+  // sẵn sàng, nó gửi __FBC_GQL_PULL và hook PHÁT LẠI toàn bộ gói đã đệm.
+  const BUFFER_MAX = 8;
+  const buffer = [];
+
+  // ĐỆM RIÊNG cho gói FEED NHÓM.
+  //
+  // VÌ SAO cần đệm riêng: hook đệm MỌI request /api/graphql/ (like, seen,
+  // notification, presence, badge…). Trong tab popup/ẩn, Facebook bắn gói feed
+  // nhóm SỚM NHẤT rồi tiếp tục bắn 8+ gói non-feed khác. Với buffer chung chỉ
+  // giữ BUFFER_MAX=8 gói gần nhất, gói feed (đến đầu tiên) bị .shift() ĐẨY RA
+  // trước khi content.js kịp __FBC_GQL_PULL => khi pull chỉ còn toàn gói
+  // non-feed => isGroupFeedRequest FALSE hết => feedCount=0 mãi. Đây CHÍNH là
+  // gốc rễ "popup lấy 0 bài". Khắc phục: nhận diện gói feed ngay tại hook
+  // (inline, không import gql-parse.js) và giữ trong đệm RIÊNG, cap lớn hơn,
+  // để gói feed không bao giờ bị gói non-feed đẩy ra.
+  const FEED_BUFFER_MAX = 24;
+  const feedBuffer = [];
+
+  // Nhận diện gói feed nhóm CHỈ dựa trên chuỗi body request (không cần parse
+  // JSON, không cần gql-parse.js). fb_api_req_friendly_name của feed nhóm luôn
+  // chứa các dấu hiệu dưới đây (đã lowercase). Cố ý "rộng tay" một chút: thà
+  // giữ dư vài gói còn hơn để lọt gói feed thật.
+  const FEED_SIGNS = [
+    "groupsfeed",
+    "groupscometfeed",
+    "groupscometnewsfeed",
+    "group_feed",
+    "groupscometregularstories",
+  ];
+  const isFeedBody = (bodyStr) => {
+    try {
+      if (!bodyStr) return false;
+      const low = bodyStr.toLowerCase();
+      for (const sign of FEED_SIGNS) {
+        if (low.indexOf(sign) !== -1) return true;
+      }
+      // Dự phòng: friendly không khớp nhưng variables có "group" + feed/stories.
+      return (
+        low.indexOf("group") !== -1 &&
+        (low.indexOf("feed") !== -1 || low.indexOf("stories") !== -1)
+      );
+    } catch (e) {
+      return false;
+    }
+  };
+
+  // CHẨN ĐOÁN runtime: đối tượng thống kê đọc được từ ngoài (qua
+  // chrome.scripting.executeScript world:"MAIN"). Dùng để phân biệt 2 gốc rễ
+  // khi popup lấy 0 bài:
+  //   - Nếu window.__FBC_GQL_HOOK__ undefined => hook KHÔNG chạy trong popup.
+  //   - Nếu installed=true nhưng seen=0 => hook chạy nhưng Facebook KHÔNG bắn
+  //     request /api/graphql/ nào (bị throttle / redirect login / checkpoint).
+  window.__FBC_GQL_STAT__ = {
+    installed: true,
+    fetchPatched: false,
+    xhrPatched: false,
+    seen: 0,       // tổng số gói /api/graphql/ đã bắt (mọi loại, không chỉ feed)
+    feedSeen: 0,   // số gói được nhận diện là feed nhóm
+    buffered: 0,
+    feedBuffered: 0,
+    lastUrl: "",
+    lastAt: 0,
+  };
+
+  // Dựng message chuẩn để phát cho content.js.
+  const buildMsg = (url, reqBody, respText) => ({
+    __FBC_GQL: 1,
+    url: String(url || ""),
+    reqBody: bodyToString(reqBody),
+    // Gửi cả chunks ĐÃ parse (đỡ phải parse lại) và một mẫu text ngắn để
+    // chẩn đoán khi cần. Không gửi nguyên text dài để tránh nặng bộ nhớ.
+    chunks: splitChunks(respText),
+    respSample: typeof respText === "string" ? respText.slice(0, 2000) : "",
+    at: Date.now(),
+  });
+
+  // Gửi gói bắt được sang content.js + LƯU vào đệm để phát lại khi được yêu cầu.
   const emit = (url, reqBody, respText) => {
     try {
-      const chunks = splitChunks(respText);
-      window.postMessage(
-        {
-          __FBC_GQL: 1,
-          url: String(url || ""),
-          reqBody: bodyToString(reqBody),
-          // Gửi cả chunks ĐÃ parse (đỡ phải parse lại) và một mẫu text ngắn để
-          // chẩn đoán khi cần. Không gửi nguyên text dài để tránh nặng bộ nhớ.
-          chunks,
-          respSample: typeof respText === "string" ? respText.slice(0, 2000) : "",
-          at: Date.now(),
-        },
-        "*"
-      );
+      const msg = buildMsg(url, reqBody, respText);
+      buffer.push(msg);
+      if (buffer.length > BUFFER_MAX) buffer.shift();
+      // GÓI FEED NHÓM: giữ trong đệm RIÊNG để KHÔNG bị gói non-feed đẩy ra.
+      // msg.reqBody đã là chuỗi urlencoded (bodyToString) nên detect inline được.
+      const isFeed = isFeedBody(msg.reqBody);
+      if (isFeed) {
+        feedBuffer.push(msg);
+        if (feedBuffer.length > FEED_BUFFER_MAX) feedBuffer.shift();
+      }
+      // Cập nhật stat để probe MAIN-world đọc được.
+      try {
+        const s = window.__FBC_GQL_STAT__;
+        if (s) {
+          s.seen++;
+          s.buffered = buffer.length;
+          s.feedBuffered = feedBuffer.length;
+          if (isFeed) s.feedSeen++;
+          s.lastUrl = String(url || "").slice(0, 120);
+          s.lastAt = Date.now();
+        }
+      } catch (_) {}
+      window.postMessage(msg, "*");
     } catch (e) {
       // im lặng — không làm phiền trang
     }
@@ -107,6 +200,7 @@
   // ---- Vá fetch ---------------------------------------------------------
   const origFetch = window.fetch;
   if (typeof origFetch === "function") {
+    window.__FBC_GQL_STAT__.fetchPatched = true;
     window.fetch = function (input, init) {
       let url = "";
       try {
@@ -135,6 +229,7 @@
     const XHR = window.XMLHttpRequest;
     const origOpen = XHR.prototype.open;
     const origSend = XHR.prototype.send;
+    window.__FBC_GQL_STAT__.xhrPatched = true;
 
     XHR.prototype.open = function (method, url) {
       try {
@@ -172,7 +267,29 @@
   // check ev.data có đúng "dấu hiệu" (__FBC_GQL_REPLAY) là đủ.
   window.addEventListener("message", (ev) => {
     const d = ev.data;
-    if (!d || typeof d !== "object" || d.__FBC_GQL_REPLAY !== 1) return;
+    if (!d || typeof d !== "object") return;
+
+    // (0) content.js vừa sẵn sàng => PHÁT LẠI mọi gói GraphQL đã đệm. Đây là
+    // cách khắc phục đua thời điểm document_start (hook) vs document_idle
+    // (content.js): gói feed FB bắn sớm sẽ không bị mất.
+    if (d.__FBC_GQL_PULL === 1) {
+      try {
+        // PHÁT feedBuffer TRƯỚC: đảm bảo content.js nhận gói feed nhóm dù đệm
+        // chung đã bị gói non-feed đẩy hết ra. Sau đó phát nốt đệm chung phòng
+        // khi có gói feed lọt qua bộ nhận diện inline.
+        const sent = new Set();
+        for (const msg of feedBuffer) {
+          sent.add(msg);
+          window.postMessage(msg, "*");
+        }
+        for (const msg of buffer) {
+          if (!sent.has(msg)) window.postMessage(msg, "*");
+        }
+      } catch (e) {}
+      return;
+    }
+
+    if (d.__FBC_GQL_REPLAY !== 1) return;
     const id = d.id;
     const reply = (payload) =>
       window.postMessage({ __FBC_GQL_REPLAY_RES: 1, id, ...payload }, "*");
