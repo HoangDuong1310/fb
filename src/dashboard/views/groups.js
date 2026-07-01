@@ -245,7 +245,6 @@ export function crawlOpts() {
     stopAfterKnown: num("crawlStopKnown", 8, 1, 100),
     scrollDelay: num("crawlDelay", 1500, 400, 8000),
     restBetween: num("crawlRest", 20, 0, 600),
-    maxThreads: num("crawlThreads", 3, 1, 20),
     fromTs,
     safeMode: !!($("crawlSafe") && $("crawlSafe").checked),
   };

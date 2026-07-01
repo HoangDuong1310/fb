@@ -9,7 +9,7 @@ import { $ } from "./core.js";
 
 /* ===================== LƯU CẤU HÌNH CRAWL (F5 vẫn giữ) ===================== */
 const CRAWL_CFG_KEY = "crawlSettings";
-export const CRAWL_FIELDS = ["crawlMethod", "crawlMax", "crawlStopKnown", "crawlDelay", "crawlRest", "crawlThreads", "crawlFromDate"];
+export const CRAWL_FIELDS = ["crawlMethod", "crawlMax", "crawlStopKnown", "crawlDelay", "crawlRest", "crawlFromDate"];
 let _flashTimer = null;
 
 export function flashSaved() {

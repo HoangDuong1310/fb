@@ -322,7 +322,8 @@ async function crawlGroupApiSmart(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
   const tpl = await getStoredGqlTemplate();
   if (tpl && tpl.doc_id) {
-    // Đường ẩn hoàn toàn: replay khuôn qua backend relay, không mở tab.
+    // Đường ẩn hoàn toàn: replay khuôn bằng fetch trực tiếp từ extension
+    // (IP/cookie của user), không mở tab, không qua backend relay.
     return crawlGroupApiTabless(groupId, options);
   }
   // Chưa có khuôn: mở tab 1 lần để bắt khuôn (đồng thời cũng cào luôn nhóm này).
@@ -1698,8 +1699,8 @@ function shuffleInPlace(arr) {
 
 /**
  * Crawl TẤT CẢ nhóm đã lưu trong tab nền theo chu kỳ.
- * Tôn trọng "Số luồng tối đa" (options.maxThreads): chạy song song tối đa N nhóm
- * cùng lúc bằng một pool worker, thay vì mở tuần tự từng tab một.
+ * LUÔN chạy tuần tự 1 nhóm/lần (xem giải thích ÉP 1 LUỒNG bên dưới) — không có
+ * tuỳ chọn số luồng song song.
  */
 async function processAutoCrawl() {
   if (_autoCrawling) return;
