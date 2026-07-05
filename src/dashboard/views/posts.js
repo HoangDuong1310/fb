@@ -23,6 +23,13 @@ import {
 
 /* =============================== BÀI VIẾT ============================== */
 
+// Số bài hiển thị mỗi trang. Kho bài có thể lên tới hàng nghìn, vẽ hết một lúc
+// rất nặng (mỗi thẻ có ảnh, phân loại lead...) nên chỉ render POSTS_PAGE_SIZE
+// thẻ mỗi trang.
+const POSTS_PAGE_SIZE = 30;
+// Trang hiện tại (bắt đầu từ 1). Đặt lại về 1 khi đổi nhóm / tìm kiếm / đổi bộ lọc.
+let postsPage = 1;
+
 export async function loadPosts() {
   const sel = $("postsGroupFilter");
   // Khôi phục bộ lọc nhóm đã lưu (lần đầu vào tab, khi select còn rỗng).
@@ -34,6 +41,8 @@ export async function loadPosts() {
   store.postsGroupId = groupId;
   saveUIPref("postsGroupId", groupId);
 
+  // Đổi nhóm -> danh sách khác hẳn, đưa về trang đầu.
+  postsPage = 1;
   // Dữ liệu bài viết là riêng tư theo tài khoản: backend chỉ trả bài của chính
   // người dùng hiện tại nên không còn cờ "chỉ của tôi".
   const res = await bg("GET_ALL_POSTS", { groupId });
@@ -51,6 +60,8 @@ export function applyLeadMode(mode) {
       b.classList.toggle("active", b.dataset.lead === store.postsLeadMode);
     });
   }
+  // Đổi bộ lọc -> danh sách khác đi, đưa về trang đầu.
+  postsPage = 1;
   renderPosts();
 }
 
@@ -114,7 +125,23 @@ export function renderPosts() {
     );
     return;
   }
-  wrap.innerHTML = list
+  // Phân trang: chỉ vẽ POSTS_PAGE_SIZE thẻ mỗi trang để tránh render hàng nghìn
+  // thẻ (kèm ảnh) một lúc gây giật/lag. Kẹp postsPage vào [1, totalPages] phòng
+  // khi danh sách co lại sau khi lọc/tìm kiếm.
+  const totalPages = Math.max(1, Math.ceil(list.length / POSTS_PAGE_SIZE));
+  if (postsPage > totalPages) postsPage = totalPages;
+  if (postsPage < 1) postsPage = 1;
+  const start = (postsPage - 1) * POSTS_PAGE_SIZE;
+  const pageItems = list.slice(start, start + POSTS_PAGE_SIZE);
+  const pagerHTML =
+    list.length > POSTS_PAGE_SIZE
+      ? `<div class="pager">
+          <button class="btn ghost sm" data-pg="prev"${postsPage <= 1 ? " disabled" : ""}>← Trước</button>
+          <span class="pager-info">Trang <b>${postsPage}</b>/${totalPages} · ${list.length} bài</span>
+          <button class="btn ghost sm" data-pg="next"${postsPage >= totalPages ? " disabled" : ""}>Sau →</button>
+        </div>`
+      : "";
+  wrap.innerHTML = pageItems
     .map((p) => {
       const imgs = p.images || [];
       const thumbs = imgs
@@ -165,7 +192,13 @@ export function renderPosts() {
         <div class="pc-cmt-hist" id="${cmtHistId}" hidden></div>
       </div>`;
     })
-    .join("");
+    .join("") + pagerHTML;
+}
+
+// Nút phân trang gọi khi bấm Trước/Sau (xử lý ở dashboard.js qua data-pg).
+export function changePostsPage(delta) {
+  postsPage += delta;
+  renderPosts();
 }
 
 /**

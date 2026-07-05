@@ -51,6 +51,7 @@ import {
   applyLeadMode,
   suggestKeywordsUI,
   loadPostComments,
+  changePostsPage,
 } from "./dashboard/views/posts.js";
 import { loadLeadKeywords } from "./dashboard/leadfilter.js";
 import {
@@ -208,6 +209,13 @@ function bindEvents() {
   $("btnExportCsv").addEventListener("click", () => exportPosts("csv"));
   $("btnClearPosts").addEventListener("click", clearGroupPosts);
   $("postsWrap").addEventListener("click", (e) => {
+    const pg = e.target.closest("[data-pg]");
+    if (pg) {
+      if (pg.disabled) return;
+      changePostsPage(pg.dataset.pg === "prev" ? -1 : 1);
+      $("postsWrap").scrollIntoView({ block: "start", behavior: "smooth" });
+      return;
+    }
     const tog = e.target.closest("[data-toggle]");
     if (tog) {
       const card = tog.closest(".post-card");
