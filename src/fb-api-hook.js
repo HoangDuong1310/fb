@@ -259,7 +259,9 @@
   // content.js nhờ MAIN world fetch hộ. content.js gửi:
   //   postMessage({ __FBC_GQL_REPLAY: 1, id, url, body })
   // MAIN world fetch rồi trả:
-  //   postMessage({ __FBC_GQL_REPLAY_RES: 1, id, ok, chunks, error })
+  //   postMessage({ __FBC_GQL_REPLAY_RES: 1, id, ok, status, chunks, blockText, error })
+  // status + blockText để content.js phát hiện FB chặn/checkpoint và dừng sớm
+  // (bảo vệ tài khoản), giống nhánh crawl không-tab.
   // LƯU: KHÔNG check `ev.source !== window` — vì MAIN world và isolated world
   // có 2 đối tượng `window` khác nhau. Khi isolated world postMessage, ev.source
   // là isolated window còn `window` ở đây là MAIN window => check đó LUÔN
@@ -294,6 +296,7 @@
     const reply = (payload) =>
       window.postMessage({ __FBC_GQL_REPLAY_RES: 1, id, ...payload }, "*");
     try {
+      let httpStatus = 0;
       origFetch
         .call(window, d.url, {
           method: "POST",
@@ -305,8 +308,20 @@
           body: d.body,
           credentials: "include",
         })
-        .then((res) => res.text())
-        .then((txt) => reply({ ok: true, chunks: splitChunks(txt) }))
+        .then((res) => {
+          httpStatus = res.status;
+          return res.text();
+        })
+        .then((txt) =>
+          reply({
+            ok: true,
+            status: httpStatus,
+            chunks: splitChunks(txt),
+            // chỉ gửi đầu phản hồi để content.js soi dấu hiệu checkpoint/login,
+            // tránh chuyển cả body nặng qua postMessage.
+            blockText: String(txt || "").slice(0, 2000),
+          })
+        )
         .catch((err) => reply({ ok: false, error: String(err) }));
     } catch (err) {
       reply({ ok: false, error: String(err) });

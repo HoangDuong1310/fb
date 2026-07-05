@@ -1365,8 +1365,45 @@
 
       // CÁC TRANG SAU: replay với cursor tăng dần.
       const tpl = apiSniff.template;
+      // Nhịp nghỉ giữa các trang CÓ JITTER (70%–160% nhịp cơ bản) + thỉnh thoảng
+      // nghỉ dài như người thật => pattern bớt máy móc, giảm rủi ro checkpoint.
+      const rint = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
+      let sincePageRest = 0;
+      let nextRestGap = rint(5, 8);
+      const nextPageDelay = () => {
+        sincePageRest += 1;
+        if (sincePageRest >= nextRestGap) {
+          sincePageRest = 0;
+          nextRestGap = rint(5, 8);
+          return rint(opts.pageDelay * 3, opts.pageDelay * 6);
+        }
+        return Math.round(opts.pageDelay * (0.7 + Math.random() * 0.9));
+      };
+      // Lý do FB chặn (checkpoint/đăng nhập lại/giới hạn tần suất) => DỪNG SỚM
+      // thay vì gõ dồn dập, để bảo vệ tài khoản. Cùng logic với nhánh API
+      // không-tab trong crawl.js.
+      let blockedReason = null;
+      const detectBlock = (status, txt) => {
+        if (status === 429)
+          return "FB giới hạn tần suất (HTTP 429). Đã dừng để bảo vệ tài khoản; thử lại sau.";
+        if (status === 401 || status === 403)
+          return `FB từ chối truy cập (HTTP ${status}). Có thể phiên đăng nhập đã hết hạn hoặc bị chặn.`;
+        if (status >= 500)
+          return `FB lỗi máy chủ (HTTP ${status}). Đã dừng, thử lại sau.`;
+        const head = String(txt || "").toLowerCase();
+        if (
+          head.includes("checkpoint") ||
+          head.includes("/login/") ||
+          head.includes("login_required") ||
+          head.includes("please log in") ||
+          head.includes("www.facebook.com/login")
+        )
+          return "FB yêu cầu xác minh/đăng nhập lại (checkpoint). Đã dừng crawl để tránh rủi ro khoá tài khoản.";
+        return null;
+      };
       while (
         !state.stopRequested &&
+        !blockedReason &&
         newCount < opts.maxNewPosts &&
         pages < opts.maxPages
       ) {
@@ -1383,6 +1420,11 @@
           dlog("[API] replay lỗi:", res.error);
           break;
         }
+        blockedReason = detectBlock(res.status, res.blockText);
+        if (blockedReason) {
+          dlog("[API] FB chặn:", blockedReason);
+          break;
+        }
         const pi = ingestChunks(res.chunks);
         pages += 1;
         await flush();
@@ -1393,11 +1435,13 @@
           break;
         }
         cursor = pi.endCursor;
-        await sleep(opts.pageDelay);
+        await sleep(nextPageDelay());
       }
 
       await flush();
-      const reason = state.stopRequested
+      const reason = blockedReason
+        ? blockedReason
+        : state.stopRequested
         ? "Đã dừng theo yêu cầu."
         : newCount >= opts.maxNewPosts
         ? "Đã đạt giới hạn số bài mới."

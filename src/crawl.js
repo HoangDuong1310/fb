@@ -536,6 +536,48 @@ async function crawlGroupApiTabless(groupId, options) {
       tpl.friendly || "GroupsCometFeedRegularStoriesPaginationQuery";
     // Chẩn đoán phản hồi /api/graphql/ trang gần nhất (để soi vì sao +0 bài).
     let lastDiag = null;
+    // Lý do FB chặn (checkpoint/đăng nhập lại/giới hạn tần suất) => DỪNG SỚM
+    // thay vì gõ dồn dập, để bảo vệ tài khoản.
+    let blockedReason = null;
+
+    // Số nguyên ngẫu nhiên trong [a, b] — dùng cho jitter nhịp nghỉ.
+    const rint = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
+
+    // Phát hiện dấu hiệu FB chặn/đòi xác minh để dừng crawl ngay. Gõ tiếp khi đã
+    // bị 429/checkpoint chỉ làm tăng rủi ro khoá tài khoản.
+    const detectBlock = (status, txt) => {
+      if (status === 429)
+        return "FB giới hạn tần suất (HTTP 429). Đã dừng để bảo vệ tài khoản; thử lại sau.";
+      if (status === 401 || status === 403)
+        return `FB từ chối truy cập (HTTP ${status}). Có thể phiên đăng nhập đã hết hạn hoặc bị chặn.`;
+      if (status >= 500)
+        return `FB lỗi máy chủ (HTTP ${status}). Đã dừng, thử lại sau.`;
+      const head = String(txt || "").slice(0, 2000).toLowerCase();
+      if (
+        head.includes("checkpoint") ||
+        head.includes("/login/") ||
+        head.includes("login_required") ||
+        head.includes("please log in") ||
+        head.includes("www.facebook.com/login")
+      )
+        return "FB yêu cầu xác minh/đăng nhập lại (checkpoint). Đã dừng crawl để tránh rủi ro khoá tài khoản.";
+      return null;
+    };
+
+    // Nhịp nghỉ giữa các trang CÓ JITTER (70%–160% nhịp cơ bản) + thỉnh thoảng
+    // nghỉ dài như người thật dừng đọc => pattern bớt máy móc, giảm rủi ro
+    // checkpoint so với nhịp cố định.
+    let sincePageRest = 0;
+    let nextRestGap = rint(5, 8);
+    const nextPageDelay = () => {
+      sincePageRest += 1;
+      if (sincePageRest >= nextRestGap) {
+        sincePageRest = 0;
+        nextRestGap = rint(5, 8);
+        return rint(opts.pageDelay * 3, opts.pageDelay * 6);
+      }
+      return Math.round(opts.pageDelay * (0.7 + Math.random() * 0.9));
+    };
 
     // Bật rule DNR chèn header bị cấm (Origin/Referer/sec-fetch-*) cho ĐÚNG
     // request nền tới /api/graphql/. Request đi THẲNG từ máy bạn (cookie tự đính
@@ -575,6 +617,9 @@ async function crawlGroupApiTabless(groupId, options) {
         hadLsd: !!lsd,
         hadDtsg: !!fb_dtsg,
       };
+      // Dừng ngay nếu FB trả dấu hiệu chặn/checkpoint/hết phiên — gõ tiếp chỉ
+      // làm tăng rủi ro khoá tài khoản, không thu thêm được gì.
+      blockedReason = detectBlock(res.status, txt);
       try {
         console.log("[FBC][API-DIRECT] /api/graphql/ resp:", lastDiag);
       } catch (_) {}
@@ -592,19 +637,26 @@ async function crawlGroupApiTabless(groupId, options) {
       if (!pi.hasNext || !pi.endCursor) cursor = null;
     }
 
-    while (cursor && newCount < opts.maxNewPosts && pages < opts.maxPages) {
-      await sleep(opts.pageDelay);
+    while (
+      !blockedReason &&
+      cursor &&
+      newCount < opts.maxNewPosts &&
+      pages < opts.maxPages
+    ) {
+      await sleep(nextPageDelay());
       const pi = ingestChunks(await fetchPage(cursor));
       pages += 1;
       await flush();
       apiReport({ status: "page", newCount, pages, hasNext: pi.hasNext });
-      if (!pi.hasNext || !pi.endCursor || pi.endCursor === cursor) break;
+      if (blockedReason || !pi.hasNext || !pi.endCursor || pi.endCursor === cursor)
+        break;
       cursor = pi.endCursor;
     }
 
     await flush();
-    let reason =
-      newCount >= opts.maxNewPosts
+    let reason = blockedReason
+      ? blockedReason
+      : newCount >= opts.maxNewPosts
         ? "Đã đạt giới hạn số bài mới."
         : "Đã hết trang feed (API không-tab).";
     // Khi +0 bài, đính chẩn đoán phản hồi để soi lý do ngay trên UI (khỏi mở devtools).
