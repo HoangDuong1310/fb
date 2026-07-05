@@ -15,7 +15,7 @@
  * (clearAllProducts, clearMyStore, clearGroupPosts, exportPosts) để không nhân
  * đôi logic và không phụ thuộc tham số backend chưa hỗ trợ.
  */
-import { bg, toast, modal } from "../core.js";
+import { bg, toast, modal, esc } from "../core.js";
 import { loadCrawlSettings } from "../prefs.js";
 import { loadAutoCrawl } from "./groups.js";
 import { loadAutoSync, clearAllProducts } from "./products.js";
@@ -30,6 +30,40 @@ export async function loadSettings() {
   await loadCrawlSettings();
   await loadAutoCrawl();
   await loadAutoSync();
+  await loadCrawlBlockBanner();
+}
+
+// Hiển thị banner khi auto-crawl đang bị "ngắt mạch" (circuit-breaker) do FB
+// chặn (429/checkpoint...). Trong thời gian này auto-crawl tạm ngưng để bảo vệ
+// tài khoản; banner cho biết còn bao lâu và lý do.
+export async function loadCrawlBlockBanner() {
+  const el = document.getElementById("crawlBlockBanner");
+  if (!el) return;
+  let state = null;
+  try {
+    const res = await bg("GET_CRAWL_BLOCK_STATE", {});
+    state = res && res.ok ? res.state : null;
+  } catch (e) {
+    state = null;
+  }
+  if (!state || !state.blocked) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  const mins = Math.max(1, Math.ceil((state.blockedUntil - Date.now()) / 60000));
+  const until = new Date(state.blockedUntil).toLocaleTimeString("vi-VN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const reason = state.reason ? String(state.reason) : "FB tạm chặn crawl.";
+  el.innerHTML =
+    `<span>⏸️</span><span class="switch-text">` +
+    `<strong>Auto-crawl đang tạm ngưng ~${mins} phút (đến ${until})</strong>` +
+    `<small>Lý do: ${esc(reason)}. Đây là cơ chế bảo vệ tài khoản: khi FB chặn, ` +
+    `tiện ích tự nghỉ và giãn dần thời gian trước khi thử lại. Bạn có thể crawl thủ công lại sau khi hết thời gian nghỉ.</small>` +
+    `</span>`;
+  el.hidden = false;
 }
 
 // ---- Quản lý dữ liệu --------------------------------------------------

@@ -48,6 +48,8 @@ import {
   crawlGroupApiSmart,
   scanJoinedGroups,
   removeCrawlTab,
+  getCrawlBlockState,
+  noteCrawlDoneReason,
   runJob,
   executeDeletePost,
   processDueJobs,
@@ -740,6 +742,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // có dashboard mở để giữ SW sống). Content đã `await flush()` (lưu xong bài
     // cuối) TRƯỚC khi gửi CRAWL_DONE, nên đóng tab ngay là an toàn, không cần đợi.
     case "CRAWL_DONE": {
+      // Ngắt mạch: nhánh in-tab (content.js) chỉ lộ dấu hiệu FB chặn ra ĐÂY
+      // (không có trong giá trị trả về của crawlGroupApiSmart, vì tab foreground
+      // resolve gần như ngay khi mở). Soi `reason` để kích hoạt cooldown auto-crawl
+      // ngay cả khi block xảy ra ở nhánh in-tab.
+      try {
+        noteCrawlDoneReason(msg && msg.result && msg.result.reason);
+      } catch (e) {}
       const tabId = sender && sender.tab && sender.tab.id;
       if (tabId == null) {
         sendResponse({ ok: true, closed: false });
@@ -760,6 +769,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         })
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true; // giữ SW sống tới khi đóng tab xong
+    }
+
+    // Dashboard hỏi trạng thái ngắt mạch (đang tạm ngưng auto-crawl do bị FB
+    // chặn hay không) để hiển thị banner cảnh báo.
+    case "GET_CRAWL_BLOCK_STATE": {
+      getCrawlBlockState()
+        .then((state) => sendResponse({ ok: true, state }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
     }
 
     // ------------------- GIÁ GROUP / TỪ KHÓA / CHIA SẺ (web backend) ------

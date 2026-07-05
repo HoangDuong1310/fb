@@ -118,6 +118,7 @@ import {
   clearAllAdvisories,
   clearAllPrices,
   clearMyStoreData,
+  loadCrawlBlockBanner,
 } from "./dashboard/views/settings.js";
 import {
   reloadGroupPrices,
@@ -607,7 +608,18 @@ chrome.runtime.onMessage.addListener((msg) => {
       setCrawlStatus(`"${name}": đã gặp đủ bài cũ liên tiếp, đang kết thúc...`, true);
     }
   }
+  if (msg.type === "CRAWL_BLOCK") {
+    // Circuit-breaker vừa bật/tắt: cập nhật banner ở tab Cài đặt nếu đang mở.
+    const active = document.querySelector(".nav-item.active");
+    if (active && active.dataset.view === "settings") loadCrawlBlockBanner();
+    return;
+  }
   if (msg.type === "CRAWL_DONE" && msg.result) {
+    // Refresh banner tạm ngưng auto-crawl nếu tab Cài đặt đang mở.
+    {
+      const active = document.querySelector(".nav-item.active");
+      if (active && active.dataset.view === "settings") loadCrawlBlockBanner();
+    }
     // Đang crawl hàng loạt (pool song song): nhả slot rồi lấp nhóm kế tiếp
     if (store.batch) {
       updateBatchStatus(`vừa xong +${msg.result.newCount} bài mới`);

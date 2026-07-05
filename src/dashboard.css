@@ -312,6 +312,15 @@ textarea { resize: vertical; line-height: 1.55; }
 .cfg-saved.flash { color: var(--green); background: var(--green-soft); border-color: var(--green); }
 .cfg-saved.flash::before { background: var(--green); }
 
+.crawl-block-banner {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 11px 13px; border-radius: 10px;
+  background: var(--amber-soft, #fff4e0); border: 1px solid var(--amber);
+  font-size: 12.5px; color: var(--ink);
+}
+.crawl-block-banner strong { display: block; margin-bottom: 2px; }
+.crawl-block-banner small { color: var(--ink-soft); }
+
 .cfg-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 13px; }
 .cfg-item { display: flex; flex-direction: column; gap: 6px; }
 .cfg-item label { font-size: 12px; font-weight: 600; color: var(--ink-soft); }

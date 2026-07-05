@@ -654,6 +654,10 @@ async function crawlGroupApiTabless(groupId, options) {
     }
 
     await flush();
+    // Ngắt mạch: bị chặn -> ghi mốc tạm ngưng (backoff); ngược lại xoá trạng thái
+    // để chu kỳ sau chạy bình thường.
+    if (blockedReason) await setCrawlBlock(blockedReason);
+    else await clearCrawlBlock();
     let reason = blockedReason
       ? blockedReason
       : newCount >= opts.maxNewPosts
@@ -1676,6 +1680,121 @@ function scheduleTickSoon() {
 
 /* -------------------- TỰ ĐỘNG CRAWL NỀN (alarms) ----------------------- */
 
+/* ------------------- NGẮT MẠCH KHI BỊ FB CHẶN (circuit-breaker) --------- */
+// Khi FB trả dấu hiệu chặn/checkpoint (429/401/403/5xx hoặc text checkpoint),
+// đó thường là giới hạn TOÀN TÀI KHOẢN — crawl tiếp nhóm khác ngay sau đó gần
+// như chắc chắn bị chặn lại, chỉ làm tăng rủi ro khoá. Vì vậy ta ghi một mốc
+// "tạm ngưng tới" (blockedUntil) vào chrome.storage.local; auto-crawl kiểm tra
+// mốc này TRƯỚC mỗi nhóm và bỏ qua toàn bộ chu kỳ khi còn trong thời gian nghỉ.
+// Backoff luỹ thừa theo số lần bị chặn liên tiếp để càng bị chặn càng nghỉ lâu.
+const CRAWL_BLOCK_KEY = "crawlBlockState";
+const CRAWL_BLOCK_BASE_MS = 30 * 60 * 1000; // nghỉ tối thiểu 30 phút
+const CRAWL_BLOCK_MAX_MS = 8 * 60 * 60 * 1000; // trần 8 giờ
+// Nếu lần chặn mới cách lần trước quá xa (2x thời gian nghỉ tối đa) thì coi như
+// đợt chặn cũ đã qua và đếm lại từ đầu, tránh cộng dồn backoff vô hạn.
+const CRAWL_BLOCK_RESET_MS = 2 * CRAWL_BLOCK_MAX_MS;
+
+/** Đọc trạng thái ngắt mạch hiện tại từ chrome.storage.local. */
+function getCrawlBlockState() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(CRAWL_BLOCK_KEY, (r) => {
+        void chrome.runtime.lastError;
+        const s = (r && r[CRAWL_BLOCK_KEY]) || {};
+        const blockedUntil = Number(s.blockedUntil) || 0;
+        resolve({
+          blocked: blockedUntil > Date.now(),
+          blockedUntil,
+          reason: s.reason || "",
+          consecutive: Number(s.consecutive) || 0,
+          since: Number(s.since) || 0,
+        });
+      });
+    } catch (e) {
+      resolve({ blocked: false, blockedUntil: 0, reason: "", consecutive: 0, since: 0 });
+    }
+  });
+}
+
+function _saveCrawlBlockState(state) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set({ [CRAWL_BLOCK_KEY]: state }, () => {
+        void chrome.runtime.lastError;
+        resolve();
+      });
+    } catch (e) {
+      resolve();
+    }
+  });
+}
+
+/**
+ * Ghi nhận một lần bị FB chặn: tăng bộ đếm liên tiếp, tính thời gian nghỉ theo
+ * backoff luỹ thừa (30' → 1h → 2h → … trần 8h) và lưu mốc blockedUntil.
+ */
+async function setCrawlBlock(reason) {
+  const now = Date.now();
+  const prev = await getCrawlBlockState();
+  // Đợt chặn cũ đã qua lâu -> đếm lại từ đầu.
+  const recent = prev.since && now - prev.since < CRAWL_BLOCK_RESET_MS;
+  const consecutive = (recent ? prev.consecutive : 0) + 1;
+  const cooldown = Math.min(
+    CRAWL_BLOCK_MAX_MS,
+    CRAWL_BLOCK_BASE_MS * Math.pow(2, consecutive - 1)
+  );
+  const state = {
+    blockedUntil: now + cooldown,
+    reason: String(reason || "FB chặn crawl."),
+    consecutive,
+    since: now,
+  };
+  await _saveCrawlBlockState(state);
+  try {
+    broadcast("CRAWL_BLOCK", { state });
+  } catch (e) {}
+  return state;
+}
+
+/** Xoá trạng thái ngắt mạch (khi một lượt crawl hoàn tất mà KHÔNG bị chặn). */
+async function clearCrawlBlock() {
+  const prev = await getCrawlBlockState();
+  if (!prev.blockedUntil && !prev.consecutive) return;
+  await _saveCrawlBlockState({ blockedUntil: 0, reason: "", consecutive: 0, since: 0 });
+}
+
+// Các cụm dấu hiệu chặn dùng chung giữa crawl.js (tabless) và content.js (in-tab)
+// khi soi chuỗi `reason` trả về qua CRAWL_DONE để kích hoạt ngắt mạch.
+const BLOCK_REASON_MARKERS = [
+  "http 429",
+  "http 401",
+  "http 403",
+  "checkpoint",
+  "để bảo vệ tài khoản",
+  "khoá tài khoản",
+  "hết hạn hoặc bị chặn",
+  "lỗi máy chủ (http 5",
+];
+
+/** true nếu chuỗi `reason` là dấu hiệu FB chặn (khớp một marker bất kỳ). */
+function isBlockReason(reason) {
+  const s = String(reason || "").toLowerCase();
+  return BLOCK_REASON_MARKERS.some((m) => s.includes(m));
+}
+
+/**
+ * Nhận `reason` từ CRAWL_DONE (kể cả nhánh in-tab qua content.js) -> nếu là dấu
+ * hiệu chặn thì kích hoạt ngắt mạch. Dùng để đóng khoảng trống nhánh in-tab
+ * (nơi block chỉ lộ ra ở message CRAWL_DONE, không có trong giá trị trả về).
+ */
+async function noteCrawlDoneReason(reason) {
+  if (isBlockReason(reason)) {
+    await setCrawlBlock(reason);
+    return true;
+  }
+  return false;
+}
+
 const AUTOCRAWL_KEY = "autoCrawlConfig";
 const AUTOCRAWL_ALARM = "autoCrawl";
 const AUTOCRAWL_DEFAULT = {
@@ -1760,6 +1879,20 @@ async function processAutoCrawl() {
   if (!cfg.enabled) return;
   _autoCrawling = true;
   try {
+    // (5) NGẮT MẠCH: nếu đang trong thời gian nghỉ do bị FB chặn ở chu kỳ trước
+    // thì bỏ qua CẢ chu kỳ này. Checkpoint/429 thường là giới hạn toàn tài khoản
+    // nên cố crawl tiếp chỉ làm tăng rủi ro khoá.
+    const blk0 = await getCrawlBlockState();
+    if (blk0.blocked) {
+      const mins = Math.ceil((blk0.blockedUntil - Date.now()) / 60000);
+      broadcast("CRAWL_DONE", {
+        result: {
+          newCount: 0,
+          reason: `Auto-crawl tạm ngưng ~${mins} phút do FB chặn: ${blk0.reason}`,
+        },
+      });
+      return;
+    }
     const groups = await DB.getGroups();
     // (4) Ngẫu nhiên thứ tự nhóm mỗi chu kỳ -> tránh mẫu "máy" crawl đúng một thứ tự.
     const order = shuffleInPlace((groups || []).slice()).filter(
@@ -1787,6 +1920,14 @@ async function processAutoCrawl() {
         const g = order[idx];
         const gid = g && (g.groupId || g.id);
         if (!gid) continue;
+        // Nhánh in-tab (API cần capture template) resolve gần NGAY khi mở tab —
+        // block thật (nếu có) chỉ lộ ra SAU, qua message CRAWL_DONE mà
+        // background.js relay vào setCrawlBlock(). Vì vậy kiểm tra lại trạng
+        // thái ngắt mạch SAU MỖI nhóm (không chỉ dựa vào giá trị trả về của
+        // crawlFn) để dừng cả chu kỳ ngay khi phát hiện block, kể cả khi nó tới
+        // từ nhóm trước đó qua đường bất đồng bộ.
+        const blk = await getCrawlBlockState();
+        if (blk.blocked) break;
         try {
           await crawlFn(gid, opts);
         } catch (e) {
@@ -2078,6 +2219,11 @@ export {
   getCrawlTabs,
   addCrawlTab,
   removeCrawlTab,
+  getCrawlBlockState,
+  setCrawlBlock,
+  clearCrawlBlock,
+  isBlockReason,
+  noteCrawlDoneReason,
   startCrawlInActiveTab,
   stopCrawlInActiveTab,
   crawlGroupInTab,
