@@ -180,20 +180,34 @@ function readJobs() {
   });
 }
 
-/** Ghi toàn bộ store job. */
+/**
+ * Ghi toàn bộ store job.
+ *
+ * QUAN TRỌNG: chrome.storage.local có hạn mức ~10MB (không có quyền
+ * "unlimitedStorage" thì KHÔNG được vượt). Khi vượt hạn mức (vd tạo hàng
+ * loạt job kèm nhiều ảnh cho nhiều nhóm), chrome.storage.local.set() vẫn gọi
+ * callback nhưng đặt chrome.runtime.lastError — nếu bỏ qua lỗi này thì lời
+ * gọi coi như "thành công" trong khi KHÔNG có gì được lưu, khiến hàng đợi
+ * trống trơn dù trước đó báo tạo việc thành công. Vì vậy PHẢI reject để lỗi
+ * lan lên tới UI (thay vì nuốt lỗi bằng `void chrome.runtime.lastError`).
+ */
 function writeJobs(store) {
   if (!hasChromeStorage()) {
     _memJobs = store;
     return Promise.resolve();
   }
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     try {
       chrome.storage.local.set({ [JOBS_KEY]: store }, () => {
-        void chrome.runtime.lastError;
+        const err = chrome.runtime.lastError;
+        if (err) {
+          reject(new Error(err.message || String(err)));
+          return;
+        }
         resolve();
       });
     } catch (e) {
-      resolve();
+      reject(e instanceof Error ? e : new Error(String(e)));
     }
   });
 }

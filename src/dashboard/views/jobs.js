@@ -288,7 +288,19 @@ function showPreview(targets, variants, origContent, fallbackInfo) {
       }
       // Tạo TOÀN BỘ job trong MỘT lần message (batch) để tránh mất SW giữa chừng.
       const res = await bg("CREATE_JOBS", { jobs: jobsToCreate });
-      const created = (res && res.ok && Array.isArray(res.jobs)) ? res.jobs.length : 0;
+      // Ghi hàng đợi vào chrome.storage.local có thể THẤT BẠI (vd vượt hạn mức
+      // khi chọn nhiều nhóm + nhiều ảnh). Trước đây lỗi bị nuốt nên vẫn "báo
+      // thành công" dù không lưu được gì -> hàng đợi trống. Nay bg trả về
+      // {ok:false} khi ghi lỗi: giữ modal + nội dung để người dùng thử lại.
+      if (!res || !res.ok) {
+        toast(
+          (res && res.error) ||
+            "Không lưu được hàng đợi (có thể do quá nhiều ảnh vượt dung lượng). Hãy bớt ảnh hoặc bớt nhóm rồi thử lại.",
+          "err"
+        );
+        return false; // KHÔNG đóng modal, KHÔNG xoá nội dung đã soạn.
+      }
+      const created = Array.isArray(res.jobs) ? res.jobs.length : 0;
       toast(
         `Đã tạo ${created}/${targets.length} việc (đang CHỜ DUYỆT). Bấm "Duyệt" để đăng.`,
         created ? "ok" : "err"
