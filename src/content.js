@@ -1101,7 +1101,23 @@
     apiRunning: false,
     // Map id -> callback chờ kết quả replay.
     replayWaiters: new Map(),
+    // Bộ đệm CUỘN các chunk response liên quan BÌNH LUẬN (tạo mới / UFI /
+    // danh sách reply). Dùng cho CAPTURE_CREATED_COMMENT (bắt id bình luận
+    // vừa đăng) và GET_COMMENT_REPLIES_API (gom reply theo cha). Giữ tối đa
+    // commentBufferMax chunk gần nhất để tránh phình bộ nhớ.
+    commentChunks: [],
+    commentCount: 0,
+    commentBufferMax: 16,
   };
+
+  // Import động gql-comments.js (bộ phân tích bình luận PURE). Cache sau lần đầu.
+  let _cmtMod = null;
+  async function loadCommentModule() {
+    if (_cmtMod) return _cmtMod;
+    const url = chrome.runtime.getURL("src/gql-comments.js");
+    _cmtMod = await import(url);
+    return _cmtMod;
+  }
 
   // Import động gql-parse.js (web_accessible_resources). Cache lại sau lần đầu.
   let _gqlMod = null;
@@ -1171,6 +1187,11 @@
     if (d.__FBC_GQL === 1) {
       try {
         const mod = await loadGqlModule();
+        // Nạp thêm bộ phân tích bình luận (để nhận diện & đệm gói comment).
+        let mod2 = null;
+        try {
+          mod2 = await loadCommentModule();
+        } catch (_) {}
         const req = mod.parseGqlRequestBody(d.reqBody);
         if (mod.isGroupFeedRequest(req.friendly, req.variables)) {
           apiSniff.feedCount += 1;
@@ -1207,6 +1228,24 @@
             `[API] bắt feed nhóm #${apiSniff.feedCount}` +
               ` | friendly=${req.friendly} doc_id=${req.doc_id}`
           );
+        } else if (
+          mod2 &&
+          mod2.isCommentRequest(req.friendly, req.raw || d.reqBody)
+        ) {
+          // Gói liên quan BÌNH LUẬN (tạo mới / UFI / list reply) => đệm CUỘN
+          // để CAPTURE_CREATED_COMMENT & GET_COMMENT_REPLIES_API dùng lại.
+          apiSniff.commentCount += 1;
+          const chunks = Array.isArray(d.chunks) ? d.chunks : [];
+          if (chunks.length) {
+            apiSniff.commentChunks.push(...chunks);
+            // Giữ cửa sổ cuộn, tránh phình bộ nhớ tab dài phiên.
+            const overflow = apiSniff.commentChunks.length - apiSniff.commentBufferMax;
+            if (overflow > 0) apiSniff.commentChunks.splice(0, overflow);
+          }
+          dlog(
+            `[API] bắt gói bình luận #${apiSniff.commentCount}` +
+              ` | friendly=${req.friendly} chunks=${chunks.length}`
+          );
         }
       } catch (e) {}
       return;
@@ -1217,7 +1256,13 @@
       const cb = apiSniff.replayWaiters.get(d.id);
       if (cb) {
         apiSniff.replayWaiters.delete(d.id);
-        cb({ ok: !!d.ok, chunks: d.chunks || [], error: d.error });
+        cb({
+          ok: !!d.ok,
+          status: d.status,
+          chunks: d.chunks || [],
+          blockText: d.blockText,
+          error: d.error,
+        });
       }
       return;
     }
@@ -1504,6 +1549,82 @@
         sendResponse({ ok: true, html: buildCleanSample(article), postId, permalink });
       })();
       return true; // giữ kênh mở cho phản hồi bất đồng bộ
+    }
+
+    // Bắt ĐÚNG bình luận VỪA ĐĂNG của ta qua API (thay cho dò text mờ ở DOM).
+    // Dùng bộ đệm gói comment (mutation create thường bắn ngay khi đăng). Chờ
+    // ngắn + kéo lại gói đã đệm để chắc có response create.
+    if (msg.type === "CAPTURE_CREATED_COMMENT") {
+      (async () => {
+        try {
+          const cmt = await loadCommentModule();
+          const me = {
+            text: msg.text || "",
+            authorId: msg.authorId || "",
+            authorName: msg.authorName || "",
+          };
+          // Chờ tối đa ~4s để response create bắn ra (đăng xong FB gọi mutation).
+          const deadline = Date.now() + 4000;
+          let found = null;
+          while (Date.now() < deadline) {
+            pullBufferedGql();
+            await sleep(500);
+            if (apiSniff.commentChunks.length) {
+              found = cmt.findCreatedComment(apiSniff.commentChunks, me);
+              if (found && found.legacyId) break;
+            }
+          }
+          if (found && (found.legacyId || found.gqlId)) {
+            sendResponse({
+              ok: true,
+              commentId: found.legacyId || found.gqlId,
+              legacyId: found.legacyId || null,
+              gqlId: found.gqlId || null,
+              text: found.text || me.text,
+              authorId: found.authorId || null,
+              authorName: found.authorName || null,
+              createdTime: found.createdTime || null,
+            });
+          } else {
+            sendResponse({ ok: false, error: "Chưa bắt được bình luận vừa đăng qua API." });
+          }
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e) });
+        }
+      })();
+      return true; // async
+    }
+
+    // Gom reply ĐÚNG bình luận cha (parentLegacyId) qua API, kèm cờ mine theo
+    // authorId. Dùng bộ đệm gói comment (UFI/list reply được sniff khi mở bài).
+    if (msg.type === "GET_COMMENT_REPLIES_API") {
+      (async () => {
+        try {
+          const cmt = await loadCommentModule();
+          const me = { authorId: msg.authorId || "", authorName: msg.authorName || "" };
+          const pid = String(msg.parentLegacyId || "");
+          // Kéo lại gói đã đệm + chờ ngắn để FB nạp danh sách bình luận.
+          const deadline = Date.now() + 3500;
+          let res = { parentText: "", parentAuthor: "", replies: [] };
+          while (Date.now() < deadline) {
+            pullBufferedGql();
+            await sleep(500);
+            if (apiSniff.commentChunks.length) {
+              res = cmt.extractRepliesForParent(apiSniff.commentChunks, pid, me);
+              if (res.replies.length) break;
+            }
+          }
+          sendResponse({
+            ok: true,
+            parentText: res.parentText,
+            parentAuthor: res.parentAuthor,
+            replies: res.replies,
+          });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e) });
+        }
+      })();
+      return true; // async
     }
 
     if (msg.type === "PING") {

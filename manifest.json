@@ -46,7 +46,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["src/gql-parse.js"],
+      "resources": ["src/gql-parse.js", "src/gql-comments.js"],
       "matches": [
         "https://www.facebook.com/*",
         "https://web.facebook.com/*"

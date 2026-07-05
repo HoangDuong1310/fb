@@ -1187,6 +1187,7 @@ async function executeCommentJob(job) {
   const url = job.targetUrl;
   if (!url) return { ok: false, error: "Thiếu link bài viết để bình luận." };
   const images = Array.isArray(job.images) ? job.images : [];
+  const meta = job.meta || {};
   // CHẠY NGẦM: mở tab ở NỀN (active:false) để KHÔNG chiếm màn hình người dùng;
   // waitTabComplete chỉ nghe tabs.onUpdated nên không cần tab active. Đóng tab
   // sau khi xong để không để lại tab rác.
@@ -1194,18 +1195,48 @@ async function executeCommentJob(job) {
   await waitTabComplete(tab.id, 30000);
   await sleep(3500);
   let res;
+  let out = { ok: false, error: "Không có kết quả." };
   try {
     res = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: runCommentInPage,
       args: [job.content || "", images],
     });
+    out = (res && res[0] && res[0].result) || out;
+
+    // ƯU TIÊN API: sau khi đăng, FB bắn mutation tạo bình luận -> fb-api-hook
+    // đệm lại, content.js bắt được id SỐ CHÍNH XÁC của bình luận vừa đăng (khớp
+    // text + tác giả). Bền hơn nhiều so dò text mờ ở DOM (runCommentInPage chỉ
+    // là fallback). Nếu API bắt được thì GHI ĐÈ commentId/commentUrl.
+    if (out && out.ok) {
+      try {
+        const cap = await chrome.tabs.sendMessage(tab.id, {
+          type: "CAPTURE_CREATED_COMMENT",
+          text: job.content || "",
+          authorId: meta.myAuthorId || "",
+          authorName: meta.myAuthorName || "",
+        });
+        if (cap && cap.ok && cap.commentId) {
+          out.commentId = cap.commentId;
+          out.commentIdSource = "api";
+          // Dựng permalink theo comment_id để khâu theo dõi reply mở đúng chỗ.
+          if (!out.commentUrl) {
+            try {
+              const u = new URL(url);
+              out.commentUrl = u.origin + u.pathname + "?comment_id=" + cap.commentId;
+            } catch (_) {}
+          }
+        }
+      } catch (_) {
+        // content.js chưa sẵn sàng / không có gói API -> giữ kết quả DOM.
+      }
+    }
   } catch (e) {
     return { ok: false, error: "Lỗi chạy script bình luận: " + String(e) };
   } finally {
     try { await chrome.tabs.remove(tab.id); } catch (e) {}
   }
-  return (res && res[0] && res[0].result) || { ok: false, error: "Không có kết quả." };
+  return out;
 }
 
 /* ----------- THEO DÕI REPLY DƯỚI BÌNH LUẬN CỦA TA --------------------- */
@@ -1478,11 +1509,45 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
 async function executeWatchReplies(conv) {
   const url = conv.myCommentUrl || conv.postUrl;
   if (!url) return { ok: false, error: "Thiếu link để theo dõi reply." };
+  const meta = conv.meta || {};
   const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
   await waitTabComplete(tab.id, 30000);
   await sleep(3500);
   let res;
   try {
+    // ƯU TIÊN API: khi mở bài, FB sniff các gói UFI/list-reply -> fb-api-hook
+    // đệm lại. content.js gom reply ĐÚNG bình luận cha (parentLegacyId) kèm cờ
+    // `mine` theo authorId -> chuẩn hơn dò anchor DOM. Chỉ dùng khi đã biết
+    // comment_id của ta (commentId). Nếu API ra reply thì dùng luôn; nếu không
+    // có (chưa biết id / gói chưa sniff kịp) thì rơi xuống DOM fallback.
+    if (conv.commentId) {
+      try {
+        const api = await chrome.tabs.sendMessage(tab.id, {
+          type: "GET_COMMENT_REPLIES_API",
+          parentLegacyId: conv.commentId,
+          authorId: meta.myAuthorId || "",
+          authorName: meta.myAuthorName || "",
+        });
+        if (api && api.ok && Array.isArray(api.replies) && api.replies.length) {
+          return {
+            ok: true,
+            replies: api.replies.map((r) => ({
+              id: r.id,
+              author: r.author,
+              text: r.text,
+              mine: !!r.mine,
+            })),
+            parentId: conv.commentId,
+            myAuthor: api.parentAuthor || "",
+            myRootText: api.parentText || "",
+            repliesSource: "api",
+          };
+        }
+      } catch (_) {
+        // content.js chưa sẵn sàng / không có gói API -> dùng DOM fallback.
+      }
+    }
+
     res = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: runWatchRepliesInPage,
