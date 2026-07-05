@@ -31,7 +31,7 @@ import {
   seedPriceSources,
 } from "./prices.js";
 import { listSheetTabs, previewSheet, importSheetTabs } from "./sheets.js";
-import { discoverSelectors, buildConfigWithAI, listModels, spinPostContent, generateProfileSkill } from "./ai.js";
+import { discoverSelectors, listModels, spinPostContent, generateProfileSkill } from "./ai.js";
 import { clearProfileCache } from "./prompts.js";
 import {
   generateAdvisories,
@@ -148,7 +148,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "GET_ALL_POSTS": {
-      DB.getAllPosts(msg.groupId, msg.mine)
+      DB.getAllPosts(msg.groupId)
         .then((posts) => sendResponse({ ok: true, posts }))
         .catch((err) => sendResponse({ ok: false, error: String(err) }));
       return true;
@@ -426,14 +426,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "IMPORT_SHEET": {
       importSheetTabs(msg.spreadsheetId, msg.tabs || [])
         .then((r) => sendResponse({ ok: true, ...r }))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
-      return true;
-    }
-
-    // ---- Build cấu hình PC bằng AI --------------------------------------
-    case "BUILD_CONFIG": {
-      buildConfigWithAI(msg.payload || {})
-        .then((r) => sendResponse(r))
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
@@ -775,14 +767,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Backend trả JSON KHÔNG bọc {ok}, nên ta tự gắn ok:true + trộn dữ liệu.
     // 401 -> apiFetch tự kích hoạt luồng AUTH_REQUIRED; ở đây trả ok:false.
 
-    // Danh sách dòng giá group đã trích (lọc chia sẻ phía server theo người gọi).
-    // filters.mineOnly = 1 -> chỉ của tôi; mặc định gồm cả dòng người khác chia sẻ.
+    // Danh sách dòng giá group đã trích. Dữ liệu này riêng tư theo tài khoản:
+    // server chỉ trả về dòng do chính người dùng hiện tại crawl/trích.
     case "GET_GROUP_PRICES": {
       (async () => {
         await readyPromise;
         const f = (msg.filters && typeof msg.filters === "object") ? msg.filters : {};
         const qs = new URLSearchParams();
-        if (f.mineOnly) qs.set("mineOnly", "1");
         if (f.groupId) qs.set("groupId", String(f.groupId));
         if (f.category) qs.set("category", String(f.category));
         if (f.condition) qs.set("condition", String(f.condition));
@@ -856,29 +847,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           method: "DELETE",
         });
         sendResponse({ ok: true });
-      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
-      return true;
-    }
-
-    // Ba công tắc chia sẻ tổng của người gọi.
-    case "GET_SHARE_PREFS": {
-      (async () => {
-        await readyPromise;
-        const data = await API.apiFetch("/api/me/share-prefs");
-        sendResponse({ ok: true, ...(data || {}) });
-      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
-      return true;
-    }
-
-    // Đổi một/nhiều công tắc chia sẻ (backend cascade xuống dòng hiện có).
-    case "SET_SHARE_PREFS": {
-      (async () => {
-        await readyPromise;
-        const data = await API.apiFetch("/api/me/share-prefs", {
-          method: "PATCH",
-          body: JSON.stringify(msg.patch || {}),
-        });
-        sendResponse({ ok: true, ...(data || {}) });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }

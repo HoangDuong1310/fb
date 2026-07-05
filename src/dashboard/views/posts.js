@@ -23,18 +23,7 @@ import {
 
 /* =============================== BÀI VIẾT ============================== */
 
-/** Lấy userId của người dùng hiện tại từ SW (cần cho ownership badge).
- * Gọi một lần; kết quả cache vào store.currentUserId. */
-async function ensureCurrentUserId() {
-  if (store.currentUserId !== undefined) return;
-  const res = await bg("AUTH_STATE");
-  store.currentUserId = (res && res.userId) || null;
-}
-
 export async function loadPosts() {
-  // Đảm bảo có userId để so sánh ownership khi render card.
-  await ensureCurrentUserId();
-
   const sel = $("postsGroupFilter");
   // Khôi phục bộ lọc nhóm đã lưu (lần đầu vào tab, khi select còn rỗng).
   if (sel && !sel.value) {
@@ -45,34 +34,11 @@ export async function loadPosts() {
   store.postsGroupId = groupId;
   saveUIPref("postsGroupId", groupId);
 
-  // Khôi phục trạng thái mine-only từ prefs.
-  if (store.postsMineOnly == null) {
-    store.postsMineOnly = !!uiPref("postsMineOnly", false);
-  }
-  _syncMineBtn();
-
-  const res = await bg("GET_ALL_POSTS", {
-    groupId,
-    mine: store.postsMineOnly ? 1 : undefined,
-  });
+  // Dữ liệu bài viết là riêng tư theo tài khoản: backend chỉ trả bài của chính
+  // người dùng hiện tại nên không còn cờ "chỉ của tôi".
+  const res = await bg("GET_ALL_POSTS", { groupId });
   store.posts = (res && res.posts) || [];
   renderPosts();
-}
-
-/** Đồng bộ trạng thái active của nút mine-only với store. */
-function _syncMineBtn() {
-  const btn = $("btnMineOnly");
-  if (!btn) return;
-  btn.classList.toggle("active", !!store.postsMineOnly);
-  btn.textContent = store.postsMineOnly ? "✓ Chỉ của tôi" : "Chỉ của tôi";
-}
-
-/** Bật/tắt chế độ chỉ hiển thị bài của chính mình rồi reload. */
-export async function toggleMineOnly() {
-  store.postsMineOnly = !store.postsMineOnly;
-  saveUIPref("postsMineOnly", store.postsMineOnly);
-  _syncMineBtn();
-  await loadPosts();
 }
 
 // Chế độ lọc thông minh hiện tại: all | lead | buy | support.
@@ -148,7 +114,6 @@ export function renderPosts() {
     );
     return;
   }
-  const myId = store.currentUserId || null;
   wrap.innerHTML = list
     .map((p) => {
       const imgs = p.images || [];
@@ -167,13 +132,6 @@ export function renderPosts() {
         lead.label !== "other"
           ? `<span class="lead-badge ${LEAD_META[lead.label].cls}">${LEAD_META[lead.label].text}</span>`
           : "";
-      // Badge quyền sở hữu: phân biệt bài của mình / bài người khác chia sẻ.
-      const isOwn = myId && String(p.crawledBy) === String(myId);
-      const ownerBadge = p.crawledBy != null
-        ? (isOwn
-            ? `<span class="lead-badge mine-badge">của tôi</span>`
-            : `<span class="lead-badge share-badge">chia sẻ</span>`)
-        : "";
       const links = (p.links || []).length
         ? `<div class="pc-links">${(p.links || [])
             .slice(0, 3)
@@ -187,7 +145,7 @@ export function renderPosts() {
         <div class="pc-head">
           ${av}
           <div class="pc-id">
-            <span class="pc-author">${esc(author)}${leadBadge}${ownerBadge}</span>
+            <span class="pc-author">${esc(author)}${leadBadge}</span>
             <span class="pc-sub">${esc(p.timeText || timeAgo(p.timestamp || p.crawledAt) || "Không rõ thời gian")} · ${esc(p.groupName || p.groupId || "")}</span>
           </div>
         </div>
@@ -235,12 +193,8 @@ export async function loadPostComments(postId, containerEl) {
   }
   containerEl.innerHTML = comments
     .map((c) => {
-      const who = c.shareCommented
-        ? `<span class="lead-badge share-badge">chia sẻ</span>`
-        : `<span class="lead-badge mine-badge">của tôi</span>`;
       const when = c.commentedAt ? timeAgo(c.commentedAt) : "";
       return `<div class="pc-cmt-row">
-        ${who}
         <span class="pc-cmt-time">${esc(when)}</span>
         <span class="pc-cmt-text">${esc(c.content || "(không có nội dung)")}</span>
       </div>`;

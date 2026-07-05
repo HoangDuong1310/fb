@@ -50,7 +50,6 @@ import {
   analyzePostUI,
   applyLeadMode,
   suggestKeywordsUI,
-  toggleMineOnly,
   loadPostComments,
 } from "./dashboard/views/posts.js";
 import { loadLeadKeywords } from "./dashboard/leadfilter.js";
@@ -89,11 +88,6 @@ import {
   compareMine,
 } from "./dashboard/views/mystore.js";
 import {
-  buildAI,
-  syncBuildBudget,
-  runBuildConfig,
-} from "./dashboard/views/build.js";
-import {
   advisoryStore,
   syncAdvTabs,
   reloadAdvisories,
@@ -127,9 +121,7 @@ import {
 import {
   reloadGroupPrices,
   applyGroupPriceFilter,
-  setGroupPriceMine,
   runExtraction,
-  explainShareIcon,
 } from "./dashboard/views/groupprices.js";
 import {
   reloadKeywords,
@@ -138,7 +130,6 @@ import {
   deleteKeyword,
   switchKeywordType,
 } from "./dashboard/views/keywords.js";
-import { loadSharingView, saveSharePref } from "./dashboard/views/sharing.js";
 import { loadProfilesView, onProfileAction } from "./dashboard/views/profiles.js";
 import { switchRcTab } from "./dashboard/views/remote-commands.js";
 
@@ -213,8 +204,6 @@ function bindEvents() {
     });
   if ($("btnSuggestKeywords"))
     $("btnSuggestKeywords").addEventListener("click", suggestKeywordsUI);
-  if ($("btnMineOnly"))
-    $("btnMineOnly").addEventListener("click", toggleMineOnly);
   $("btnExportJson").addEventListener("click", () => exportPosts("json"));
   $("btnExportCsv").addEventListener("click", () => exportPosts("csv"));
   $("btnClearPosts").addEventListener("click", clearGroupPosts);
@@ -368,36 +357,6 @@ function bindEvents() {
       if (btn) compareMine(btn.dataset.cmp);
     });
 
-  // Build cấu hình bằng AI
-  if ($("buildBudget"))
-    $("buildBudget").addEventListener("input", () => syncBuildBudget(false));
-  if ($("buildBudgetRange"))
-    $("buildBudgetRange").addEventListener("input", () => syncBuildBudget(true));
-  if ($("buildNeeds"))
-    $("buildNeeds").addEventListener("click", (e) => {
-      const btn = e.target.closest("[data-need]");
-      if (!btn) return;
-      const key = btn.dataset.need;
-      if (buildAI.needs.has(key)) buildAI.needs.delete(key);
-      else buildAI.needs.add(key);
-      btn.classList.toggle("active", buildAI.needs.has(key));
-    });
-  // Dùng sự kiện "change" của checkbox: chỉ bắn 1 lần với trạng thái cuối cùng,
-  // tránh double-toggle khi click trúng label (label tự lật checkbox bên trong).
-  if ($("buildCats"))
-    $("buildCats").addEventListener("change", (e) => {
-      const cb = e.target.closest("input[type=checkbox]");
-      if (!cb) return;
-      const label = cb.closest("label[data-cat]");
-      if (!label) return;
-      const cat = label.dataset.cat;
-      if (cb.checked) buildAI.selected.add(cat);
-      else buildAI.selected.delete(cat);
-      label.classList.toggle("on", cb.checked);
-    });
-  if ($("btnBuildConfig"))
-    $("btnBuildConfig").addEventListener("click", runBuildConfig);
-
   // Tư vấn AI
   if ($("btnGenAdvisories"))
     $("btnGenAdvisories").addEventListener("click", genAdvisories);
@@ -470,7 +429,7 @@ function bindEvents() {
   if ($("setClearAdvisories"))
     $("setClearAdvisories").addEventListener("click", clearAllAdvisories);
 
-  // Giá Group: trích xuất, lọc, toggle "Chỉ của tôi", icon chia sẻ (read-only).
+  // Giá Group: trích xuất, lọc.
   if ($("btnExtractPrices"))
     $("btnExtractPrices").addEventListener("click", runExtraction);
   if ($("gpGroupFilter"))
@@ -483,17 +442,6 @@ function bindEvents() {
     $("gpPriceMin").addEventListener("input", applyGroupPriceFilter);
   if ($("gpPriceMax"))
     $("gpPriceMax").addEventListener("input", applyGroupPriceFilter);
-  if ($("gpMineToggle"))
-    $("gpMineToggle").addEventListener("click", (e) => {
-      const btn = e.target.closest("[data-mine]");
-      if (!btn) return;
-      setGroupPriceMine(btn.dataset.mine === "1");
-    });
-  if ($("groupPriceList"))
-    $("groupPriceList").addEventListener("click", (e) => {
-      // Icon 🌐/🔒 chỉ hiển thị trạng thái — bấm thì nhắc chỗ chỉnh chia sẻ.
-      if (e.target.closest("[data-share-info]")) explainShareIcon();
-    });
 
   // Từ khóa học: thêm thủ công + bật/tắt + xóa (event delegation trên bảng).
   if ($("btnAddKeyword"))
@@ -522,11 +470,6 @@ function bindEvents() {
       const btn = e.target.closest("button[data-kwtype]");
       if (btn) switchKeywordType(btn.dataset.kwtype);
     });
-
-  // Cài đặt chia sẻ: mỗi công tắc lưu riêng khi đổi.
-  ["shareCrawled", "shareCommented", "shareGroupPrices"].forEach((id) => {
-    if ($(id)) $(id).addEventListener("change", () => saveSharePref(id));
-  });
 
   // Hồ sơ ngành: 1 delegation cho cả section (nút dùng data-act).
   const profilesView = document.querySelector('.view[data-view="profiles"]');
@@ -709,13 +652,6 @@ chrome.runtime.onMessage.addListener((msg) => {
       );
     }
   }
-  if (msg.type === "BUILD_PROGRESS") {
-    // Cập nhật dòng chữ tiến trình trong khung loading (nếu đang build).
-    if (buildAI.running) {
-      const el = $("buildProgressText");
-      if (el && msg.text) el.textContent = msg.text;
-    }
-  }
   if (msg.type === "JOB_UPDATE") {
     const active = document.querySelector(".nav-item.active");
     if (active && active.dataset.view === "autopost") loadJobs("post");
@@ -733,7 +669,6 @@ chrome.runtime.onMessage.addListener((msg) => {
     const view = active && active.dataset.view;
     if (view === "groupprices") reloadGroupPrices();
     else if (view === "keywords") reloadKeywords();
-    else if (view === "sharing") loadSharingView();
     else if (view === "profiles") loadProfilesView();
   }
 });

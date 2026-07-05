@@ -70,10 +70,6 @@
             <svg viewBox="0 0 24 24"><path d="M4 4h16v2H4V4zm0 4h16l-1 12H5L4 8zm5 3v6h2v-6H9zm4 0v6h2v-6h-2z"/></svg>
             <span>Kho của tôi</span>
           </button>
-          <button class="nav-item" data-view="build">
-            <svg viewBox="0 0 24 24"><path d="M22 9 12 2 2 9l10 7 10-7zm-10 9.5L4 12.7V15l8 5.8 8-5.8v-2.3l-8 5.8z"/></svg>
-            <span>Build AI</span>
-          </button>
           <button class="nav-item" data-view="sources">
             <svg viewBox="0 0 24 24"><path d="M4 6c0-1.1 3.58-2 8-2s8 .9 8 2-3.58 2-8 2-8-.9-8-2zm0 5c0 1.1 3.58 2 8 2s8-.9 8-2V7.5c0 1.1-3.58 2-8 2s-8-.9-8-2V11zm0 5c0 1.1 3.58 2 8 2s8-.9 8-2v-3.5c0 1.1-3.58 2-8 2s-8-.9-8-2V16z"/></svg>
             <span>Nguồn dữ liệu</span>
@@ -83,10 +79,6 @@
           <button class="nav-item" data-view="keywords">
             <svg viewBox="0 0 24 24"><path d="M12.65 10A5.99 5.99 0 0 0 7 6c-3.31 0-6 2.69-6 6s2.69 6 6 6a5.99 5.99 0 0 0 5.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>
             <span>Từ khóa học</span>
-          </button>
-          <button class="nav-item" data-view="sharing">
-            <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>
-            <span>Cài đặt chia sẻ</span>
           </button>
           <button class="nav-item" data-view="profiles">
             <svg viewBox="0 0 24 24"><path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/></svg>
@@ -210,7 +202,6 @@
               <button type="button" data-lead="buy">Cần mua</button>
               <button type="button" data-lead="support">Cần hỗ trợ</button>
             </div>
-            <button id="btnMineOnly" class="btn ghost" title="Chỉ hiển thị bài do chính bạn crawl (ẩn dữ liệu người khác chia sẻ)">Chỉ của tôi</button>
             <div class="spacer"></div>
             <button id="btnSuggestKeywords" class="btn ghost" title="Quét kho bài đã crawl để gợi ý từ khoá lọc mới">💡 Gợi ý từ khoá</button>
           </div>
@@ -401,57 +392,6 @@
           </div>
         </section>
 
-        <!-- ============ BUILD AI ============ -->
-        <section class="view" data-view="build">
-          <div class="build-grid">
-            <!-- Cột trái: form yêu cầu -->
-            <div class="panel build-form">
-              <div class="panel-head"><h2>Yêu cầu của khách</h2></div>
-              <div class="build-body">
-                <label class="field">
-                  <span>Ngân sách (₫)</span>
-                  <input id="buildBudget" type="text" inputmode="numeric" placeholder="VD: 25.000.000" />
-                </label>
-                <input id="buildBudgetRange" type="range" min="5000000" max="100000000" step="500000" value="25000000" class="build-range" />
-                <div class="build-budget-readout"><span id="buildBudgetText">25.000.000₫</span></div>
-
-                <span class="build-label">Nhu cầu sử dụng</span>
-                <div id="buildNeeds" class="build-chips">
-                  <button type="button" data-need="gaming" class="active">Gaming</button>
-                  <button type="button" data-need="office">Văn phòng</button>
-                  <button type="button" data-need="design">Đồ hoạ</button>
-                  <button type="button" data-need="stream">Stream</button>
-                  <button type="button" data-need="render">Render/AI</button>
-                </div>
-
-                <label class="field">
-                  <span>Mô tả thêm (tuỳ chọn)</span>
-                  <textarea id="buildNote" rows="2" placeholder="VD: ưu tiên VGA mạnh, chơi game AAA 2K, yên tĩnh..."></textarea>
-                </label>
-
-                <span class="build-label">Linh kiện cần có</span>
-                <div id="buildCats" class="build-cats"></div>
-
-                <label class="switch-row" for="buildOwnedOnly">
-                  <input id="buildOwnedOnly" type="checkbox" />
-                  <span class="switch-text"><strong>Chỉ dùng hàng trong kho</strong><small>Bỏ qua linh kiện chỉ có ở cửa hàng khác</small></span>
-                </label>
-
-                <button id="btnBuildConfig" class="btn primary block">Tạo cấu hình</button>
-              </div>
-            </div>
-
-            <!-- Cột phải: kết quả -->
-            <div class="panel build-result">
-              <div class="panel-head">
-                <h2>Cấu hình đề xuất</h2>
-                <span id="buildSrcBadge" class="build-src-badge" hidden></span>
-              </div>
-              <div id="buildOutput" class="build-output"></div>
-            </div>
-          </div>
-        </section>
-
         <!-- ============ TƯ VẤN AI (CHÀO GIÁ / HỖ TRỢ KH) ============ -->
         <section class="view" data-view="advisory">
           <div class="panel">
@@ -568,14 +508,9 @@
                 <span>Giá đến</span>
                 <input id="gpPriceMax" type="number" min="0" step="1000" placeholder="∞" />
               </label>
-              <div class="seg" id="gpMineToggle">
-                <button class="seg-btn active" data-mine="0">Tất cả (chung)</button>
-                <button class="seg-btn" data-mine="1">Chỉ của tôi</button>
-              </div>
             </div>
             <p class="hint">
               Giá được AI trích từ các bài rao bán đã crawl, gom theo sản phẩm và sắp xếp thấp→cao.
-              Icon 🌐/🔒 chỉ hiển thị trạng thái chia sẻ — chỉnh ở tab "Cài đặt chia sẻ".
             </p>
             <div id="groupPriceList" class="gp-list"></div>
           </div>
@@ -609,34 +544,6 @@
               (gắn nhãn "mới bởi AI") trong lúc trích xuất; bạn có thể bật/tắt hoặc xóa.
             </p>
             <div id="keywordList" class="kw-list"></div>
-          </div>
-        </section>
-
-        <!-- ============ CÀI ĐẶT CHIA SẺ ============ -->
-        <section class="view" data-view="sharing">
-          <div class="panel">
-            <div class="panel-head">
-              <h2>Cài đặt chia sẻ</h2>
-            </div>
-            <p id="sharingAuthHint" class="hint" hidden></p>
-            <div class="form">
-              <label class="switch-row" for="shareCrawled">
-                <input type="checkbox" id="shareCrawled" />
-                <span class="switch-text"><b>Chia sẻ bài đã crawl</b><small>Cho người dùng khác xem các bài bạn đã crawl được. Tắt để giữ riêng tư.</small></span>
-              </label>
-              <label class="switch-row" for="shareCommented">
-                <input type="checkbox" id="shareCommented" />
-                <span class="switch-text"><b>Chia sẻ bài/bình luận của tôi</b><small>Cho người khác xem các bài và bình luận do bạn tạo. Tắt để giữ riêng tư.</small></span>
-              </label>
-              <label class="switch-row" for="shareGroupPrices">
-                <input type="checkbox" id="shareGroupPrices" />
-                <span class="switch-text"><b>Chia sẻ giá trích từ group</b><small>Đóng góp dòng giá bạn trích được vào mặt bằng giá chung. Tắt để giữ riêng tư.</small></span>
-              </label>
-            </div>
-            <p class="hint">
-              Mỗi công tắc khi đổi sẽ áp dụng cho CẢ dữ liệu hiện có (không chỉ dữ liệu mới).
-              Đây là nơi duy nhất chỉnh chế độ chia sẻ.
-            </p>
           </div>
         </section>
 

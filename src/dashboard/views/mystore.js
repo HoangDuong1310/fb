@@ -9,8 +9,8 @@ import {
   productSignature,
   tokensSubset,
   isModelCode,
+  canonCat,
 } from "./products.js";
-import { canonCat } from "./build.js";
 
 // State riêng cho view "Kho của tôi" (sản phẩm tự nhập từ Google Sheet).
 export const myStore = {

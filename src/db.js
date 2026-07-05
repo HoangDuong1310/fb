@@ -64,16 +64,15 @@ async function getKnownIds(groupId) {
 }
 
 /** Lấy toàn bộ bài viết (tùy chọn lọc theo nhóm). Trả về MẢNG (server sort sẵn).
- * mine=true => chỉ lấy bài DO CHÍNH user crawl (không kéo data người khác chia sẻ). */
-async function getAllPosts(groupId, mine) {
-  const body = await apiFetch(
-    "/api/posts" + qs({ groupId, mine: mine ? 1 : undefined })
-  );
+ * Dữ liệu bài viết là RIÊNG TƯ theo tài khoản: server chỉ trả bài do chính
+ * người dùng hiện tại crawl. */
+async function getAllPosts(groupId) {
+  const body = await apiFetch("/api/posts" + qs({ groupId }));
   return Array.isArray(body?.posts) ? body.posts : [];
 }
 
 /** Lấy lịch sử bình luận của MỘT bài viết (ai đã comment, nội dung gì) để AI
- * tránh trùng lặp. Trả về MẢNG [{id, postId, userId, content, commentedAt, shareCommented}]. */
+ * tránh trùng lặp. Trả về MẢNG [{id, postId, userId, content, commentedAt}]. */
 async function getPostComments(postId) {
   if (!postId) return [];
   const body = await apiFetch(

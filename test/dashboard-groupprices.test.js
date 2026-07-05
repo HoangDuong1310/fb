@@ -87,9 +87,9 @@ test("groupByProduct: danh sách rỗng -> mảng rỗng", () => {
 /* ------------------------------- filterRows ------------------------------ */
 
 const SAMPLE = [
-  { id: 1, name: "A", price: 1000000, groupId: "g1", category: "VGA", condition: "mới", crawledByMe: true },
-  { id: 2, name: "B", price: 5000000, groupId: "g2", category: "CPU", condition: "cũ", crawledByMe: false },
-  { id: 3, name: "C", price: 3000000, groupId: "g1", category: "VGA", condition: "likenew", crawledByMe: false },
+  { id: 1, name: "A", price: 1000000, groupId: "g1", category: "VGA", condition: "mới" },
+  { id: 2, name: "B", price: 5000000, groupId: "g2", category: "CPU", condition: "cũ" },
+  { id: 3, name: "C", price: 3000000, groupId: "g1", category: "VGA", condition: "likenew" },
 ];
 
 test("filterRows: không filter -> trả nguyên danh sách", () => {
@@ -114,11 +114,6 @@ test("filterRows: lọc theo condition", () => {
 test("filterRows: lọc theo khoảng giá priceMin/priceMax", () => {
   const out = filterRows(SAMPLE, { priceMin: 2000000, priceMax: 4000000 });
   assert.deepEqual(out.map((r) => r.id), [3]);
-});
-
-test("filterRows: mineOnly chỉ giữ dòng của tôi (crawledByMe)", () => {
-  const out = filterRows(SAMPLE, { mineOnly: true });
-  assert.deepEqual(out.map((r) => r.id), [1]);
 });
 
 test("filterRows: kết hợp nhiều điều kiện", () => {

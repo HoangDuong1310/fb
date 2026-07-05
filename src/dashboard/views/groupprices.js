@@ -1,8 +1,11 @@
 /**
  * groupprices.js — View "Giá Group": hiển thị mặt bằng giá đã TRÍCH từ bài rao
  * bán trong các nhóm (group_prices ở web backend). Gom theo sản phẩm để thấy
- * ngay dải giá thấp→cao, kèm bộ lọc nhóm/loại/khoảng giá/tình trạng và công
- * tắc "Tất cả (chung) / Chỉ của tôi".
+ * ngay dải giá thấp→cao, kèm bộ lọc nhóm/loại/khoảng giá/tình trạng.
+ *
+ * Dữ liệu này là RIÊNG TƯ theo tài khoản: backend chỉ trả về các dòng giá do
+ * chính người dùng hiện tại crawl/trích, nên không còn khái niệm "chung" vs
+ * "chỉ của tôi" hay icon chia sẻ.
  *
  * Đường dữ liệu: dashboard KHÔNG gọi HTTP API trực tiếp (JWT nằm ở service
  * worker). Mọi dữ liệu đi qua bg() -> message handler ở background.js -> gọi
@@ -10,12 +13,6 @@
  *   - GET_GROUP_PRICES  { filters } -> { ok, groupPrices }
  *   - RUN_GROUP_PRICE_EXTRACTION    -> { ok, processed, inserted, newKeywords }
  *   - GET_GROUPS (đã có sẵn)        -> để dựng dropdown lọc theo nhóm.
- *
- * GHI CHÚ icon chia sẻ mỗi thẻ (🌐/🔒): backend KHÔNG có endpoint bật/tắt chia
- * sẻ theo từng dòng — việc chia sẻ do BA công tắc tổng ở "Cài đặt chia sẻ" điều
- * khiển (cascade xuống mọi dòng). Vì vậy icon ở đây chỉ HIỂN THỊ trạng thái
- * `shareGroupPrices` của dòng (read-only); bấm vào chỉ nhắc người dùng chỉnh ở
- * tab "Cài đặt chia sẻ". KHÔNG bịa endpoint mới.
  *
  * KIỂM THỬ ĐƯỢC: normalizeProductKey / groupByProduct / filterRows là hàm THUẦN
  * (không đụng DOM, không network) nên test bằng node --test (xem
@@ -26,9 +23,8 @@ import { fmtPrice } from "./products.js";
 
 // State riêng cho view.
 export const groupPriceStore = {
-  rows: [],        // toàn bộ dòng giá đã nạp (sau lọc phía server theo mineOnly)
-  groups: [],      // danh sách nhóm (để dựng dropdown + tra tên theo groupId)
-  mineOnly: false, // cờ "Chỉ của tôi"
+  rows: [],   // toàn bộ dòng giá đã nạp (đã lọc riêng-tư theo user ở backend)
+  groups: [], // danh sách nhóm (để dựng dropdown + tra tên theo groupId)
 };
 
 // Chỉ cho phép http/https khi dựng <a href> từ dữ liệu AI/crawl (ít tin cậy):
@@ -100,17 +96,15 @@ function priceOrInfinity(obj, field = "price") {
  *   - groupId, category, condition: so khớp tuyệt đối.
  *   - priceMin, priceMax: khoảng giá (bao gồm 2 đầu). Dòng không có giá bị loại
  *     khi có ràng buộc khoảng giá.
- *   - mineOnly: chỉ giữ dòng crawledByMe === true.
  */
 export function filterRows(rows, filters = {}) {
   if (!Array.isArray(rows)) return [];
-  const { groupId, category, condition, priceMin, priceMax, mineOnly } = filters || {};
+  const { groupId, category, condition, priceMin, priceMax } = filters || {};
   return rows.filter((r) => {
     if (!r) return false;
     if (groupId && String(r.groupId) !== String(groupId)) return false;
     if (category && r.category !== category) return false;
     if (condition && r.condition !== condition) return false;
-    if (mineOnly && !r.crawledByMe) return false;
     const hasRange = priceMin != null || priceMax != null;
     if (hasRange) {
       if (r.price == null) return false;
@@ -147,13 +141,11 @@ function renderGroupFilterOptions() {
   if (cur) sel.value = cur;
 }
 
-// Nạp dòng giá từ backend (qua service worker). mineOnly đẩy xuống server.
+// Nạp dòng giá từ backend (qua service worker). Backend tự lọc theo user hiện
+// tại nên không cần đẩy filter riêng-tư nào lên server.
 export async function reloadGroupPrices() {
   const wrap = $("groupPriceList");
-  const filters = readFilters();
-  // Chỉ mineOnly đẩy xuống server (server lọc theo người gọi); các filter còn
-  // lại lọc phía client để đổi tức thì không cần gọi lại mạng.
-  const res = await bg("GET_GROUP_PRICES", { filters: { mineOnly: filters.mineOnly ? 1 : 0 } });
+  const res = await bg("GET_GROUP_PRICES", { filters: {} });
   if (!res || !res.ok) {
     // Chưa đăng nhập -> hiện hướng dẫn thay vì bảng trống gây hiểu nhầm.
     if (wrap) {
@@ -164,16 +156,8 @@ export async function reloadGroupPrices() {
     }
     return;
   }
-  groupPriceStore.rows = (res.groupPrices || []).map(normalizeRow);
+  groupPriceStore.rows = res.groupPrices || [];
   renderGroupPrices();
-}
-
-// Chuẩn hoá dòng từ backend: thêm cờ crawledByMe (phục vụ filter "Chỉ của tôi").
-// Backend trả crawledBy = userId của người crawl; ở client ta không có userId
-// hiện tại, nên dựa vào mineOnly server-side. Khi mineOnly bật, mọi dòng trả về
-// đều là của tôi -> đánh dấu crawledByMe = true để filter client nhất quán.
-function normalizeRow(r) {
-  return { ...r, crawledByMe: groupPriceStore.mineOnly ? true : !!r.crawledByMe };
 }
 
 // Đọc bộ lọc hiện tại từ các control trên UI.
@@ -189,7 +173,6 @@ function readFilters() {
     condition: ($("gpCondFilter") && $("gpCondFilter").value) || "",
     priceMin: num("gpPriceMin"),
     priceMax: num("gpPriceMax"),
-    mineOnly: groupPriceStore.mineOnly,
   };
 }
 
@@ -198,18 +181,6 @@ function readFilters() {
 // Áp filter client + render lại danh sách (gọi khi đổi filter cục bộ).
 export function applyGroupPriceFilter() {
   renderGroupPrices();
-}
-
-// Bật/tắt cờ "Chỉ của tôi" -> phải nạp lại từ server (mineOnly là server-side).
-export function setGroupPriceMine(mineOnly) {
-  groupPriceStore.mineOnly = !!mineOnly;
-  const seg = $("gpMineToggle");
-  if (seg) {
-    seg.querySelectorAll("[data-mine]").forEach((b) =>
-      b.classList.toggle("active", (b.dataset.mine === "1") === groupPriceStore.mineOnly)
-    );
-  }
-  reloadGroupPrices();
 }
 
 function groupName(groupId) {
@@ -276,16 +247,12 @@ function renderPriceCard(r) {
     r.groupId && r.postId
       ? `<a class="gp-source" href="https://www.facebook.com/groups/${esc(r.groupId)}/posts/${esc(r.postId)}/" target="_blank" rel="noopener">Bài gốc ↗</a>`
       : "";
-  // Icon chia sẻ: chỉ HIỂN THỊ trạng thái (read-only). Bấm -> nhắc chỉnh ở "Cài đặt chia sẻ".
-  const shared = !!r.shareGroupPrices;
-  const shareIcon = `<button class="gp-share" data-share-info="1" title="${shared ? "Đang chia sẻ chung" : "Riêng tư"} — chỉnh ở tab Cài đặt chia sẻ">${shared ? "🌐" : "🔒"}</button>`;
   const av = `<span class="gp-avatar" style="background:${colorFor(seller)}">${esc(initials(seller))}</span>`;
   return `
     <div class="gp-card">
       <div class="gp-card-main">
         <div class="gp-name-row">
           <span class="gp-name">${esc(r.name || "(không tên)")}</span>
-          ${shareIcon}
         </div>
         <div class="gp-meta">
           ${cond}${warranty}
@@ -319,9 +286,4 @@ export async function runExtraction() {
   } else {
     toast((res && res.error) || "Trích giá thất bại.", "err", 6000);
   }
-}
-
-// Nhắc người dùng chỗ chỉnh chia sẻ (icon 🌐/🔒 chỉ read-only).
-export function explainShareIcon() {
-  toast('Chia sẻ giá được điều khiển bằng công tắc tổng ở tab "Cài đặt chia sẻ".', "info", 4000);
 }

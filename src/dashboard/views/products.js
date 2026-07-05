@@ -1,12 +1,30 @@
 /**
  * View "Sản phẩm / Giá" — nạp kho sản phẩm, lọc, và so sánh giá giữa các cửa hàng.
- * Tách từ dashboard.js (B3.2h). Phụ thuộc canonCat từ build.js (gọi trong hàm nên
- * import vòng an toàn).
+ * Tách từ dashboard.js (B3.2h).
  */
 import { $, bg, esc, emptyState, timeAgo, toast, modal, syncToasts, colorFor, initials } from "../core.js";
-import { canonCat } from "./build.js";
 
 /* ========================== SẢN PHẨM / GIÁ ============================ */
+
+// Gộp các tên danh mục đồng nghĩa về MỘT nhãn chuẩn để không bị phân mảnh khi
+// lọc/hiển thị (VD "Main"/"Bo mạch chủ" -> "Mainboard", "PSU"/"Nguồn PSU" ->
+// "Nguồn", "Vỏ case" -> "Case"). Tên lạ giữ nguyên.
+export function canonCat(c) {
+  const n = String(c || "").trim().toLowerCase();
+  if (!n) return "";
+  if (n === "cpu") return "CPU";
+  if (n === "ram") return "RAM";
+  if (n === "vga" || n === "card" || n.includes("card màn") || n.includes("card man")) return "VGA";
+  if (n.includes("main") || n.includes("bo mạch") || n.includes("bo mach")) return "Mainboard";
+  if (n === "ssd") return "SSD";
+  if (n === "hdd") return "HDD";
+  if (n.includes("ổ cứng") || n.includes("o cung")) return "Ổ cứng";
+  if (n.includes("nguồn") || n.includes("nguon") || n === "psu") return "Nguồn";
+  if (n.includes("case") || n.includes("vỏ") || n === "vo") return "Case";
+  if (n.includes("tản") || n.includes("tan nhiet")) return "Tản nhiệt";
+  if (n.includes("màn") || n.includes("man hinh") || n.includes("monitor")) return "Màn hình";
+  return String(c).trim();
+}
 // State riêng cho view sản phẩm.
 export const productStore = { sources: [], products: [], allProducts: [], mode: "compare", page: 1, pageSize: 50 };
 
