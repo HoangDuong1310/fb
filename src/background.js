@@ -682,7 +682,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!conv) return sendResponse({ ok: false, error: "Không tìm thấy hội thoại." });
         const reply = (msg.reply != null ? String(msg.reply) : (conv.draft && conv.draft.reply) || "").trim();
         if (!reply) return sendResponse({ ok: false, error: "Nháp rỗng, không thể đăng." });
-        const url = conv.myCommentUrl || conv.postUrl;
+        // LUÔN ưu tiên dựng lại link từ postUrl (bài GỐC) + commentId, GIỐNG như
+        // executeWatchReplies. Lý do: với bài trang cá nhân dạng permalink.php,
+        // danh tính bài nằm HẾT ở query string (story_fbid & id). FB tự render
+        // href bình luận chỉ còn permalink.php?comment_id=X (mất story_fbid/id)
+        // nên myCommentUrl đã LƯU của các hội thoại cũ (hoặc tạo qua theo dõi thủ
+        // công) có thể bị hỏng. postUrl vẫn giữ đủ story_fbid/id -> ghép commentId
+        // vào đó mới ra link mở được, dùng làm targetUrl để đăng rep tiếp. Nếu
+        // thiếu postUrl/commentId thì mới rơi về myCommentUrl || postUrl như cũ.
+        let url = conv.myCommentUrl || conv.postUrl;
+        if (conv.postUrl && conv.commentId) {
+          try {
+            const u = new URL(conv.postUrl);
+            u.searchParams.set("comment_id", String(conv.commentId));
+            url = u.toString();
+          } catch (_) {}
+        }
         if (!url) return sendResponse({ ok: false, error: "Thiếu link bài để đăng phản hồi." });
         const job = await DB.createJob({
           type: "comment",

@@ -124,7 +124,7 @@ function renderPostCard(j) {
 }
 
 function renderCommentCard(j) {
-  const url = (j.result && j.result.commentUrl) || j.targetUrl || "";
+  const url = bestCommentUrl(j);
   const imgs = imgStrip(j.images);
   const src =
     j.meta && j.meta.source === "conversation"
@@ -153,6 +153,24 @@ function renderCommentCard(j) {
 }
 
 /* ---- Helpers ------------------------------------------------------------ */
+// Dựng link bình luận "chắc mở được" cho job: LUÔN ưu tiên ghép lại từ
+// targetUrl (link BÀI GỐC, luôn còn đủ story_fbid/id với bài trang cá nhân)
+// + commentId, giống logic executeCommentJob/executeWatchReplies bên
+// background. Không tin thẳng result.commentUrl đã lưu vì các job CŨ (đăng
+// trước khi có an toàn này) có thể đã lưu link hỏng dạng
+// permalink.php?comment_id=... (FB tự bỏ mất story_fbid/id khi render href).
+function bestCommentUrl(j) {
+  const commentId = j.result && j.result.commentId;
+  if (j.targetUrl && commentId) {
+    try {
+      const u = new URL(j.targetUrl);
+      u.searchParams.set("comment_id", String(commentId));
+      return u.toString();
+    } catch (_) {}
+  }
+  return (j.result && j.result.commentUrl) || j.targetUrl || "";
+}
+
 function whenText(j) {
   const ts = j.updatedAt || j.createdAt;
   return ts ? `Đăng: ${timeAgo(ts)} (${fmtDateTime(ts)})` : "";
