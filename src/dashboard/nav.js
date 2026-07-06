@@ -10,6 +10,7 @@ import { renderOverview } from "./views/overview.js";
 import { renderGroups } from "./views/groups.js";
 import { loadPosts } from "./views/posts.js";
 import { loadJobs } from "./views/jobs.js";
+import { loadMyActivityView } from "./views/my-activity.js";
 import { loadSources, loadAutoSync, loadProducts } from "./views/products.js";
 import { loadMyStore } from "./views/mystore.js";
 import { loadAdvisoryView } from "./views/advisory.js";
@@ -25,6 +26,7 @@ export const VIEW_META = {
   overview: ["Tổng quan", "Theo dõi hiệu quả khai thác nhóm của bạn."],
   groups: ["Nhóm", "Quản lý các nhóm đã tham gia và crawl theo từng nhóm."],
   posts: ["Bài viết", "Kho bài viết đã crawl, lọc và xuất dữ liệu."],
+  myactivity: ["Hoạt động của tôi", "Quản lý bài đã đăng và bình luận đã đăng của bạn."],
   autopost: ["Đăng bài", "Lên lịch đăng bài tự động vào nhóm."],
   autocomment: ["Bình luận", "Lên lịch bình luận tự động vào bài viết."],
   sources: ["Nguồn dữ liệu", "Quản lý các nguồn dữ liệu giá được cấu hình sẵn trong tiện ích."],
@@ -48,6 +50,7 @@ export function switchView(view) {
   if (view === "overview") renderOverview();
   if (view === "groups") renderGroups();
   if (view === "posts") loadPosts();
+  if (view === "myactivity") loadMyActivityView();
   if (view === "autopost") loadJobs("post");
   if (view === "autocomment") loadJobs("comment");
   if (view === "sources") {

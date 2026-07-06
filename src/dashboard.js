@@ -53,6 +53,11 @@ import {
   loadPostComments,
   changePostsPage,
 } from "./dashboard/views/posts.js";
+import {
+  loadMyActivityView,
+  setMyActivityTab,
+  setMyActivityQuery,
+} from "./dashboard/views/my-activity.js";
 import { loadLeadKeywords } from "./dashboard/leadfilter.js";
 import {
   loadJobs,
@@ -209,6 +214,20 @@ function bindEvents() {
   $("btnExportJson").addEventListener("click", () => exportPosts("json"));
   $("btnExportCsv").addEventListener("click", () => exportPosts("csv"));
   $("btnClearPosts").addEventListener("click", clearGroupPosts);
+
+  // Hoạt động của tôi
+  if ($("myActTabs"))
+    $("myActTabs").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-mya]");
+      if (btn) setMyActivityTab(btn.dataset.mya);
+    });
+  if ($("myActSearch"))
+    $("myActSearch").addEventListener("input", (e) =>
+      setMyActivityQuery(e.target.value)
+    );
+  if ($("btnMyActRefresh"))
+    $("btnMyActRefresh").addEventListener("click", loadMyActivityView);
+
   $("postsWrap").addEventListener("click", (e) => {
     const pg = e.target.closest("[data-pg]");
     if (pg) {

@@ -1742,27 +1742,50 @@ async function runJob(job) {
         }
       } catch (e) {}
     }
-    // Bình luận thành công -> tạo HỘI THOẠI để theo dõi reply về sau (chỉ THÊM,
-    // không đụng dữ liệu cũ). Bọc try để không làm hỏng luồng job nếu lỗi.
+    // Bình luận thành công -> xử lý HỘI THOẠI. Bọc try để không làm hỏng luồng
+    // job nếu lỗi.
     if (job.type === "comment") {
       try {
         const meta = job.meta || {};
-        await DB.createConversation({
-          status: "watching",
-          jobId: job.id,
-          postUrl: job.targetUrl || "",
-          postId: meta.postId || "",
-          groupId: meta.groupId || "",
-          groupName: meta.groupName || "",
-          myComment: job.content || "",
-          myCommentUrl: result.commentUrl || "",
-          commentId: result.commentId || null,
-          // Lưu ĐÚNG author id/tên của ta (bắt từ API lúc đăng bình luận) để
-          // khâu theo dõi reply gắn cờ `mine` theo id — chuẩn hơn khớp tên.
-          myAuthorId: result.myAuthorId || "",
-          myAuthorName: result.myAuthorName || "",
-          postText: meta.postText || "",
-        });
+        if (meta.source === "conversation" && meta.conversationId) {
+          // Đây là REP TIẾP trong 1 hội thoại có sẵn (do APPROVE_CONV_REPLY tạo).
+          // KHÔNG tạo hội thoại mới (tránh trùng) — merge reply của mình vào đúng
+          // hội thoại cũ, reset nháp, đưa về "watching" để tiếp tục theo dõi.
+          await DB.mergeReplies(meta.conversationId, [{
+            id: result.commentId || "self-" + job.id,
+            commentId: result.commentId || null,
+            mine: true,
+            author: result.myAuthorName || "",
+            text: job.content || "",
+            seenAt: Date.now(),
+          }]);
+          const patch = {
+            draft: null,
+            status: "watching",
+            lastReplyJobId: job.id,
+          };
+          if (result.commentUrl) patch.myCommentUrl = result.commentUrl;
+          await DB.updateConversation(meta.conversationId, patch);
+        } else {
+          // Bình luận GỐC mới -> tạo HỘI THOẠI để theo dõi reply về sau (chỉ THÊM,
+          // không đụng dữ liệu cũ).
+          await DB.createConversation({
+            status: "watching",
+            jobId: job.id,
+            postUrl: job.targetUrl || "",
+            postId: meta.postId || "",
+            groupId: meta.groupId || "",
+            groupName: meta.groupName || "",
+            myComment: job.content || "",
+            myCommentUrl: result.commentUrl || "",
+            commentId: result.commentId || null,
+            // Lưu ĐÚNG author id/tên của ta (bắt từ API lúc đăng bình luận) để
+            // khâu theo dõi reply gắn cờ `mine` theo id — chuẩn hơn khớp tên.
+            myAuthorId: result.myAuthorId || "",
+            myAuthorName: result.myAuthorName || "",
+            postText: meta.postText || "",
+          });
+        }
         broadcast("CONVERSATION_UPDATE", {});
       } catch (e) {}
     }
