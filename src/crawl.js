@@ -1363,11 +1363,20 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
   };
   // Text của một reply: div[dir="auto"] dài nhất TRONG mục đó, bỏ qua những
   // đoạn chỉ là thời gian/nhãn ngắn để không trả về "4 ngày".
-  const textOf = (unit) => {
+  // `authorName` (nếu có): tên tác giả ĐÃ xác định của mục này, dùng để LOẠI
+  // phần tử dir="auto" CHÍNH LÀ tên tác giả khỏi việc chọn "text dài nhất".
+  // BUG THỰC TẾ: khi nội dung reply RẤT NGẮN (VD "hihi") nhưng tên tác giả DÀI
+  // (VD "Trung Trung"), nếu không loại trừ thì div chứa TÊN TÁC GIẢ (dài hơn)
+  // bị nhận lầm thành NỘI DUNG reply -> hiển thị sai hoàn toàn (thấy tên tác
+  // giả lặp lại làm nội dung, đúng như báo lỗi: reply "hihi" của "Trung Trung"
+  // lại hiện text là "Trung Trung").
+  const textOf = (unit, authorName) => {
+    const authorN = norm(authorName || "");
     let best = "";
     for (const d of unit.querySelectorAll('div[dir="auto"], span[dir="auto"]')) {
       const t = (d.textContent || "").trim();
       if (!t || RELTIME_RE.test(t)) continue;
+      if (authorN && norm(t) === authorN) continue; // bỏ phần tử = tên tác giả
       if (t.length > best.length) best = t;
     }
     if (!best) {
@@ -1462,7 +1471,7 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
     const u = unitOf(a);
     if (!u) continue;
     if (!myAuthor) myAuthor = authorOf(u);
-    if (!myRootText) myRootText = textOf(u);
+    if (!myRootText) myRootText = textOf(u, myAuthor);
     if (myAuthor && myRootText) break;
   }
   const myAuthorN = norm(myAuthor);
@@ -1495,7 +1504,7 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
   const out = [];
   for (const [replyId, unit] of byReplyId) {
     const author = authorOf(unit);
-    const text = textOf(unit);
+    const text = textOf(unit, author);
     if (!text) continue;
     // Bỏ nếu mục CHÍNH LÀ bình luận GỐC của ta (không phải reply) — tránh tự
     // nhân đôi bình luận gốc vào luồng. KHÔNG bỏ các reply của ta nữa: một hội
