@@ -137,25 +137,37 @@ router.post("/:id/replies", requireAuth, async (req, res) => {
     }
 
     const existing = parseJson(rows[0].replies, []);
-    // Deduplicate: use reply.id if present, else fall back to commentId field
-    const existingIds = new Set(
-      existing.map((r) => r?.id ?? r?.commentId).filter(Boolean)
-    );
+    // Deduplicate: use reply.id if present, else fall back to commentId field.
+    // Map id -> vị trí trong `existing` để có thể GHI ĐÈ khi trùng id, thay vì
+    // chỉ bỏ qua. Trước đây nếu id đã tồn tại thì reply mới bị `continue`, nên
+    // dữ liệu sai lưu từ lần quét lỗi trước (do bug đọc author/text) không bao
+    // giờ được sửa dù người dùng quét lại nhiều lần.
+    const indexById = new Map();
+    existing.forEach((r, i) => {
+      const rid = r?.id ?? r?.commentId;
+      if (rid) indexById.set(rid, i);
+    });
 
     let added = 0;
+    let updated = 0;
     for (const reply of incoming) {
       const rid = reply?.id ?? reply?.commentId;
-      if (rid && existingIds.has(rid)) continue;
-      existing.push(reply);
-      if (rid) existingIds.add(rid);
-      added++;
+      if (rid && indexById.has(rid)) {
+        const idx = indexById.get(rid);
+        existing[idx] = { ...existing[idx], ...reply };
+        updated++;
+      } else {
+        existing.push(reply);
+        if (rid) indexById.set(rid, existing.length - 1);
+        added++;
+      }
     }
 
     await pool.execute(
       "UPDATE conversations SET replies = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
       [JSON.stringify(existing), req.params.id, req.userId]
     );
-    return res.json({ added, total: existing.length });
+    return res.json({ added, updated, total: existing.length });
   } catch (err) {
     console.error("[conversations/replies]", err);
     return res.status(500).json({ error: "Lỗi server." });
