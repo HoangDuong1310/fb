@@ -194,6 +194,8 @@ test("extractRepliesForParent lọc đúng reply của cha + cờ mine theo auth
   });
   assert.equal(res.parentText, "Máy còn bảo hành");
   assert.equal(res.parentAuthor, "Shop Me");
+  // author id của bình luận cha (của ta) -> để backfill myAuthorId cho hội thoại.
+  assert.equal(res.parentAuthorId, "555");
   assert.equal(res.replies.length, 3);
   // thứ tự theo thời gian tăng dần
   assert.deepEqual(res.replies.map((r) => r.id), ["2001", "2002", "2003"]);

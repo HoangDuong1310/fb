@@ -94,6 +94,8 @@ export async function runMigrations() {
       group_name         VARCHAR(255) NOT NULL DEFAULT '',
       my_comment         TEXT,
       my_comment_url     VARCHAR(512) NOT NULL DEFAULT '',
+      my_author_id       VARCHAR(64)  DEFAULT NULL,
+      my_author_name     VARCHAR(255) DEFAULT NULL,
       post_text          MEDIUMTEXT,
       draft              TEXT,
       job_id             VARCHAR(64)  DEFAULT NULL,
@@ -210,6 +212,13 @@ export async function runMigrations() {
   await ensureColumns(pool, "posts", [
     { name: "reactions", ddl: "reactions BIGINT DEFAULT NULL" },
     { name: "comments", ddl: "comments BIGINT DEFAULT NULL" },
+  ]);
+
+  // Bổ sung tác giả bình luận GỐC của ta -> cờ `mine` khi gom reply khớp
+  // CHÍNH XÁC theo authorId (bền hơn khớp tên tác giả).
+  await ensureColumns(pool, "conversations", [
+    { name: "my_author_id", ddl: "my_author_id VARCHAR(64) DEFAULT NULL" },
+    { name: "my_author_name", ddl: "my_author_name VARCHAR(255) DEFAULT NULL" },
   ]);
 
   console.log("[db] migrations complete");

@@ -1219,6 +1219,10 @@ async function executeCommentJob(job) {
         if (cap && cap.ok && cap.commentId) {
           out.commentId = cap.commentId;
           out.commentIdSource = "api";
+          // Lưu ĐÚNG tác giả bình luận gốc (chính là ta) để khâu theo dõi reply
+          // gắn cờ `mine` theo authorId — chuẩn hơn khớp tên tác giả.
+          if (cap.authorId) out.myAuthorId = String(cap.authorId);
+          if (cap.authorName) out.myAuthorName = String(cap.authorName);
           // Dựng permalink theo comment_id để khâu theo dõi reply mở đúng chỗ.
           if (!out.commentUrl) {
             try {
@@ -1525,8 +1529,10 @@ async function executeWatchReplies(conv) {
         const api = await chrome.tabs.sendMessage(tab.id, {
           type: "GET_COMMENT_REPLIES_API",
           parentLegacyId: conv.commentId,
-          authorId: meta.myAuthorId || "",
-          authorName: meta.myAuthorName || "",
+          // ƯU TIÊN author id đã LƯU trên hội thoại (bắt lúc đăng bình luận) —
+          // chuẩn nhất; nếu chưa có thì mới rơi về meta.
+          authorId: conv.myAuthorId || meta.myAuthorId || "",
+          authorName: conv.myAuthorName || meta.myAuthorName || "",
         });
         if (api && api.ok && Array.isArray(api.replies) && api.replies.length) {
           return {
@@ -1539,6 +1545,9 @@ async function executeWatchReplies(conv) {
             })),
             parentId: conv.commentId,
             myAuthor: api.parentAuthor || "",
+            // author id của bình luận cha (của ta) -> để backfill myAuthorId khi
+            // hội thoại chưa lưu, giúp các lần theo dõi sau khớp `mine` theo id.
+            myAuthorId: api.parentAuthorId || "",
             myRootText: api.parentText || "",
             repliesSource: "api",
           };
@@ -1704,6 +1713,10 @@ async function runJob(job) {
           myComment: job.content || "",
           myCommentUrl: result.commentUrl || "",
           commentId: result.commentId || null,
+          // Lưu ĐÚNG author id/tên của ta (bắt từ API lúc đăng bình luận) để
+          // khâu theo dõi reply gắn cờ `mine` theo id — chuẩn hơn khớp tên.
+          myAuthorId: result.myAuthorId || "",
+          myAuthorName: result.myAuthorName || "",
           postText: meta.postText || "",
         });
         broadcast("CONVERSATION_UPDATE", {});
@@ -2229,6 +2242,14 @@ async function processReplyWatch(opts = {}) {
       // các lượt quét sau chính xác và nhanh hơn.
       if (res && res.ok && res.parentId && !c.commentId) {
         try { await DB.updateConversation(c.id, { commentId: res.parentId }); } catch (e) {}
+      }
+      // Lần đầu bắt được author id của ta (từ API bình luận cha) mà hội thoại
+      // chưa lưu -> backfill để các lượt sau khớp cờ `mine` theo id (chuẩn nhất).
+      if (res && res.ok && res.myAuthorId && !c.myAuthorId) {
+        try {
+          await DB.updateConversation(c.id, { myAuthorId: res.myAuthorId });
+          c.myAuthorId = res.myAuthorId;
+        } catch (e) {}
       }
       // Theo dõi bằng LINK có comment_id (không dán text) -> `myComment` rỗng.
       // Bóc nội dung bình luận GỐC từ trang để "Bình luận của bạn" và lượt MỞ

@@ -357,7 +357,7 @@ export function findCreatedComment(chunks, me = {}) {
  * @param {Array} chunks
  * @param {string} parentLegacyId - id SỐ của bình luận cha (của ta).
  * @param {{authorId?:string, authorName?:string}} me
- * @returns {{parentText:string, parentAuthor:string, replies:Array}}
+ * @returns {{parentText:string, parentAuthor:string, parentAuthorId:string, replies:Array}}
  */
 export function extractRepliesForParent(chunks, parentLegacyId, me = {}) {
   const comments = extractComments(chunks);
@@ -367,12 +367,16 @@ export function extractRepliesForParent(chunks, parentLegacyId, me = {}) {
 
   let parentText = "";
   let parentAuthor = "";
+  let parentAuthorId = "";
   const replies = [];
   for (const c of comments) {
     if (pid && String(c.legacyId) === pid) {
-      // Chính bình luận cha (của ta) -> lấy text/author gốc.
+      // Chính bình luận cha (của ta) -> lấy text/author gốc + author id.
+      // parentAuthorId dùng để backfill myAuthorId cho hội thoại (khi lúc
+      // đăng chưa bắt được id) -> cờ `mine` về sau chuẩn theo id.
       if (!parentText && c.text) parentText = c.text;
       if (!parentAuthor && c.authorName) parentAuthor = c.authorName;
+      if (!parentAuthorId && c.authorId) parentAuthorId = String(c.authorId);
       continue;
     }
     if (!pid || String(c.parentLegacyId) !== pid) continue; // chỉ reply của cha này
@@ -390,5 +394,5 @@ export function extractRepliesForParent(chunks, parentLegacyId, me = {}) {
   }
   // Sắp theo thời gian tăng dần để luồng hội thoại đúng thứ tự.
   replies.sort((a, b) => (a.createdTime || 0) - (b.createdTime || 0));
-  return { parentText, parentAuthor, replies };
+  return { parentText, parentAuthor, parentAuthorId, replies };
 }

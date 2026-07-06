@@ -28,8 +28,8 @@ router.post("/", requireAuth, async (req, res) => {
       `INSERT INTO conversations
          (post_id, user_id, comment_permalink, comment_id, replies, status,
           post_url, group_id, group_name, my_comment, my_comment_url,
-          post_text, draft, job_id, last_watched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          my_author_id, my_author_name, post_text, draft, job_id, last_watched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         String(c.postId || ""),
         req.userId,
@@ -42,6 +42,8 @@ router.post("/", requireAuth, async (req, res) => {
         String(c.groupName || ""),
         c.myComment != null ? String(c.myComment) : null,
         String(c.myCommentUrl || ""),
+        c.myAuthorId != null ? String(c.myAuthorId) : null,
+        c.myAuthorName != null ? String(c.myAuthorName) : null,
         c.postText != null ? String(c.postText) : null,
         c.draft != null ? String(c.draft) : null,
         c.jobId != null ? String(c.jobId) : null,
@@ -90,6 +92,8 @@ router.patch("/:id", requireAuth, async (req, res) => {
     commentId:        ["comment_id",        (v) => v != null ? String(v) : null],
     myComment:        ["my_comment",        (v) => v != null ? String(v) : null],
     myCommentUrl:     ["my_comment_url",    (v) => String(v)],
+    myAuthorId:       ["my_author_id",      (v) => v != null ? String(v) : null],
+    myAuthorName:     ["my_author_name",    (v) => v != null ? String(v) : null],
     postText:         ["post_text",         (v) => v != null ? String(v) : null],
     draft:            ["draft",             (v) => v != null ? String(v) : null],
     jobId:            ["job_id",            (v) => v != null ? String(v) : null],
@@ -187,6 +191,8 @@ function mapConversation(r) {
     groupName: r.group_name,
     myComment: r.my_comment,
     myCommentUrl: r.my_comment_url,
+    myAuthorId: r.my_author_id,
+    myAuthorName: r.my_author_name,
     postText: r.post_text,
     draft: r.draft,
     jobId: r.job_id,

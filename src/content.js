@@ -1605,7 +1605,7 @@
           const pid = String(msg.parentLegacyId || "");
           // Kéo lại gói đã đệm + chờ ngắn để FB nạp danh sách bình luận.
           const deadline = Date.now() + 3500;
-          let res = { parentText: "", parentAuthor: "", replies: [] };
+          let res = { parentText: "", parentAuthor: "", parentAuthorId: "", replies: [] };
           while (Date.now() < deadline) {
             pullBufferedGql();
             await sleep(500);
@@ -1618,6 +1618,9 @@
             ok: true,
             parentText: res.parentText,
             parentAuthor: res.parentAuthor,
+            // author id của bình luận cha (chính là ta) -> nền dùng để backfill
+            // myAuthorId cho hội thoại nếu lúc đăng chưa bắt được.
+            parentAuthorId: res.parentAuthorId,
             replies: res.replies,
           });
         } catch (e) {

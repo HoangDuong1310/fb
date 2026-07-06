@@ -50,6 +50,8 @@ test("createConversation POSTs the full rich field set", async () => {
     commentId: "2198772343999307",
     myComment: "Inbox giá nhé",
     myCommentUrl: "https://fb.com/comment/abc",
+    myAuthorId: "100001234567890",
+    myAuthorName: "Shop Của Tôi",
     postText: "Cần bán iPhone",
     draft: { reply: "Dạ em gửi giá" },
     jobId: "job-9",
@@ -73,6 +75,10 @@ test("createConversation POSTs the full rich field set", async () => {
   assert.equal(body.commentId, "2198772343999307");
   assert.equal(body.myComment, "Inbox giá nhé");
   assert.equal(body.myCommentUrl, "https://fb.com/comment/abc");
+  // author id/tên của ta phải tới server để cờ `mine` lúc theo dõi reply khớp
+  // chuẩn theo id.
+  assert.equal(body.myAuthorId, "100001234567890");
+  assert.equal(body.myAuthorName, "Shop Của Tôi");
   assert.equal(body.postText, "Cần bán iPhone");
   assert.deepEqual(body.draft, { reply: "Dạ em gửi giá" });
   assert.equal(body.jobId, "job-9");
