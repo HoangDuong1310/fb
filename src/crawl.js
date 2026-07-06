@@ -979,7 +979,13 @@ async function runPostInPage(text, images) {
         if (!hasId(href)) continue;
         try {
           const u = new URL(href, location.origin);
-          return u.origin + u.pathname;
+          // QUAN TRỌNG: giữ lại query string (u.search). Với bài đăng trang cá
+          // nhân, FB dùng permalink.php?story_fbid=...&id=... — path đơn thuần
+          // "/permalink.php" không mang thông tin nhận diện bài gì cả, thông
+          // tin đó nằm hết trong query. Nếu chỉ lấy origin+pathname như trước
+          // sẽ mất story_fbid/id, hỏng cả link (đây chính là nguyên nhân link
+          // "quét phản hồi ngay" bị sai với bài đăng trang cá nhân).
+          return u.origin + u.pathname + u.search;
         } catch (e) {
           return href;
         }
@@ -1137,8 +1143,13 @@ async function runCommentInPage(text, images) {
           const m = a.match(COMMENT_ID_RE);
           let clean = a;
           try {
+            // Giữ nguyên các query param khác mà FB đã gắn sẵn trong href (ví dụ
+            // story_fbid, id trên bài đăng trang cá nhân dùng permalink.php) —
+            // chỉ ghi đè/thêm comment_id, không bỏ hết query như trước (khiến
+            // link hỏng, không xác định được bài với permalink.php dạng query).
             const u = new URL(a, location.origin);
-            clean = u.origin + u.pathname + "?comment_id=" + m[1];
+            u.searchParams.set("comment_id", m[1]);
+            clean = u.toString();
           } catch (e) {}
           return { commentId: m[1], commentUrl: clean };
         }
@@ -1224,10 +1235,17 @@ async function executeCommentJob(job) {
           if (cap.authorId) out.myAuthorId = String(cap.authorId);
           if (cap.authorName) out.myAuthorName = String(cap.authorName);
           // Dựng permalink theo comment_id để khâu theo dõi reply mở đúng chỗ.
+          // QUAN TRỌNG: phải GIỮ NGUYÊN query string gốc (ví dụ story_fbid, id
+          // của permalink.php trên trang cá nhân) rồi chỉ THÊM/GHI ĐÈ tham số
+          // comment_id lên trên — không được dùng origin+pathname rồi bỏ hết
+          // query cũ, vì với bài đăng trang cá nhân (permalink.php?story_fbid=
+          // ...&id=...) thông tin nhận diện bài nằm HOÀN TOÀN trong query, mất
+          // đi là link hỏng (không mở đúng bài/bình luận nữa).
           if (!out.commentUrl) {
             try {
               const u = new URL(url);
-              out.commentUrl = u.origin + u.pathname + "?comment_id=" + cap.commentId;
+              u.searchParams.set("comment_id", String(cap.commentId));
+              out.commentUrl = u.toString();
             } catch (_) {}
           }
         }
