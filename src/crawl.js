@@ -1234,24 +1234,27 @@ async function executeCommentJob(job) {
           // gắn cờ `mine` theo authorId — chuẩn hơn khớp tên tác giả.
           if (cap.authorId) out.myAuthorId = String(cap.authorId);
           if (cap.authorName) out.myAuthorName = String(cap.authorName);
-          // Dựng permalink theo comment_id để khâu theo dõi reply mở đúng chỗ.
-          // QUAN TRỌNG: phải GIỮ NGUYÊN query string gốc (ví dụ story_fbid, id
-          // của permalink.php trên trang cá nhân) rồi chỉ THÊM/GHI ĐÈ tham số
-          // comment_id lên trên — không được dùng origin+pathname rồi bỏ hết
-          // query cũ, vì với bài đăng trang cá nhân (permalink.php?story_fbid=
-          // ...&id=...) thông tin nhận diện bài nằm HOÀN TOÀN trong query, mất
-          // đi là link hỏng (không mở đúng bài/bình luận nữa).
-          if (!out.commentUrl) {
-            try {
-              const u = new URL(url);
-              u.searchParams.set("comment_id", String(cap.commentId));
-              out.commentUrl = u.toString();
-            } catch (_) {}
-          }
         }
       } catch (_) {
-        // content.js chưa sẵn sàng / không có gói API -> giữ kết quả DOM.
+        // content.js chưa sẵn sàng / không có gói API -> giữ commentId từ DOM (nếu có).
       }
+    }
+    // LUÔN dựng lại commentUrl từ URL BÀI GỐC (url = job.targetUrl), KHÔNG tin
+    // href mà FB tự render trong DOM (captureMyComment trả về). Lý do gốc rễ:
+    // với bài đăng TRANG CÁ NHÂN (permalink.php?story_fbid=...&id=...), CHÍNH FB
+    // khi render thẻ <a href> cho bình luận CHỈ gắn "permalink.php?comment_id=
+    // ..." — tự FB đã bỏ mất story_fbid/id ngay trong href, KHÔNG phải do code
+    // ta cắt query. Vì vậy dù ta có cố giữ query khi build từ href đó thì href
+    // vốn đã không còn story_fbid/id -> link vẫn hỏng. Chỉ URL GỐC của bài
+    // (url, chính là tab đã mở) mới chắc chắn còn đủ story_fbid/id. Do đó lấy
+    // URL gốc làm nền rồi GHI ĐÈ/THÊM comment_id lên trên là cách DUY NHẤT đúng
+    // cho cả bài nhóm lẫn bài trang cá nhân.
+    if (out.commentId) {
+      try {
+        const u = new URL(url);
+        u.searchParams.set("comment_id", String(out.commentId));
+        out.commentUrl = u.toString();
+      } catch (_) {}
     }
   } catch (e) {
     return { ok: false, error: "Lỗi chạy script bình luận: " + String(e) };
@@ -1529,7 +1532,21 @@ async function runWatchRepliesInPage(myCommentId, myCommentText) {
 
 /** Mở permalink bình luận của ta ở tab NỀN, quét reply, đóng tab. */
 async function executeWatchReplies(conv) {
-  const url = conv.myCommentUrl || conv.postUrl;
+  // LUÔN ưu tiên dựng lại link từ postUrl (bài GỐC) + comment_id. Lý do: với bài
+  // trang cá nhân dạng permalink.php, danh tính bài nằm HẾT ở query string
+  // (story_fbid & id). Facebook lại tự render href bình luận chỉ còn
+  // permalink.php?comment_id=X (mất story_fbid/id) nên myCommentUrl đã LƯU của
+  // các hội thoại cũ bị hỏng. postUrl vẫn giữ đủ story_fbid/id -> ghép comment_id
+  // vào đó mới ra link mở được. Nếu thiếu postUrl/commentId thì mới rơi về
+  // myCommentUrl || postUrl như cũ.
+  let url = conv.myCommentUrl || conv.postUrl;
+  if (conv.postUrl && conv.commentId) {
+    try {
+      const u = new URL(conv.postUrl);
+      u.searchParams.set("comment_id", String(conv.commentId));
+      url = u.toString();
+    } catch (_) {}
+  }
   if (!url) return { ok: false, error: "Thiếu link để theo dõi reply." };
   const meta = conv.meta || {};
   const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
