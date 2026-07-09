@@ -13,6 +13,8 @@ import {
   fetchWithTimeout,
   broadcast,
 } from "./util.js";
+import { getActiveProfile } from "./prompts.js";
+import * as DB from "./db.js";
 /**
  * Hàm TỰ-CHỨA chạy trong NGỮ CẢNH TRANG (func injection).
  * BẮT BUỘC không tham chiếu biến/hàm ngoài — mọi thứ định nghĩa bên trong, vì
@@ -247,7 +249,7 @@ export async function discoverSelectors() {
     return { ok: false, error: "Không parse được JSON selector từ phản hồi AI:\n" + content.slice(0, 300) };
   }
 
-  await new Promise((r) => chrome.storage.local.set({ fbSelectors: selectors }, r));
+  await DB.setSetting("fbSelectors", selectors);
   return { ok: true, selectors, postId: sample.postId };
 }
 
@@ -428,19 +430,191 @@ export async function spinPostContent(payload) {
   return { ok: true, variants, source: "ai" };
 }
 
+/* ======================================================================== */
+/* AI TỰ VIẾT NỘI DUNG ĐĂNG BÀI (sinh mới từ YÊU CẦU của người dùng)         */
+/* ======================================================================== */
+
+const POST_TONE_SPECS = {
+  "than-thien":
+    "thân thiện, gần gũi như đang trò chuyện với bạn bè.",
+  "chuyen-nghiep":
+    "chuyên nghiệp, chỉn chu, tập trung vào lợi ích và uy tín.",
+  "nang-dong":
+    "trẻ trung, năng động, bắt trend, câu ngắn tạo năng lượng.",
+  "khan-truong":
+    "thúc đẩy chốt đơn, nhấn mạnh khuyến mãi/giới hạn thời gian, kêu gọi hành động mạnh.",
+};
+
 /**
- * generateProfileSkill — Dùng AI sinh NỘI DUNG cho 1 trường "skill" của hồ sơ
- * ngành khi người dùng để trống / nhập thiếu. Dựa vào ngữ cảnh hồ sơ (tên, mô
- * tả, danh mục) + ý nghĩa của từng skill để viết đoạn hướng dẫn tiếng Việt phù
- * hợp ngành. CHỈ sinh phần nội dung đặc thù ngành — KHÔNG sinh khung JSON (khung
- * này do code tự nối ở prompts.js nên không bao giờ vỡ luồng).
- *
- * payload: { field, profile:{ name, description, categories } }
- *   field ∈ classifyIntro | draftPersona | extractIntro | buildPersona
- * trả: { ok, text, source } hoặc { ok:false, error }
+ * Dựng ĐOẠN NGỮ CẢNH NGÀNH từ hồ sơ đang kích hoạt, để nhét vào system prompt của
+ * generatePostContent. Nhờ đó AI viết bài đúng ngành của người dùng (điện thoại, thời
+ * trang, bất động sản...) thay vì mặc định ngành máy tính. Trả về "" nếu không có hồ sơ.
  */
-export async function generateProfileSkill(payload) {
-  const field = payload && payload.field ? String(payload.field) : "";
+function buildIndustryContext(profile) {
+  if (!profile || typeof profile !== "object") return "";
+  const name = String(profile.name || "").trim();
+  const cats = Array.isArray(profile.categories)
+    ? profile.categories.map((c) => String(c || "").trim()).filter(Boolean)
+    : [];
+  if (!name && !cats.length) return "";
+  let s = "NGÀNH HÀNG CỦA NGƯỜI DÙNG";
+  if (name) s += ': "' + name + '"';
+  s += ". Viết bài đúng bối cảnh, thuật ngữ và cách khách hàng của ngành này quen dùng";
+  if (cats.length) s += " (nhóm sản phẩm thường gặp: " + cats.join(", ") + ")";
+  s += ". TUYỆT ĐỐI không mặc định là ngành máy tính/linh kiện trừ khi yêu cầu nói vậy.\n";
+  return s;
+}
+
+/**
+ * Sinh MỚI N biến thể bài đăng bán hàng dựa trên YÊU CẦU (brief) của người dùng.
+ * Khác với spinPostContent (xào nấu nội dung có sẵn), hàm này TỰ VIẾT nội dung
+ * từ mô tả yêu cầu — sản phẩm, ưu đãi, thông tin liên hệ... do người dùng nêu.
+ *
+ *   payload = { brief: string, tone?: string, count?: number }
+ *   trả: { ok, variants: string[], source:"ai" } hoặc { ok:false, error }
+ *
+ * Không có fallback "nội dung gốc" vì bản chất là sinh mới: nếu AI lỗi / chưa có
+ * API key thì trả ok:false để UI báo rõ, tránh tạo hàng loạt bài rỗng.
+ */
+export async function generatePostContent(payload) {
+  const brief = (payload && payload.brief ? String(payload.brief) : "").trim();
+  const count = Math.max(1, Math.min(50, parseInt(payload && payload.count, 10) || 1));
+  const toneKey = payload && payload.tone ? String(payload.tone) : "";
+  const toneSpec = POST_TONE_SPECS[toneKey] || POST_TONE_SPECS["than-thien"];
+
+  if (!brief) return { ok: false, error: "Chưa nhập yêu cầu nội dung để AI viết bài." };
+
+  const cfg = await getAIConfig();
+  const apiBase = (cfg.apiBase || "https://danglamgiau.com/v1").replace(/\/+$/, "");
+  const apiKey = cfg.apiKey || "";
+  const model = cfg.model || "gpt-5.5";
+  if (!apiKey) {
+    return {
+      ok: false,
+      error: "Chưa cấu hình API key AI (tab Cài đặt) nên chưa tự viết được nội dung.",
+    };
+  }
+
+  // Lấy HỒ SƠ NGÀNH đang kích hoạt để AI viết đúng "giọng" & đặc thù ngành của
+  // người dùng, thay vì gán cứng ngành máy tính. Lỗi -> hồ sơ máy tính mặc định.
+  const profile = await getActiveProfile();
+  const industry = buildIndustryContext(profile);
+
+  const multi =
+    count > 1
+      ? "Vì sẽ đăng lên " + count + " nhóm khác nhau, hãy viết " + count +
+        " BIẾN THỂ KHÁC NHAU RÕ RỆT (đổi câu chữ, cách mở đầu/kết, thứ tự ý) " +
+        "để tránh bị Facebook gắn cờ trùng nội dung — nhưng CÙNG bán một sản phẩm/thông điệp.\n"
+      : "Hãy viết 1 bài đăng hoàn chỉnh.\n";
+
+  const sys =
+    "Bạn là CHUYÊN GIA VIẾT CONTENT BÁN HÀNG trên Facebook, tiếng Việt. Người dùng " +
+    "mô tả YÊU CẦU (sản phẩm, ưu đãi, thông tin cần có) và bạn TỰ VIẾT bài đăng bán " +
+    "hàng hoàn chỉnh, sẵn sàng đăng lên nhóm.\n" +
+    industry +
+    "QUY TẮC BẮT BUỘC:\n" +
+    "1) Bám sát YÊU CẦU: đầy đủ thông tin người dùng nêu (sản phẩm, giá, khuyến mãi, " +
+    "số điện thoại, link...). KHÔNG bịa số liệu/giá/liên hệ nếu người dùng không cung cấp.\n" +
+    "2) Giọng văn: " + toneSpec + "\n" +
+    "3) Cấu trúc hấp dẫn: mở đầu thu hút → lợi ích/điểm nổi bật → lời kêu gọi hành động (CTA). " +
+    "Dùng xuống dòng để dễ đọc trên Facebook.\n" +
+    "4) TUYỆT ĐỐI KHÔNG dùng emoji/icon/ký tự đặc biệt trang trí. Chỉ dùng chữ, số và dấu câu thông thường.\n" +
+    "5) TUYỆT ĐỐI không thêm tiêu đề kiểu 'Biến thể 1', không giải thích ngoài lề.\n" +
+    multi +
+    'CHỈ trả JSON hợp lệ, KHÔNG bọc code fence. Cấu trúc: {"variants":["nội dung 1","nội dung 2", ...]} ' +
+    "với đúng " + count + " phần tử.";
+
+  const user =
+    "SỐ BÀI CẦN VIẾT: " + count + "\n" +
+    "YÊU CẦU NỘI DUNG:\n\"\"\"\n" + brief + "\n\"\"\"\n" +
+    'Hãy trả JSON đúng cấu trúc, mảng variants có đúng ' + count + " bài đăng hoàn chỉnh.";
+
+  const AI_TIMEOUT_MS = 30000;
+  const callOnce = async (useJsonFormat) => {
+    const body = {
+      model,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user },
+      ],
+      temperature: 0.9,
+      max_tokens: 4000,
+      stream: false,
+    };
+    if (useJsonFormat) body.response_format = { type: "json_object" };
+    return fetchWithTimeout(
+      apiBase + "/chat/completions",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey },
+        body: JSON.stringify(body),
+      },
+      AI_TIMEOUT_MS
+    );
+  };
+
+  let resp;
+  try {
+    resp = await callOnce(true);
+    if (resp && (resp.status === 400 || resp.status === 422)) {
+      resp = await callOnce(false);
+    }
+  } catch (e) {
+    return { ok: false, error: "Gọi AI thất bại: " + String(e) };
+  }
+  if (!resp || !resp.ok) {
+    return { ok: false, error: "AI trả lỗi (HTTP " + (resp ? resp.status : "?") + ")." };
+  }
+
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    return { ok: false, error: "Không đọc được phản hồi AI." };
+  }
+  const text = data && data.choices && data.choices[0] && data.choices[0].message
+    ? data.choices[0].message.content
+    : "";
+  const obj = parseSelectorJson(text);
+  let variants =
+    obj && Array.isArray(obj.variants)
+      ? obj.variants.map((v) => String(v || "").trim()).filter(Boolean)
+      : [];
+
+  // AI có thể trả thẳng 1 đoạn văn (không JSON) khi chỉ cần 1 bài.
+  if (!variants.length) {
+    const raw = String(text || "").trim();
+    if (raw) variants = [raw];
+  }
+  if (!variants.length) return { ok: false, error: "AI không viết được nội dung." };
+
+  // Chuẩn hoá về đúng count: thiếu thì nhân bản luân phiên, thừa thì cắt.
+  if (variants.length < count) {
+    for (let i = variants.length; i < count; i++) {
+      variants.push(variants[i % variants.length]);
+    }
+  } else if (variants.length > count) {
+    variants = variants.slice(0, count);
+  }
+
+  return { ok: true, variants, source: "ai" };
+}
+
+/**
+ * generateProfileFull — Dùng AI sinh TOÀN BỘ hồ sơ ngành từ MỘT mô tả/yêu cầu
+ * bằng lời của người dùng. Thay cho việc sinh lẻ từng trường: AI đọc yêu cầu +
+ * ngữ cảnh hồ sơ (nếu có) rồi trả về cả 4 đoạn hướng dẫn đặc thù ngành cùng lúc
+ * (classifyIntro, draftPersona, extractIntro, buildPersona) và, khi còn trống,
+ * gợi ý luôn tên / mô tả / danh mục. CHỈ sinh phần nội dung đặc thù ngành —
+ * KHÔNG sinh khung JSON (khung này do code tự nối ở prompts.js nên không vỡ luồng).
+ *
+ * payload: { request, profile:{ name, description, categories } }
+ *   request  — mô tả ngành + yêu cầu bằng lời của người dùng (bắt buộc)
+ * trả: { ok, fields:{ name?, description?, categories?, classifyIntro,
+ *        draftPersona, extractIntro, buildPersona }, source } hoặc { ok:false, error }
+ */
+export async function generateProfileFull(payload) {
+  const request = String((payload && payload.request) || "").trim();
   const profile = (payload && payload.profile) || {};
   const name = String(profile.name || "").trim();
   const description = String(profile.description || "").trim();
@@ -448,31 +622,10 @@ export async function generateProfileSkill(payload) {
     ? profile.categories.map((c) => String(c || "").trim()).filter(Boolean)
     : [];
 
-  // Mô tả ý nghĩa + yêu cầu của từng skill để AI viết đúng "phần đặc thù ngành".
-  const SKILL_SPECS = {
-    classifyIntro:
-      "Đoạn hướng dẫn AI PHÂN LOẠI Ý ĐỊNH của một bài đăng / bình luận trong nhóm: " +
-      "khách MUỐN MUA, khách CHỈ HỎI/THẮC MẮC, hay nội dung BỎ QUA (không liên quan). " +
-      "Nêu rõ dấu hiệu nhận biết theo đặc thù ngành (từ khóa, ngữ cảnh) để AI quyết định chính xác.",
-    draftPersona:
-      "Đoạn mô tả VAI TRÒ và QUY TẮC khi AI SOẠN TRẢ LỜI khách: giọng văn, thái độ, " +
-      "cách xưng hô, điều nên nói / nên tránh, cách dẫn dắt chốt đơn phù hợp ngành. " +
-      "Viết như bản mô tả nhân sự bán hàng giỏi của ngành này.",
-    extractIntro:
-      "Đoạn hướng dẫn AI TRÍCH GIÁ / thông tin sản phẩm từ các bài RAO BÁN trong nhóm: " +
-      "cần lấy những trường nào (tên sản phẩm, giá, tình trạng...) và lưu ý đặc thù ngành " +
-      "khi đọc giá (đơn vị, khoảng giá, cách viết tắt thường gặp).",
-    buildPersona:
-      "Đoạn hướng dẫn AI GHÉP BỘ / tư vấn combo theo NGÂN SÁCH của khách trong ngành này: " +
-      "cách phân bổ ngân sách cho từng nhóm sản phẩm, ưu tiên gì trước, nguyên tắc cân đối. " +
-      "Nếu ngành không có khái niệm ghép bộ thì viết ngắn gọn cách gợi ý sản phẩm theo ngân sách.",
-  };
-  const spec = SKILL_SPECS[field];
-  if (!spec) return { ok: false, error: "Trường skill không hợp lệ: " + field };
-  if (!name && !description && !categories.length) {
+  if (!request && !name && !description && !categories.length) {
     return {
       ok: false,
-      error: "Hãy điền tên / mô tả / danh mục hồ sơ trước để AI có ngữ cảnh sinh nội dung.",
+      error: "Hãy mô tả ngành hàng + yêu cầu của bạn để AI có ngữ cảnh sinh hồ sơ.",
     };
   }
 
@@ -484,29 +637,46 @@ export async function generateProfileSkill(payload) {
     return { ok: false, error: "Chưa cấu hình API key AI (tab Cài đặt) nên chưa sinh được nội dung." };
   }
 
+  // Mô tả ý nghĩa từng trường để AI viết đúng "phần đặc thù ngành".
+  const FIELD_SPECS =
+    "- classifyIntro: hướng dẫn AI PHÂN LOẠI Ý ĐỊNH của bài/bình luận trong nhóm " +
+    "(khách MUỐN MUA, khách CHỈ HỎI, hay BỎ QUA), nêu dấu hiệu nhận biết theo đặc thù ngành.\n" +
+    "- draftPersona: mô tả VAI TRÒ + QUY TẮC khi AI SOẠN TRẢ LỜI khách (giọng văn, thái độ, " +
+    "xưng hô, nên/không nên nói, cách dẫn dắt chốt đơn) — như mô tả một nhân sự bán hàng giỏi.\n" +
+    "- extractIntro: hướng dẫn AI TRÍCH GIÁ / thông tin sản phẩm từ bài RAO BÁN (lấy trường nào, " +
+    "lưu ý đơn vị / khoảng giá / cách viết tắt thường gặp của ngành).\n" +
+    "- buildPersona: hướng dẫn AI GHÉP BỘ / tư vấn theo NGÂN SÁCH của khách; nếu ngành không có " +
+    "khái niệm ghép bộ thì viết ngắn gọn cách gợi ý sản phẩm theo ngân sách.";
+
   const ctx =
-    "NGÀNH / HỒ SƠ:\n" +
+    "NGỮ CẢNH HỒ SƠ HIỆN CÓ (có thể trống):\n" +
     "- Tên: " + (name || "(chưa đặt)") + "\n" +
     "- Mô tả: " + (description || "(chưa có)") + "\n" +
-    "- Danh mục sản phẩm: " + (categories.length ? categories.join(", ") : "(chưa có)") + "\n";
+    "- Danh mục sản phẩm: " + (categories.length ? categories.join(", ") : "(chưa có)") + "\n\n" +
+    "YÊU CẦU CỦA NGƯỜI DÙNG:\n" + (request || "(người dùng không mô tả thêm — hãy suy luận từ ngữ cảnh hồ sơ)") + "\n";
 
   const sys =
     "Bạn là CHUYÊN GIA THIẾT KẾ PROMPT cho trợ lý bán hàng AI tiếng Việt. Người dùng " +
-    "đang tạo 'hồ sơ ngành' để áp tool cho ngành của họ. Nhiệm vụ của bạn: viết NỘI DUNG " +
-    "đặc thù ngành cho MỘT phần hướng dẫn (skill) dựa trên ngữ cảnh hồ sơ.\n" +
+    "đang tạo 'hồ sơ ngành' để áp tool cho ngành của họ. Nhiệm vụ: đọc yêu cầu + ngữ cảnh " +
+    "rồi viết NỘI DUNG đặc thù ngành cho CẢ 4 phần hướng dẫn (skill) cùng lúc.\n" +
+    "CÁC PHẦN CẦN VIẾT:\n" + FIELD_SPECS + "\n" +
     "QUY TẮC:\n" +
-    "1) Viết tiếng Việt tự nhiên, rõ ràng, đúng đặc thù ngành đã cho.\n" +
-    "2) CHỈ viết phần nội dung hướng dẫn, KHÔNG kèm khung JSON, KHÔNG ví dụ JSON, " +
-    "KHÔNG tiêu đề thừa, KHÔNG giải thích ngoài lề.\n" +
-    "3) Độ dài vừa phải (vài câu đến một đoạn), dùng gạch đầu dòng khi cần cho dễ đọc.\n" +
-    'CHỈ trả JSON hợp lệ, KHÔNG bọc code fence. Cấu trúc: {"text":"<nội dung hướng dẫn>"}';
+    "1) Viết tiếng Việt tự nhiên, rõ ràng, đúng đặc thù ngành theo yêu cầu người dùng.\n" +
+    "2) CHỈ viết phần nội dung hướng dẫn, KHÔNG kèm khung JSON mẫu, KHÔNG ví dụ JSON, " +
+    "KHÔNG tiêu đề thừa, KHÔNG giải thích ngoài lề trong từng trường.\n" +
+    "3) Mỗi trường độ dài vừa phải (vài câu đến một đoạn), dùng gạch đầu dòng khi cần.\n" +
+    "4) LUÔN đề xuất name (ngắn gọn), description (một câu súc tích), categories (mảng chuỗi " +
+    "các danh mục sản phẩm chính) suy ra từ yêu cầu người dùng — kể cả khi ngữ cảnh hồ sơ đã " +
+    "có sẵn giá trị (khi đã có, hãy tinh chỉnh cho sát yêu cầu). KHÔNG bỏ trống 3 trường này.\n" +
+    "CHỈ trả JSON hợp lệ, KHÔNG bọc code fence. Cấu trúc:\n" +
+    '{"name":"<tên>","description":"<mô tả>","categories":["..."],' +
+    '"classifyIntro":"...","draftPersona":"...","extractIntro":"...","buildPersona":"..."}';
 
   const user =
     ctx + "\n" +
-    "PHẦN CẦN VIẾT:\n" + spec + "\n\n" +
-    'Hãy trả JSON đúng cấu trúc {"text":"..."} với nội dung hướng dẫn cho phần trên.';
+    'Hãy trả JSON đúng cấu trúc đã nêu, điền đủ 4 trường skill và (nếu cần) name/description/categories.';
 
-  const AI_TIMEOUT_MS = 30000;
+  const AI_TIMEOUT_MS = 45000;
   const callOnce = async (useJsonFormat) => {
     const body = {
       model,
@@ -515,7 +685,7 @@ export async function generateProfileSkill(payload) {
         { role: "user", content: user },
       ],
       temperature: 0.7,
-      max_tokens: 1500,
+      max_tokens: 3000,
       stream: false,
     };
     if (useJsonFormat) body.response_format = { type: "json_object" };
@@ -553,10 +723,302 @@ export async function generateProfileSkill(payload) {
     ? data.choices[0].message.content
     : "";
   const obj = parseSelectorJson(raw);
-  // Ưu tiên obj.text; nếu AI lỡ trả thẳng văn bản (không phải JSON) thì dùng raw.
-  let text = obj && typeof obj.text === "string" ? obj.text.trim() : "";
-  if (!text) text = String(raw || "").trim();
-  if (!text) return { ok: false, error: "AI không sinh được nội dung." };
+  if (!obj || typeof obj !== "object") {
+    return { ok: false, error: "AI trả về không đúng định dạng, hãy thử lại." };
+  }
 
-  return { ok: true, text, source: "ai" };
+  const str = (v) => (typeof v === "string" ? v.trim() : "");
+  const fields = {
+    name: str(obj.name),
+    description: str(obj.description),
+    categories: Array.isArray(obj.categories)
+      ? obj.categories.map((c) => str(c)).filter(Boolean)
+      : [],
+    classifyIntro: str(obj.classifyIntro),
+    draftPersona: str(obj.draftPersona),
+    extractIntro: str(obj.extractIntro),
+    buildPersona: str(obj.buildPersona),
+  };
+  // Coi là thành công nếu AI sinh được ít nhất 1 trong 4 trường skill.
+  const hasSkill =
+    fields.classifyIntro || fields.draftPersona || fields.extractIntro || fields.buildPersona;
+  if (!hasSkill) return { ok: false, error: "AI không sinh được nội dung, hãy thử lại." };
+
+  return { ok: true, fields, source: "ai" };
+}
+
+/**
+ * draftPitch — Soạn MỘT tin nhắn CHÀO HÀNG riêng (inbox/DM) gửi tới một khách tiềm
+ * năng đã phát hiện từ bài đăng trong nhóm. Khác với generatePostContent (viết bài
+ * đăng công khai) và draftConversationReply (trả lời công khai dưới bình luận): đây là
+ * lời chào hàng NGẮN, mang tính CÁ NHÂN, gửi thẳng hộp thư của khách.
+ *
+ *   payload = {
+ *     postText:   string,   // nội dung bài đăng của khách (ngữ cảnh nhu cầu) — nên có
+ *     authorName: string?,  // tên khách để xưng hô cho tự nhiên
+ *     groupName:  string?,  // tên nhóm (ngữ cảnh)
+ *     userPitch:  string?,  // NỘI DUNG NGƯỜI DÙNG TỰ ĐIỀN — nếu có, AI dựa/bám theo
+ *   }
+ *   trả: { ok, message: string, source:"ai" } hoặc { ok:false, error }
+ *
+ * Lấy HỒ SƠ NGÀNH đang kích hoạt (giọng văn + đặc thù ngành) qua draftPersona để tin
+ * nhắn đúng "chất" người dùng. Nếu có userPitch: AI dựa trên ý người dùng, chỉ tinh
+ * chỉnh/cá nhân hoá cho khớp bài đăng, KHÔNG bịa thêm thông tin. Không có fallback nội
+ * dung để tránh gửi tin rỗng: AI lỗi / chưa có API key -> ok:false để UI báo rõ.
+ */
+export async function draftPitch(payload) {
+  const postText = String((payload && payload.postText) || "").trim();
+  const authorName = String((payload && payload.authorName) || "").trim();
+  const groupName = String((payload && payload.groupName) || "").trim();
+  const userPitch = String((payload && payload.userPitch) || "").trim();
+
+  if (!postText && !userPitch) {
+    return {
+      ok: false,
+      error: "Thiếu ngữ cảnh: cần nội dung bài đăng của khách hoặc nội dung bạn tự điền.",
+    };
+  }
+
+  const cfg = await getAIConfig();
+  const apiBase = (cfg.apiBase || "https://danglamgiau.com/v1").replace(/\/+$/, "");
+  const apiKey = cfg.apiKey || "";
+  const model = cfg.model || "gpt-5.5";
+  if (!apiKey) {
+    return {
+      ok: false,
+      error: "Chưa cấu hình API key AI (tab Cài đặt) nên chưa soạn được tin chào hàng.",
+    };
+  }
+
+  // Hồ sơ ngành đang kích hoạt -> giọng văn + đặc thù ngành (draftPersona) + ngữ cảnh ngành.
+  const profile = await getActiveProfile();
+  const industry = buildIndustryContext(profile);
+  const persona = String((profile && profile.draftPersona) || "").trim();
+
+  const guidance = userPitch
+    ? "NGƯỜI DÙNG ĐÃ ĐIỀN SẴN Ý CHÀO HÀNG dưới đây. Hãy BÁM SÁT ý đó, chỉ tinh chỉnh câu " +
+      "chữ và CÁ NHÂN HOÁ cho khớp nhu cầu trong bài đăng của khách. KHÔNG bịa thêm sản phẩm, " +
+      "giá, khuyến mãi hay thông tin liên hệ mà người dùng không nêu.\n"
+    : "Hãy TỰ SOẠN một lời chào hàng phù hợp nhu cầu khách nêu trong bài đăng, đúng ngành hàng, " +
+      "KHÔNG bịa số liệu/giá/liên hệ cụ thể nếu không có dữ liệu.\n";
+
+  const sys =
+    "Bạn là NHÂN VIÊN BÁN HÀNG giỏi, đang NHẮN TIN RIÊNG (inbox) cho một khách tiềm năng " +
+    "vừa đăng bài trong nhóm Facebook. Nhiệm vụ: soạn MỘT tin nhắn chào hàng đầu tiên.\n" +
+    industry +
+    (persona ? "VAI TRÒ & GIỌNG VĂN CỦA BẠN:\n" + persona + "\n" : "") +
+    guidance +
+    "QUY TẮC BẮT BUỘC:\n" +
+    "1) NGẮN GỌN (2-5 câu), thân thiện, tự nhiên như người thật nhắn tin — KHÔNG rập khuôn spam.\n" +
+    "2) Mở đầu chào và nhắc khéo tới nhu cầu khách vừa đăng để thấy bạn đã đọc bài của họ.\n" +
+    "3) Gợi mở rằng bạn có thể hỗ trợ/cung cấp thứ họ cần và mời khách trao đổi thêm (CTA nhẹ nhàng).\n" +
+    "4) TUYỆT ĐỐI KHÔNG dùng emoji/icon/ký tự trang trí. Chỉ dùng chữ, số và dấu câu thông thường.\n" +
+    "5) KHÔNG chèn link, KHÔNG xin số điện thoại dồn dập, KHÔNG hối thúc gây khó chịu.\n" +
+    "6) KHÔNG thêm tiêu đề, KHÔNG giải thích ngoài lề, chỉ trả đúng nội dung tin nhắn.\n" +
+    (authorName ? '7) Xưng hô lịch sự, có thể gọi khách theo tên "' + authorName + '" nếu tự nhiên.\n' : "") +
+    'CHỈ trả JSON hợp lệ, KHÔNG bọc code fence. Cấu trúc: {"message":"<nội dung tin nhắn>"}';
+
+  const ctx =
+    (authorName ? "TÊN KHÁCH: " + authorName + "\n" : "") +
+    (groupName ? "NHÓM: " + groupName + "\n" : "") +
+    (postText ? 'BÀI ĐĂNG CỦA KHÁCH:\n"""\n' + postText + '\n"""\n' : "") +
+    (userPitch ? 'Ý CHÀO HÀNG NGƯỜI DÙNG TỰ ĐIỀN:\n"""\n' + userPitch + '\n"""\n' : "");
+
+  const user =
+    ctx + "\n" +
+    'Hãy trả JSON đúng cấu trúc {"message":"..."} với một tin nhắn chào hàng riêng hoàn chỉnh.';
+
+  const AI_TIMEOUT_MS = 30000;
+  const callOnce = async (useJsonFormat) => {
+    const body = {
+      model,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user },
+      ],
+      temperature: 0.8,
+      max_tokens: 1200,
+      stream: false,
+    };
+    if (useJsonFormat) body.response_format = { type: "json_object" };
+    return fetchWithTimeout(
+      apiBase + "/chat/completions",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey },
+        body: JSON.stringify(body),
+      },
+      AI_TIMEOUT_MS
+    );
+  };
+
+  let resp;
+  try {
+    resp = await callOnce(true);
+    if (resp && (resp.status === 400 || resp.status === 422)) {
+      resp = await callOnce(false);
+    }
+  } catch (e) {
+    return { ok: false, error: "Gọi AI thất bại: " + String(e) };
+  }
+  if (!resp || !resp.ok) {
+    return { ok: false, error: "AI trả lỗi (HTTP " + (resp ? resp.status : "?") + ")." };
+  }
+
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    return { ok: false, error: "Không đọc được phản hồi AI." };
+  }
+  const text = data && data.choices && data.choices[0] && data.choices[0].message
+    ? data.choices[0].message.content
+    : "";
+  const obj = parseSelectorJson(text);
+  let message = obj && typeof obj.message === "string" ? obj.message.trim() : "";
+
+  // AI có thể trả thẳng đoạn văn (không JSON).
+  if (!message) {
+    const raw = String(text || "").trim();
+    if (raw) message = raw;
+  }
+  if (!message) return { ok: false, error: "AI không soạn được tin chào hàng, hãy thử lại." };
+
+  return { ok: true, message, source: "ai" };
+}
+
+/**
+ * Soạn NHÁP trả lời cho một HỘI THOẠI CÓ SẴN trong Messenger (khác draftPitch:
+ * đây là TRẢ LỜI khách đang nhắn với mình, dựa trên lịch sử tin nhắn thật).
+ *
+ * payload = {
+ *   contactName: string,            // tên người đang chat với mình
+ *   messages: [{ mine:boolean, text:string }],  // lịch sử tin nhắn (cũ -> mới)
+ *   userHint?: string,              // gợi ý/ý người dùng muốn trả lời (tuỳ chọn)
+ * }
+ * Trả về { ok, message, source } hoặc { ok:false, error }.
+ */
+export async function draftInboxReply(payload) {
+  const contactName = String((payload && payload.contactName) || "").trim();
+  const userHint = String((payload && payload.userHint) || "").trim();
+  const history = Array.isArray(payload && payload.messages) ? payload.messages : [];
+
+  // Cần ít nhất một tin của KHÁCH để có gì mà trả lời.
+  const hasIncoming = history.some((m) => m && !m.mine && String(m.text || "").trim());
+  if (!hasIncoming && !userHint) {
+    return {
+      ok: false,
+      error: "Chưa có tin nhắn nào của khách để trả lời (hoặc hãy nhập ý bạn muốn nhắn).",
+    };
+  }
+
+  const cfg = await getAIConfig();
+  const apiBase = (cfg.apiBase || "https://danglamgiau.com/v1").replace(/\/+$/, "");
+  const apiKey = cfg.apiKey || "";
+  const model = cfg.model || "gpt-5.5";
+  if (!apiKey) {
+    return {
+      ok: false,
+      error: "Chưa cấu hình API key AI (tab Cài đặt) nên chưa soạn được câu trả lời.",
+    };
+  }
+
+  const profile = await getActiveProfile();
+  const industry = buildIndustryContext(profile);
+  const persona = String((profile && profile.draftPersona) || "").trim();
+
+  const guidance = userHint
+    ? "NGƯỜI DÙNG ĐÃ GỢI Ý Ý TRẢ LỜI dưới đây. Hãy BÁM SÁT ý đó, chỉ tinh chỉnh câu chữ cho " +
+      "tự nhiên, lịch sự và khớp mạch hội thoại. KHÔNG bịa thêm sản phẩm/giá/khuyến mãi/liên hệ " +
+      "mà người dùng không nêu.\n"
+    : "Hãy soạn câu trả lời phù hợp NGỮ CẢNH hội thoại và tin nhắn gần nhất của khách. Nếu khách " +
+      "hỏi thông tin bạn không chắc (giá cụ thể, tồn kho, chính sách), hãy trả lời khéo là sẽ kiểm " +
+      "tra/xác nhận lại thay vì bịa số liệu.\n";
+
+  const sys =
+    "Bạn là NHÂN VIÊN CHĂM SÓC KHÁCH HÀNG đang TRẢ LỜI TIN NHẮN riêng (Messenger) với một khách. " +
+    "Nhiệm vụ: soạn MỘT tin nhắn trả lời tiếp theo trong mạch hội thoại.\n" +
+    industry +
+    (persona ? "VAI TRÒ & GIỌNG VĂN CỦA BẠN:\n" + persona + "\n" : "") +
+    guidance +
+    "QUY TẮC BẮT BUỘC:\n" +
+    "1) NGẮN GỌN, thân thiện, tự nhiên như người thật đang nhắn — KHÔNG rập khuôn, KHÔNG spam.\n" +
+    "2) Trả lời ĐÚNG câu hỏi/nhu cầu gần nhất của khách; giữ mạch hội thoại liền lạc.\n" +
+    "3) TUYỆT ĐỐI KHÔNG dùng emoji/icon/ký tự trang trí. Chỉ dùng chữ, số và dấu câu thông thường.\n" +
+    "4) KHÔNG bịa số liệu/giá/tồn kho/chính sách nếu không có dữ liệu; nói sẽ xác nhận lại.\n" +
+    "5) KHÔNG thêm tiêu đề hay giải thích ngoài lề, chỉ trả đúng nội dung tin nhắn.\n" +
+    (contactName ? '6) Có thể xưng hô với khách theo tên "' + contactName + '" nếu tự nhiên.\n' : "") +
+    'CHỈ trả JSON hợp lệ, KHÔNG bọc code fence. Cấu trúc: {"message":"<nội dung trả lời>"}';
+
+  // Dựng lại lịch sử hội thoại (giới hạn 20 tin gần nhất để tiết kiệm token).
+  const recent = history.slice(-20);
+  const transcript = recent
+    .map((m) => (m && m.mine ? "TÔI: " : "KHÁCH: ") + String((m && m.text) || "").trim())
+    .filter((line) => line.length > 5)
+    .join("\n");
+
+  const ctx =
+    (contactName ? "TÊN KHÁCH: " + contactName + "\n" : "") +
+    (transcript ? 'LỊCH SỬ HỘI THOẠI (cũ -> mới):\n"""\n' + transcript + '\n"""\n' : "") +
+    (userHint ? 'Ý NGƯỜI DÙNG MUỐN TRẢ LỜI:\n"""\n' + userHint + '\n"""\n' : "");
+
+  const user =
+    ctx + "\n" +
+    'Hãy trả JSON đúng cấu trúc {"message":"..."} với MỘT tin nhắn trả lời tiếp theo hoàn chỉnh.';
+
+  const AI_TIMEOUT_MS = 30000;
+  const callOnce = async (useJsonFormat) => {
+    const body = {
+      model,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user },
+      ],
+      temperature: 0.8,
+      max_tokens: 1200,
+      stream: false,
+    };
+    if (useJsonFormat) body.response_format = { type: "json_object" };
+    return fetchWithTimeout(
+      apiBase + "/chat/completions",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey },
+        body: JSON.stringify(body),
+      },
+      AI_TIMEOUT_MS
+    );
+  };
+
+  let resp;
+  try {
+    resp = await callOnce(true);
+    if (resp && (resp.status === 400 || resp.status === 422)) {
+      resp = await callOnce(false);
+    }
+  } catch (e) {
+    return { ok: false, error: "Gọi AI thất bại: " + String(e) };
+  }
+  if (!resp || !resp.ok) {
+    return { ok: false, error: "AI trả lỗi (HTTP " + (resp ? resp.status : "?") + ")." };
+  }
+
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    return { ok: false, error: "Không đọc được phản hồi AI." };
+  }
+  const text = data && data.choices && data.choices[0] && data.choices[0].message
+    ? data.choices[0].message.content
+    : "";
+  const obj = parseSelectorJson(text);
+  let message = obj && typeof obj.message === "string" ? obj.message.trim() : "";
+  if (!message) {
+    const raw = String(text || "").trim();
+    if (raw) message = raw;
+  }
+  if (!message) return { ok: false, error: "AI không soạn được câu trả lời, hãy thử lại." };
+
+  return { ok: true, message, source: "ai" };
 }

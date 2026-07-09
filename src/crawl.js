@@ -320,13 +320,24 @@ async function crawlGroupApiInTab(groupId, options) {
  */
 async function crawlGroupApiSmart(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
-  const tpl = await getStoredGqlTemplate();
-  if (tpl && tpl.doc_id) {
-    // Đường ẩn hoàn toàn: replay khuôn bằng fetch trực tiếp từ extension
-    // (IP/cookie của user), không mở tab, không qua backend relay.
-    return crawlGroupApiTabless(groupId, options);
+  const opts = options || {};
+
+  // AN TOÀN TUYỆT ĐỐI (mặc định): ưu tiên TIER-2 = replay-TRONG-TRANG.
+  // Mở 1 tab nhóm (credential/cookie/header THẬT của trình duyệt user, KHÔNG
+  // giả mạo header qua declarativeNetRequest), rồi content.js replay ngay
+  // trong ngữ cảnh trang => request giống hệt lúc user tự cuộn feed. Đây là
+  // đường ít bị FB nghi ngờ nhất.
+  //
+  // TIER-3 = crawlGroupApiTabless (service worker fetch + DNR ghi đè header)
+  // chỉ dùng khi người gọi CHỦ ĐỘNG bật cờ preferTabless. Nhanh/nhẹ hơn nhưng
+  // rủi ro hơn vì header do extension dựng lại, không phải do trang FB phát ra.
+  if (opts.preferTabless === true) {
+    const tpl = await getStoredGqlTemplate();
+    if (tpl && tpl.doc_id) {
+      return crawlGroupApiTabless(groupId, options);
+    }
+    // Chưa có khuôn để chạy tabless => vẫn phải mở tab bắt khuôn trước.
   }
-  // Chưa có khuôn: mở tab 1 lần để bắt khuôn (đồng thời cũng cào luôn nhóm này).
   return crawlGroupApiInTab(groupId, options);
 }
 
@@ -1264,6 +1275,111 @@ async function executeCommentJob(job) {
   return out;
 }
 
+/* ----------- GỬI TIN NHẮN CHÀO HÀNG (INBOX MESSENGER) ----------------- */
+
+/**
+ * Hàm tự-chứa chạy TRONG TAB Messenger (/messages/t/<id>): tìm ô soạn tin,
+ * dán nội dung rồi bấm Enter để GỬI. Khác ô bình luận ở chỗ với Messenger phím
+ * Enter = GỬI (đúng ý muốn), còn Shift+Enter mới xuống dòng. Vì vậy khi cần
+ * xuống dòng trong nội dung ta dùng execCommand insertLineBreak (không Enter).
+ * Trả về { ok, error? } — best-effort theo DOM Messenger hiện hành.
+ */
+async function runMessageInPage(text) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const body = String(text == null ? "" : text).trim();
+  if (!body) return { ok: false, error: "Nội dung tin nhắn rỗng." };
+
+  // Ô soạn tin của Messenger là contenteditable role=textbox. Chờ và cuộn nhẹ
+  // để giao diện kịp render (tab nền có thể tải chậm).
+  const findBox = () =>
+    document.querySelector('div[role="textbox"][contenteditable="true"]') ||
+    document.querySelector('[contenteditable="true"][data-lexical-editor="true"]');
+  let box = findBox();
+  for (let i = 0; i < 6 && !box; i++) {
+    await sleep(1500);
+    box = findBox();
+  }
+  if (!box) return { ok: false, error: "Không tìm thấy ô soạn tin (có thể chưa đăng nhập Messenger hoặc không mở được hội thoại)." };
+
+  box.focus();
+  await sleep(400);
+
+  // Dán qua ClipboardEvent (Lexical tôn trọng paste text/plain, không tự gửi).
+  const pasteInto = (el, str) => {
+    try {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", str);
+      const ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+      el.dispatchEvent(ev);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+  // Dự phòng: gõ từng dòng bằng insertText + insertLineBreak (KHÔNG Enter vì
+  // Enter sẽ GỬI ngay khi mới gõ được 1 dòng).
+  const typeFallback = (raw) => {
+    const lines = String(raw == null ? "" : raw).split(/\r\n|\r|\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        let broke = false;
+        try { broke = document.execCommand("insertLineBreak"); } catch (e) {}
+        if (!broke) { try { document.execCommand("insertParagraph"); } catch (e) {} }
+      }
+      if (lines[i]) { try { document.execCommand("insertText", false, lines[i]); } catch (e) {} }
+    }
+  };
+
+  pasteInto(box, body);
+  await sleep(500);
+  if (!((box.textContent || "").trim())) {
+    try { typeFallback(body); } catch (e) { try { box.textContent = body; } catch (_) {} }
+  }
+  await sleep(1000);
+  if (!((box.textContent || "").trim())) {
+    return { ok: false, error: "Không nhập được nội dung vào ô soạn tin." };
+  }
+
+  // GỬI bằng Enter (Messenger: Enter = gửi). Bắn đủ keydown/keypress/keyup.
+  const fire = (type) =>
+    box.dispatchEvent(
+      new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true })
+    );
+  fire("keydown");
+  fire("keypress");
+  fire("keyup");
+  await sleep(2500);
+
+  // Xác nhận đã gửi: ô soạn tin thường bị xoá rỗng sau khi gửi thành công.
+  const cleared = !((box.textContent || "").trim());
+  return { ok: true, sent: cleared };
+}
+
+async function executeMessageJob(job) {
+  const url = job.targetUrl;
+  if (!url) return { ok: false, error: "Thiếu link hội thoại Messenger để gửi tin." };
+  // Mở tab Messenger ở NỀN (active:false) để không chiếm màn hình; Messenger
+  // cần thời gian tải lười nên chờ lâu hơn chút so với bình luận.
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  await waitTabComplete(tab.id, 30000);
+  await sleep(4500);
+  let res;
+  let out = { ok: false, error: "Không có kết quả." };
+  try {
+    res = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: runMessageInPage,
+      args: [job.content || ""],
+    });
+    out = (res && res[0] && res[0].result) || out;
+  } catch (e) {
+    return { ok: false, error: "Lỗi chạy script gửi tin: " + String(e) };
+  } finally {
+    try { await chrome.tabs.remove(tab.id); } catch (e) {}
+  }
+  return out;
+}
+
 /* ----------- THEO DÕI REPLY DƯỚI BÌNH LUẬN CỦA TA --------------------- */
 
 /**
@@ -1724,14 +1840,19 @@ async function runJob(job) {
   broadcast("JOB_UPDATE", { jobId: job.id });
   let result;
   try {
-    result = job.type === "comment" ? await executeCommentJob(job) : await executePostJob(job);
+    result =
+      job.type === "message"
+        ? await executeMessageJob(job)
+        : job.type === "comment"
+        ? await executeCommentJob(job)
+        : await executePostJob(job);
   } catch (e) {
     result = { ok: false, error: String(e) };
   }
   if (result && result.ok) {
     await DB.updateJob(job.id, { status: "done", result, error: null });
-    // Đăng bài thành công -> lưu lịch sử "nhóm hay đăng" (chỉ khi job có groupId).
-    if (job.type !== "comment" && job.groupId) {
+    // Đăng bài thành công -> lưu lịch sử "nhóm hay đăng" (chỉ job đăng bài có groupId).
+    if (job.type === "post" && job.groupId) {
       try {
         const userId = await _getAuthUserId();
         if (userId) {
@@ -1949,23 +2070,29 @@ const AUTOCRAWL_DEFAULT = {
   options: {},
 };
 
-/** Đọc cấu hình auto-crawl từ chrome.storage.local, trộn với mặc định. */
-function getAutoCrawlConfig() {
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get(AUTOCRAWL_KEY, (r) => {
-        const saved = (r && r[AUTOCRAWL_KEY]) || {};
-        resolve({
-          enabled: !!saved.enabled,
-          intervalMinutes:
-            Math.max(1, Math.min(1440, parseInt(saved.intervalMinutes, 10) || AUTOCRAWL_DEFAULT.intervalMinutes)),
-          options: saved.options && typeof saved.options === "object" ? saved.options : {},
-        });
-      });
-    } catch (e) {
-      resolve({ ...AUTOCRAWL_DEFAULT });
-    }
-  });
+/**
+ * Ghi một khoá cấu hình theo TÀI KHOẢN lên server (upsert), NUỐT lỗi mạng để
+ * alarm vẫn được (tái)tạo theo giá trị đã tính.
+ */
+async function writeSetting(key, value) {
+  try {
+    await DB.setSetting(key, value);
+  } catch (e) {
+    // Bỏ qua lỗi ghi.
+  }
+}
+
+/** Đọc cấu hình auto-crawl từ server theo tài khoản, trộn với mặc định. */
+async function getAutoCrawlConfig() {
+  const saved = (await DB.getSetting(AUTOCRAWL_KEY)) || {};
+  return {
+    enabled: !!saved.enabled,
+    intervalMinutes: Math.max(
+      1,
+      Math.min(1440, parseInt(saved.intervalMinutes, 10) || AUTOCRAWL_DEFAULT.intervalMinutes)
+    ),
+    options: saved.options && typeof saved.options === "object" ? saved.options : {},
+  };
 }
 
 /** Lưu cấu hình + (tái)tạo hoặc xóa alarm theo trạng thái bật/tắt. */
@@ -1980,16 +2107,7 @@ async function applyAutoCrawlConfig(input) {
     options:
       input.options && typeof input.options === "object" ? input.options : current.options,
   };
-  await new Promise((resolve) => {
-    try {
-      chrome.storage.local.set({ [AUTOCRAWL_KEY]: next }, () => {
-        void chrome.runtime.lastError;
-        resolve();
-      });
-    } catch (e) {
-      resolve();
-    }
-  });
+  await writeSetting(AUTOCRAWL_KEY, next);
   try {
     await chrome.alarms.clear(AUTOCRAWL_ALARM);
     if (next.enabled) {
@@ -2126,22 +2244,13 @@ function normalizeSyncHours(v) {
   return AUTOSYNC_INTERVALS.includes(h) ? h : AUTOSYNC_DEFAULT.intervalHours;
 }
 
-/** Đọc cấu hình auto-sync từ chrome.storage.local, trộn với mặc định. */
-function getAutoSyncConfig() {
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get(AUTOSYNC_KEY, (r) => {
-        void chrome.runtime.lastError;
-        const saved = (r && r[AUTOSYNC_KEY]) || {};
-        resolve({
-          enabled: !!saved.enabled,
-          intervalHours: normalizeSyncHours(saved.intervalHours),
-        });
-      });
-    } catch (e) {
-      resolve({ ...AUTOSYNC_DEFAULT });
-    }
-  });
+/** Đọc cấu hình auto-sync từ server theo tài khoản, trộn với mặc định. */
+async function getAutoSyncConfig() {
+  const saved = (await DB.getSetting(AUTOSYNC_KEY)) || {};
+  return {
+    enabled: !!saved.enabled,
+    intervalHours: normalizeSyncHours(saved.intervalHours),
+  };
 }
 
 /** Lưu cấu hình + (tái)tạo hoặc xóa alarm theo trạng thái bật/tắt. */
@@ -2154,16 +2263,7 @@ async function applyAutoSyncConfig(input) {
         ? normalizeSyncHours(input.intervalHours)
         : current.intervalHours,
   };
-  await new Promise((resolve) => {
-    try {
-      chrome.storage.local.set({ [AUTOSYNC_KEY]: next }, () => {
-        void chrome.runtime.lastError;
-        resolve();
-      });
-    } catch (e) {
-      resolve();
-    }
-  });
+  await writeSetting(AUTOSYNC_KEY, next);
   try {
     await chrome.alarms.clear(AUTOSYNC_ALARM);
     if (next.enabled) {
@@ -2215,26 +2315,17 @@ const WATCH_ALARM = "watchReplies";
 // các hội thoại đang "watching"/"replied" để gom reply mới của người khác.
 const WATCH_DEFAULT = { enabled: false, intervalMinutes: 30, maxPerRun: 8 };
 
-/** Đọc cấu hình theo-dõi-reply từ chrome.storage.local, trộn với mặc định. */
-function getWatchConfig() {
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get(WATCH_KEY, (r) => {
-        void chrome.runtime.lastError;
-        const saved = (r && r[WATCH_KEY]) || {};
-        resolve({
-          enabled: !!saved.enabled,
-          intervalMinutes: Math.max(
-            5,
-            Math.min(720, parseInt(saved.intervalMinutes, 10) || WATCH_DEFAULT.intervalMinutes)
-          ),
-          maxPerRun: Math.max(1, Math.min(30, parseInt(saved.maxPerRun, 10) || WATCH_DEFAULT.maxPerRun)),
-        });
-      });
-    } catch (e) {
-      resolve({ ...WATCH_DEFAULT });
-    }
-  });
+/** Đọc cấu hình theo-dõi-reply từ server theo tài khoản, trộn với mặc định. */
+async function getWatchConfig() {
+  const saved = (await DB.getSetting(WATCH_KEY)) || {};
+  return {
+    enabled: !!saved.enabled,
+    intervalMinutes: Math.max(
+      5,
+      Math.min(720, parseInt(saved.intervalMinutes, 10) || WATCH_DEFAULT.intervalMinutes)
+    ),
+    maxPerRun: Math.max(1, Math.min(30, parseInt(saved.maxPerRun, 10) || WATCH_DEFAULT.maxPerRun)),
+  };
 }
 
 /** Lưu cấu hình + (tái)tạo hoặc xóa alarm theo trạng thái bật/tắt. */
@@ -2251,16 +2342,7 @@ async function applyWatchConfig(input) {
         ? Math.max(1, Math.min(30, parseInt(input.maxPerRun, 10) || current.maxPerRun))
         : current.maxPerRun,
   };
-  await new Promise((resolve) => {
-    try {
-      chrome.storage.local.set({ [WATCH_KEY]: next }, () => {
-        void chrome.runtime.lastError;
-        resolve();
-      });
-    } catch (e) {
-      resolve();
-    }
-  });
+  await writeSetting(WATCH_KEY, next);
   try {
     await chrome.alarms.clear(WATCH_ALARM);
     if (next.enabled) {
@@ -2366,6 +2448,571 @@ async function initReplyWatch() {
   } catch (e) {}
 }
 
+/* ================= HỘP THƯ MESSENGER (đọc hội thoại có sẵn) ============== */
+//
+// AN TOÀN TÀI KHOẢN — nguyên tắc:
+//  - CHỈ chạy khi người dùng CHỦ ĐỘNG bấm (không có vòng lặp nền tự quét).
+//  - Quét là READ-ONLY (chỉ đọc DOM), KHÔNG bấm/gửi gì trong lúc quét.
+//  - Mở tab Messenger ở NỀN (active:false), quét xong ĐÓNG ngay.
+//  - Có trần số hội thoại đọc mỗi lượt + giãn cách giữa các thread để giống
+//    người thật, giảm rủi ro bị gắn cờ.
+//  - Việc GỬI trả lời KHÔNG nằm ở đây: đi qua "message" job (đã có kill-switch,
+//    trần ngày, chống trùng, giãn cách) và luôn chờ người dùng DUYỆT.
+
+// Số thread tối đa đọc chi tiết trong một lượt quét (bảo thủ cho an toàn).
+const INBOX_SCAN_MAX_THREADS = 20;
+
+// ── Lịch đọc thông minh (tránh "quét acc lâu năm load mãi không xong") ──────
+// Mỗi LƯỢT quét chỉ MỞ ĐỌC tối đa ngần này thread. Thread ưu tiên (có tin mới)
+// luôn được đọc trước; phần "backfill" (thread cũ chưa từng đọc) rải dần qua
+// nhiều lượt để không bao giờ mở hàng trăm tab một lúc.
+const INBOX_READ_BUDGET = 8;
+// Trần thời gian THỰC cho pha đọc chi tiết một lượt (ms). Chạm trần thì dừng
+// sớm, các thread còn lại để lượt sau — không treo vô hạn.
+const INBOX_READ_TIME_CAP_MS = 90 * 1000;
+// Số lần đọc HỤT (lỗi/rỗng) tối đa trước khi coi thread là "chịu thua" và ngừng
+// thử lại (tránh vòng lặp kẹt đúng một thread hỏng mỗi lượt quét).
+const INBOX_MAX_READ_ATTEMPTS = 4;
+
+/**
+ * Tính BACKOFF (ms) cho lần đọc lại một thread đọc hụt, theo số lần đã hụt.
+ * Tăng dần: 5' → 15' → 45' → 2h (chặn trên) — giãn để không spam mở tab.
+ */
+function inboxBackoffMs(attempts) {
+  const steps = [5, 15, 45, 120];
+  const i = Math.min(Math.max(0, (Number(attempts) || 1) - 1), steps.length - 1);
+  return steps[i] * 60 * 1000;
+}
+
+/**
+ * HÀM THUẦN (test được): từ danh sách thread quét được + trạng thái ĐÃ LƯU,
+ * quyết định thread nào cần MỞ ĐỌC lượt này, theo thứ tự ưu tiên và trong hạn
+ * mức. KHÔNG chạm DOM/tab — chỉ suy luận trên metadata lấy thụ động.
+ *
+ * Phân loại mỗi thread:
+ *  - deferred: đang trong cửa sổ backoff (nextReadAt > now) HOẶC đã hụt quá số
+ *    lần cho phép -> BỎ QUA lượt này.
+ *  - fresh (ưu tiên 0): có tín hiệu TIN MỚI — unread, hoặc preview đổi so với
+ *    bản đã lưu. Luôn đọc trước.
+ *  - retry (ưu tiên 1): từng đọc nhưng ra RỖNG (emptyReads>0) và chưa tới trần
+ *    -> thử lại (có backoff), sau fresh.
+ *  - backfill (ưu tiên 2): CHƯA TỪNG đọc (không có readAt & chưa có tin) -> rải
+ *    dần. Đây là case acc lâu năm: hàng trăm thread cũ, mỗi lượt chỉ nhặt vài.
+ *  - unchanged: đã đọc, không có tin mới -> KHÔNG đọc lại.
+ *
+ * @returns {{toRead:Array, skipped:number, deferred:number, counts:object}}
+ */
+function planInboxReads(listThreads, storedById, opts, now) {
+  const list = Array.isArray(listThreads) ? listThreads : [];
+  const stored = storedById instanceof Map ? storedById : new Map();
+  const o = opts || {};
+  const budget = Math.max(1, Number(o.budget) || INBOX_READ_BUDGET);
+  const maxAttempts = Math.max(1, Number(o.maxAttempts) || INBOX_MAX_READ_ATTEMPTS);
+  const t = Number(now) || Date.now();
+  const norm = (s) => String(s || "").trim().toLowerCase();
+
+  const fresh = [];
+  const retry = [];
+  const backfill = [];
+  let deferred = 0;
+  let unchanged = 0;
+
+  for (const th of list) {
+    const id = String((th && th.threadId) || "");
+    if (!id) continue;
+    const prev = stored.get(id);
+    const hasStored =
+      prev && Array.isArray(prev.messages) && prev.messages.length > 0;
+    const attempts = Number(prev && prev.readAttempts) || 0;
+    const empties = Number(prev && prev.emptyReads) || 0;
+    const nextReadAt = Number(prev && prev.nextReadAt) || 0;
+    const everRead = !!(prev && (prev.readAt || hasStored));
+
+    // Tín hiệu tin mới (thụ động từ list-scan). CHỈ tính "preview đổi" khi ĐÃ có
+    // bản ghi cũ để so — lượt quét ĐẦU TIÊN (chưa từng thấy thread) KHÔNG được
+    // coi preview khác rỗng là "tin mới", nếu không mọi thread acc lâu năm sẽ bị
+    // xếp fresh và mở hết. Thread mới toanh mà không unread -> để "backfill".
+    const previewChanged =
+      !!prev &&
+      norm(th.preview) &&
+      norm(th.preview) !== norm(prev.preview);
+    const hasNew = !!th.unread || previewChanged;
+
+    // Đã "chịu thua" (hụt quá nhiều) và KHÔNG có tin mới -> thôi thử.
+    if (attempts >= maxAttempts && !hasNew) {
+      deferred += 1;
+      continue;
+    }
+    // Trong cửa sổ backoff và KHÔNG có tin mới -> hoãn. (Tin mới thì đọc ngay,
+    // bỏ qua backoff, vì đó là thứ người dùng cần nhất.)
+    if (nextReadAt > t && !hasNew) {
+      deferred += 1;
+      continue;
+    }
+
+    if (hasNew) {
+      fresh.push(th);
+    } else if (!everRead) {
+      backfill.push(th);
+    } else if (empties > 0) {
+      retry.push(th);
+    } else {
+      unchanged += 1;
+    }
+  }
+
+  // Ưu tiên: fresh -> retry -> backfill. Cắt theo budget.
+  const ordered = fresh.concat(retry).concat(backfill);
+  const toRead = ordered.slice(0, budget);
+  const considered = fresh.length + retry.length + backfill.length;
+  const skipped = list.length - toRead.length;
+  return {
+    toRead,
+    skipped,
+    deferred,
+    counts: {
+      fresh: fresh.length,
+      retry: retry.length,
+      backfill: backfill.length,
+      unchanged,
+      considered,
+    },
+  };
+}
+
+/**
+ * Hàm TỰ-CHỨA chạy trong TAB /messages: quét DANH SÁCH hội thoại ở cột trái.
+ * Trả về { ok, threads:[{threadId,name,threadUrl,preview,unread}] }.
+ * KHÔNG mở/không bấm vào hội thoại nào — chỉ đọc các link /messages/t/<id>.
+ */
+async function runScanInboxListInPage(maxThreads) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const cap = Math.max(1, Math.min(50, Number(maxThreads) || 20));
+
+  // Chờ danh sách hội thoại render (tab nền tải lười).
+  const findLinks = () =>
+    Array.from(document.querySelectorAll('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]'));
+  let links = findLinks();
+  for (let i = 0; i < 8 && links.length === 0; i++) {
+    await sleep(1500);
+    links = findLinks();
+  }
+  if (links.length === 0) {
+    return { ok: false, error: "Không thấy danh sách hội thoại (có thể chưa đăng nhập Messenger hoặc trang chưa tải xong)." };
+  }
+
+  const idOf = (href) => {
+    const m = String(href || "").match(/\/messages\/(?:e2ee\/)?t\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  };
+  const seen = new Set();
+  const threads = [];
+  for (const a of links) {
+    const href = a.href || a.getAttribute("href") || "";
+    const threadId = idOf(href);
+    if (!threadId || seen.has(threadId)) continue;
+    seen.add(threadId);
+
+    // Tên + preview: FB xếp trong các span dir="auto" bên trong link/row.
+    // LƯU Ý: span ĐẦU thường KHÔNG phải tên hội thoại mà là nhãn phụ trợ cho
+    // trình đọc màn hình / biểu tượng (vd "Thông báo", "Đang hoạt động"), nên
+    // lấy span[0] làm tên sẽ ra sai (mọi thread thành "Thông báo"). Cần LỌC bỏ
+    // các nhãn hệ thống chung rồi mới chọn tên; nếu bí thì dùng aria-label.
+    const GENERIC_LABEL =
+      /^(thông báo|notifications?|đang hoạt động|active( now)?|hoạt động|marketplace|đã xem|seen|sent|đã gửi|đã nhận|delivered|you|bạn|mới|new)$/i;
+    const isTimeish = (s) =>
+      /^\d/.test(s) || /^(vài|một|hai|ba|bốn|năm|sáu|bảy|tám|chín|mười)\b/i.test(s);
+    const spans = Array.from(a.querySelectorAll('span[dir="auto"], span'))
+      .map((s) => (s.textContent || "").trim())
+      .filter(Boolean);
+    // Ứng viên tên: bỏ nhãn hệ thống, bỏ chuỗi thời gian, cần đủ dài.
+    const meaningful = spans.filter(
+      (s) => !GENERIC_LABEL.test(s) && !isTimeish(s) && s.length >= 2
+    );
+    let name = meaningful[0] || "";
+    // Dự phòng: aria-label của link/row thường bắt đầu bằng tên hội thoại.
+    if (!name || GENERIC_LABEL.test(name)) {
+      const ariaName = (a.getAttribute("aria-label") || "").trim();
+      if (ariaName) name = ariaName.split(/[,·\n]|\s{2,}/)[0].trim();
+    }
+    // Preview: chuỗi có nghĩa dài nhất KHÁC tên.
+    let preview = "";
+    for (const s of meaningful) {
+      if (s !== name && s.length > preview.length) preview = s;
+    }
+    // Chưa đọc: FB hay gắn aria-label chứa "chưa đọc"/"unread", hoặc chữ đậm.
+    const aria = (a.getAttribute("aria-label") || "").toLowerCase();
+    const row = a.closest('[role="row"], [role="gridcell"], li') || a;
+    const unread =
+      /unread|chưa đọc/.test(aria) ||
+      !!(row.querySelector && row.querySelector('[aria-label*="Unread"], [aria-label*="chưa đọc"]'));
+
+    threads.push({
+      threadId,
+      name: name.slice(0, 200),
+      threadUrl: "https://www.facebook.com/messages/t/" + threadId,
+      preview: preview.slice(0, 400),
+      unread,
+    });
+    if (threads.length >= cap) break;
+  }
+  return { ok: true, threads };
+}
+
+/**
+ * Hàm TỰ-CHỨA chạy trong TAB /messages/t/<id>: đọc CÁC TIN NHẮN trong hội thoại
+ * đang mở. Trả về { ok, messages:[{mine,text}], name }.
+ * READ-ONLY: không gõ, không gửi.
+ */
+async function runReadThreadInPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ── Tín hiệu VÀNG (đã kiểm chứng bằng DOM thật): mỗi tin nhắn trong hội thoại
+  //    mang một [role="button"] có aria-label dạng:
+  //      "Nhập, Tin nhắn do {NGƯỜI} gửi lúc {GIỜ}: {NỘI DUNG}"
+  //    "do Bạn gửi" => của mình; "do <tên khác> gửi" => của đối phương.
+  //    Đây là 1 nút / 1 tin, KHÔNG dính thanh bên trái, panel phải hay dấu giờ.
+  const MSG_ARIA =
+    /tin nhắn do .+? gửi|message .*sent by|you sent|bạn đã gửi/i;
+  const findMsgBtns = () =>
+    Array.from(document.querySelectorAll('[role="button"][aria-label]')).filter(
+      (b) => MSG_ARIA.test(b.getAttribute("aria-label") || "")
+    );
+
+  let btns = findMsgBtns();
+  for (let i = 0; i < 8 && btns.length === 0; i++) {
+    await sleep(1500);
+    btns = findMsgBtns();
+  }
+
+  // Nhãn UI/hệ thống KHÔNG được dùng làm tên hội thoại (tránh lỗi "tên biến
+  // thành 'Đoạn chat'"). heading trên Messenger thường là "Đoạn chat".
+  const GENERIC_NAME =
+    /^(đoạn chat|thông báo|notifications?|đang hoạt động|active( now)?|messenger|tin nhắn|messages?|chat|menu|trang chủ|home|marketplace)$/i;
+  const cleanName = (raw) => {
+    const s = (raw || "").trim();
+    if (!s || GENERIC_NAME.test(s)) return "";
+    return s.slice(0, 200);
+  };
+
+  // Tách "mine" + "text" + "sender" từ aria-label. Nội dung nằm sau dấu ": "
+  // (colon+space) ĐẦU TIÊN — vì giờ ("21:40ch") dùng ":" KHÔNG kèm khoảng trắng
+  // nên không lẫn. Tên người gửi nằm giữa "do " và " gửi".
+  const parseAria = (ariaRaw) => {
+    const aria = String(ariaRaw || "");
+    const mine = /tin nhắn do bạn gửi|bạn đã gửi|you sent/i.test(aria);
+    const parts = aria.split(/:\s+/);
+    const text = parts.length > 1 ? parts.slice(1).join(": ").trim() : "";
+    let sender = "";
+    const sm = aria.match(/do\s+(.+?)\s+gửi/i) || aria.match(/sent by\s+(.+?)(?:\s+at|:|$)/i);
+    if (sm && sm[1]) sender = sm[1].trim();
+    return { mine, text, sender };
+  };
+
+  const messages = [];
+  let name = "";
+  for (const b of btns) {
+    const { mine, text, sender } = parseAria(b.getAttribute("aria-label"));
+    // Tên hội thoại = tên người gửi KHÁC "Bạn" (đối phương trong chat 1:1).
+    if (!name && !mine && sender) {
+      const n = cleanName(sender);
+      if (n && !/^bạn$/i.test(n)) name = n;
+    }
+    if (!text) continue; // tin chỉ có ảnh/sticker (không có phần text) -> bỏ.
+    messages.push({ mine: mine === true, text: text.slice(0, 8000) });
+  }
+
+  // Dự phòng tên: heading trên cùng, nhưng loại nhãn UI chung.
+  if (!name) {
+    const h = document.querySelector(
+      '[role="main"] h1, [role="main"] h2, [aria-label] h1, h1 span'
+    );
+    if (h) name = cleanName(h.textContent || "");
+  }
+
+  // Khử trùng lặp liên tiếp.
+  const dedupOf = (list) => {
+    const d = [];
+    for (const m of list) {
+      const prev = d[d.length - 1];
+      if (prev && prev.text === m.text && prev.mine === m.mine) continue;
+      d.push(m);
+    }
+    return d.slice(-60);
+  };
+
+  const viaAria = dedupOf(messages);
+  if (viaAria.length > 0) {
+    return { ok: true, messages: viaAria, name };
+  }
+
+  // ── DỰ PHÒNG (khi FB đổi aria-label): đọc theo VỊ TRÍ bong bóng trong
+  //    [role="main"]. FB căn tin của MÌNH lệch phải, của người khác lệch trái.
+  const mainEl = document.querySelector('[role="main"]') || document.body;
+  const mainRect = mainEl.getBoundingClientRect();
+  const midX = mainRect.left + mainRect.width / 2;
+  const SYS_LABEL =
+    /^(đang hoạt động|active now|seen|đã xem|sent|đã gửi|delivered|đã nhận|enter|được mã hóa|·|\d{1,2}:\d{2})/i;
+
+  const posMsgs = [];
+  const bubbles = Array.from(mainEl.querySelectorAll('div[dir="auto"]')).filter(
+    (d) => {
+      const t = (d.textContent || "").trim();
+      if (!t || SYS_LABEL.test(t) || t.startsWith("Nhập")) return false;
+      const r = d.getBoundingClientRect();
+      return r.width > 0;
+    }
+  );
+  for (const b of bubbles) {
+    const text = (b.textContent || "").trim();
+    let mine = false;
+    try {
+      const r = b.getBoundingClientRect();
+      const gapLeft = r.left - mainRect.left;
+      const gapRight = mainRect.right - r.right;
+      if (gapLeft - gapRight > 40) mine = true;
+      else if (gapRight - gapLeft > 40) mine = false;
+      else mine = r.left + r.width / 2 >= midX;
+    } catch (e) {}
+    posMsgs.push({ mine, text: text.slice(0, 8000) });
+  }
+  return { ok: true, messages: dedupOf(posMsgs), name };
+}
+
+/**
+ * QUÉT DANH SÁCH hội thoại: mở tab /messages ở nền, đọc cột trái, đóng tab.
+ * Nếu deep=true thì đọc luôn chi tiết tin của tối đa INBOX_SCAN_MAX_THREADS
+ * thread (giãn cách giữa các thread). Trả về { ok, threads } hoặc { ok:false }.
+ */
+async function scanInbox(options) {
+  const opts = options || {};
+  const deep = !!opts.deep;
+  const maxThreads = Math.max(1, Math.min(INBOX_SCAN_MAX_THREADS, Number(opts.maxThreads) || INBOX_SCAN_MAX_THREADS));
+
+  // Chốt chặn kill-switch: nếu hệ thống đang bị FB chặn thì không quét.
+  try {
+    const blockState = await getCrawlBlockState();
+    if (blockState && blockState.blocked) {
+      return { ok: false, error: "Hệ thống đang tạm dừng do phát hiện rủi ro (kill-switch). Lý do: " + (blockState.reason || "không rõ") + "." };
+    }
+  } catch (e) {}
+
+  const listUrl = "https://www.facebook.com/messages/";
+  const tab = await new Promise((r) => chrome.tabs.create({ url: listUrl, active: false }, r));
+  let listThreads = [];
+  let via = "api";
+  try {
+    await waitTabComplete(tab.id, 30000);
+    await sleep(4000);
+
+    // ƯU TIÊN API (tier-2 replay-trong-trang): content.js đã tự chèn ở
+    // /messages/* nên chỉ cần nhắn lệnh. An toàn hơn DOM (không tạo click giả),
+    // và lấy được ĐẦY ĐỦ nhờ phân trang cursor. Nếu chưa bắt được gói API thì
+    // rơi xuống DOM dự phòng bên dưới.
+    let apiOut = null;
+    try {
+      apiOut = await chrome.tabs.sendMessage(tab.id, {
+        type: "START_INBOX_API_SCAN",
+        options: { maxThreads },
+      });
+    } catch (e) {
+      apiOut = null; // content.js chưa sẵn sàng / trang chưa khớp
+    }
+    if (apiOut && apiOut.ok && Array.isArray(apiOut.threads) && apiOut.threads.length) {
+      listThreads = apiOut.threads.map((t) => ({
+        threadId: t.threadId,
+        name: t.name || "",
+        threadUrl: t.threadUrl || (listUrl + "t/" + encodeURIComponent(t.threadId)),
+        preview: t.preview || "",
+        unread: !!t.unread,
+      }));
+    } else {
+      // DOM DỰ PHÒNG: đọc danh sách hội thoại từ giao diện.
+      via = "dom";
+      let res;
+      try {
+        res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: runScanInboxListInPage,
+          args: [maxThreads],
+        });
+      } catch (e) {
+        return { ok: false, error: "Lỗi chạy script quét hộp thư: " + String(e) };
+      }
+      const out = (res && res[0] && res[0].result) || { ok: false, error: "Không có kết quả." };
+      if (!out.ok) return out;
+      listThreads = Array.isArray(out.threads) ? out.threads : [];
+    }
+  } finally {
+    try { await chrome.tabs.remove(tab.id); } catch (e) {}
+  }
+
+  // Chụp trạng thái ĐÃ LƯU trước khi upsert (upsert sẽ ghi preview mới), để phát
+  // hiện thread KHÔNG đổi mà bỏ qua việc mở đọc lại.
+  const storedById = new Map();
+  try {
+    const existing = await DB.getInboxThreads();
+    for (const t of existing) storedById.set(String(t.threadId), t);
+  } catch (e) {}
+
+  // Lưu danh sách (chưa có messages) — UPSERT giữ nháp/tin cũ.
+  try { await DB.upsertInboxThreads(listThreads); } catch (e) {}
+
+  if (!deep || listThreads.length === 0) {
+    return { ok: true, threads: listThreads, deep: false, via };
+  }
+
+  // TỐI ƯU AN TOÀN + LỊCH ĐỌC THÔNG MINH: tin nhắn Messenger MÃ HOÁ ĐẦU-CUỐI
+  // (Labyrinth V1_1) nên text chỉ lấy được từ DOM sau khi trang tự giải mã
+  // (API/IndexedDB đều là ciphertext "maw_ear"). Vì mỗi thread phải MỞ 1 TAB để
+  // đọc, KHÔNG được mở tất cả — nhất là acc lâu năm có hàng trăm hội thoại cũ.
+  // planInboxReads() phân loại & xếp ưu tiên: tin mới (unread/preview đổi) đọc
+  // trước, kế đến thử-lại thread từng rỗng, rồi "backfill" thread cũ chưa từng
+  // đọc — tất cả trong HẠN MỨC budget mỗi lượt. Thread đã đọc & không đổi thì bỏ
+  // qua; thread đọc hụt nhiều lần bị giãn (backoff) rồi thôi. Nhờ vậy quét acc
+  // lâu năm KHÔNG "load mãi": mỗi lượt chỉ mở vài tab, phần còn lại rải lượt sau.
+  const readBudget = Math.max(1, Number(opts.readBudget) || INBOX_READ_BUDGET);
+  const slice = listThreads.slice(0, maxThreads);
+  const plan = planInboxReads(slice, storedById, { budget: readBudget }, Date.now());
+
+  const detailed = [];
+  const startedAt = Date.now();
+  let read = 0;
+  let failed = 0;
+  let timedOut = false;
+  for (const th of plan.toRead) {
+    // Trần thời gian THỰC: chạm trần thì dừng, thread còn lại để lượt sau.
+    if (Date.now() - startedAt > INBOX_READ_TIME_CAP_MS) {
+      timedOut = true;
+      break;
+    }
+    const id = String(th.threadId);
+    const prev = storedById.get(id) || {};
+    const one = await readInboxThread(id);
+    const gotMsgs =
+      one &&
+      one.ok &&
+      one.thread &&
+      Array.isArray(one.thread.messages) &&
+      one.thread.messages.length > 0;
+
+    if (gotMsgs) {
+      // Thành công: reset bộ đếm hụt, đóng dấu đã đọc.
+      read += 1;
+      detailed.push(one.thread);
+      try {
+        await DB.upsertInboxThreads([
+          {
+            threadId: id,
+            readAt: Date.now(),
+            readAttempts: 0,
+            emptyReads: 0,
+            nextReadAt: null,
+            lastReadError: null,
+          },
+        ]);
+      } catch (e) {}
+    } else {
+      // Hụt (lỗi hoặc rỗng): tăng bộ đếm + đặt backoff để không kẹt lượt sau.
+      failed += 1;
+      const attempts = (Number(prev.readAttempts) || 0) + 1;
+      const isEmpty = one && one.ok; // ok nhưng 0 tin => parse rỗng
+      const emptyReads = (Number(prev.emptyReads) || 0) + (isEmpty ? 1 : 0);
+      try {
+        await DB.upsertInboxThreads([
+          {
+            threadId: id,
+            readAt: Date.now(),
+            readAttempts: attempts,
+            emptyReads,
+            nextReadAt: Date.now() + inboxBackoffMs(attempts),
+            lastReadError: isEmpty
+              ? "Đọc ra 0 tin (có thể chỉ có ảnh/sticker hoặc DOM chưa render)."
+              : String((one && one.error) || "Đọc hụt."),
+          },
+        ]);
+      } catch (e) {}
+    }
+    await sleep(3500);
+  }
+
+  const threads = await DB.getInboxThreads();
+  return {
+    ok: true,
+    threads,
+    deep: true,
+    read,
+    failed,
+    skipped: plan.skipped,
+    deferred: plan.deferred,
+    pending: Math.max(0, plan.counts.considered - plan.toRead.length),
+    timedOut,
+    counts: plan.counts,
+    via,
+  };
+}
+
+/**
+ * MỞ & ĐỌC một hội thoại theo threadId: mở tab /messages/t/<id> ở nền, đọc tin,
+ * đóng tab, UPSERT vào store. Trả về { ok, thread } hoặc { ok:false, error }.
+ */
+async function readInboxThread(threadId) {
+  const id = String(threadId || "").trim();
+  if (!id) return { ok: false, error: "Thiếu mã hội thoại." };
+
+  try {
+    const blockState = await getCrawlBlockState();
+    if (blockState && blockState.blocked) {
+      return { ok: false, error: "Hệ thống đang tạm dừng (kill-switch): " + (blockState.reason || "không rõ") + "." };
+    }
+  } catch (e) {}
+
+  const url = "https://www.facebook.com/messages/t/" + encodeURIComponent(id);
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  let out = { ok: false, error: "Không có kết quả." };
+  let name = "";
+  try {
+    await waitTabComplete(tab.id, 30000);
+    // Chờ ngắn cho khung chat khởi tạo; runReadThreadInPage tự poll thêm
+    // (8×1500ms) đến khi tin render, nên không cần chờ cố định lâu ở đây.
+    await sleep(1500);
+
+    // DOM-FIRST (đã kiểm chứng bằng dữ liệu bắt thật): tin nhắn Messenger được
+    // MÃ HOÁ ĐẦU-CUỐI (Labyrinth V1_1). API mạng chỉ trả METADATA mã hoá
+    // (sender_id/sort_order_ms), KHÔNG có text; IndexedDB cũng là ciphertext
+    // ("maw_ear"). Vì vậy DOM sau khi trang tự giải mã là nguồn text DUY NHẤT.
+    // Đọc thẳng DOM theo aria-label (đã cho cả text lẫn tên người gửi) — bỏ
+    // luôn bước chờ template API ~15s vốn không bao giờ ra text cho thread E2EE.
+    let res;
+    try {
+      res = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: runReadThreadInPage,
+      });
+    } catch (e) {
+      return { ok: false, error: "Lỗi chạy script đọc hội thoại: " + String(e) };
+    }
+    out = (res && res[0] && res[0].result) || out;
+  } finally {
+    try { await chrome.tabs.remove(tab.id); } catch (e) {}
+  }
+  if (!out.ok) return out;
+
+  const messages = Array.isArray(out.messages) ? out.messages : [];
+  name = out.name || "";
+  await DB.upsertInboxThreads([
+    {
+      threadId: id,
+      name,
+      threadUrl: url,
+      messages,
+      unread: false, // vừa đọc xong -> coi như đã đọc trong app
+    },
+  ]);
+  const thread = await DB.getInboxThread(id);
+  return { ok: true, thread };
+}
+
 export {
   CRAWL_TABS_KEY,
   withNewestSort,
@@ -2386,6 +3033,10 @@ export {
   scanJoinedGroups,
   runJob,
   executeDeletePost,
+  scanInbox,
+  readInboxThread,
+  planInboxReads,
+  inboxBackoffMs,
   processDueJobs,
   scheduleTickSoon,
   AUTOCRAWL_ALARM,

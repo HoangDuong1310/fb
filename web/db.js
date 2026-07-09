@@ -186,6 +186,72 @@ export async function runMigrations() {
       created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
+    /* ── user_settings — generic per-user key/value config blobs ──────── */
+    // Thay cho các khoá nhỏ trước đây ở chrome.storage.local (autoCrawlConfig,
+    // autoSyncConfig, watchRepliesConfig, aiConfig, fbSelectors, crawlSettings,
+    // uiPrefs, aiModelList, deletedPriceSeedIds...). Mỗi (user, key) một dòng,
+    // giá trị là JSON tuỳ ý -> lưu theo TÀI KHOẢN người dùng, đồng bộ mọi thiết bị.
+    `CREATE TABLE IF NOT EXISTS user_settings (
+      user_id     INT UNSIGNED NOT NULL,
+      key_name    VARCHAR(64)  NOT NULL,
+      value       JSON,
+      updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, key_name),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+    /* ── jobs — hàng đợi tự động hoá (đăng/bình luận/nhắn tin) ─────────── */
+    // Trước đây là chrome.storage.local "localJobs" (giới hạn ~10MB toàn thiết bị,
+    // dễ tràn khi kèm nhiều ảnh base64). Nay mỗi job MỘT DÒNG theo tài khoản: id
+    // là AUTO_INCREMENT (thay cho seq cục bộ), các trường điều phối tách cột để
+    // truy vấn (status/type/scheduled_at), phần còn lại nằm trong `data` JSON.
+    `CREATE TABLE IF NOT EXISTS jobs (
+      id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      user_id       INT UNSIGNED NOT NULL,
+      type          VARCHAR(32)  NOT NULL DEFAULT 'post',
+      status        VARCHAR(32)  NOT NULL DEFAULT 'pending',
+      attempts      INT          NOT NULL DEFAULT 0,
+      scheduled_at  BIGINT       DEFAULT NULL,
+      created_at    BIGINT       DEFAULT NULL,
+      updated_at    BIGINT       DEFAULT NULL,
+      data          JSON,
+      INDEX idx_user_status (user_id, status),
+      INDEX idx_user_type (user_id, type),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+    /* ── inbox_threads — hộp thư Messenger quét từ DOM ────────────────── */
+    // Trước đây là chrome.storage.local "inboxThreads". Nay theo tài khoản người
+    // dùng. Mỗi thread MỘT DÒNG (PK user_id+thread_id) để UPSERT không đẻ trùng;
+    // toàn bộ bản ghi thread (name/preview/messages/draft/read-state) nằm trong
+    // `data` JSON để giữ NGUYÊN hình dạng phía client.
+    `CREATE TABLE IF NOT EXISTS inbox_threads (
+      user_id     INT UNSIGNED NOT NULL,
+      thread_id   VARCHAR(191) NOT NULL,
+      updated_at  BIGINT       DEFAULT NULL,
+      data        JSON,
+      PRIMARY KEY (user_id, thread_id),
+      INDEX idx_user_updated (user_id, updated_at),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+    /* ── posted_groups — lịch sử đăng theo TÀI KHOẢN FACEBOOK ─────────── */
+    // Trước đây là chrome.storage.local "postedGroups" (map theo FB account id).
+    // GIỮ NGUYÊN ngữ nghĩa: khoá bằng cả web user_id (chủ sở hữu/cô lập) LẪN
+    // fb_account_id (một reseller có thể chạy nhiều nick FB) -> lịch sử tách theo
+    // từng nick FB đúng như hành vi cũ.
+    `CREATE TABLE IF NOT EXISTS posted_groups (
+      user_id        INT UNSIGNED NOT NULL,
+      fb_account_id  VARCHAR(64)  NOT NULL DEFAULT '_local',
+      group_id       VARCHAR(64)  NOT NULL,
+      group_name     VARCHAR(255) NOT NULL DEFAULT '',
+      post_count     INT          NOT NULL DEFAULT 0,
+      last_posted_at BIGINT       DEFAULT NULL,
+      PRIMARY KEY (user_id, fb_account_id, group_id),
+      INDEX idx_user_fb (user_id, fb_account_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
     /* ── remote_commands ─────────────────────────────────────────────── */
     `CREATE TABLE IF NOT EXISTS remote_commands (
       id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,

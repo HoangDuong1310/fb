@@ -4,6 +4,8 @@
  * Đây là ES module (import/export) — service worker chạy ở chế độ "type":"module".
  */
 
+import { apiFetch } from "./api.js";
+
 // ---- Tab / DOM helpers ------------------------------------------------------
 
 /** Lấy tab đang active ở cửa sổ hiện tại (null nếu không có). */
@@ -38,7 +40,7 @@ export function waitTabComplete(tabId, timeoutMs) {
 
 /** Mở (hoặc focus) trang quản lý dashboard. */
 export async function openDashboard() {
-  const url = chrome.runtime.getURL("src/dashboard.html");
+  const url = chrome.runtime.getURL("dist/ui/index.html");
   const tabs = await new Promise((r) => chrome.tabs.query({}, r));
   const existing = (tabs || []).find((t) => t.url && t.url.indexOf(url) === 0);
   if (existing) {
@@ -293,14 +295,14 @@ export function stripTags(htmlFrag) {
 
 // ---- AI config / JSON parse helpers ----------------------------------------
 
-/** Đọc cấu hình AI (apiBase/apiKey/model...) từ chrome.storage.local. */
-export function getAIConfig() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get("aiConfig", (r) => {
-      void chrome.runtime.lastError;
-      resolve((r && r.aiConfig) || {});
-    });
-  });
+/** Đọc cấu hình AI (apiBase/apiKey/model...) theo TÀI KHOẢN từ server. */
+export async function getAIConfig() {
+  try {
+    const r = await apiFetch("/api/settings/aiConfig");
+    return (r && r.value) || {};
+  } catch (e) {
+    return {};
+  }
 }
 
 /** Bóc object JSON từ phản hồi AI: bỏ code fence, cắt từ "{" đầu tới "}" cuối. */
@@ -318,6 +320,14 @@ export function parseSelectorJson(text) {
     const obj = JSON.parse(s);
     return obj && typeof obj === "object" ? obj : null;
   } catch (e) {
-    return null;
+    // LLM hay trả JSON có dấu "\" thừa trước ký tự không hợp lệ (vd emoji),
+    // khiến JSON.parse ném lỗi. Thử làm sạch escape sai rồi parse lại.
+    try {
+      const cleaned = s.replace(/\\(?!["\\/bfnrtu])/g, "");
+      const obj = JSON.parse(cleaned);
+      return obj && typeof obj === "object" ? obj : null;
+    } catch (e2) {
+      return null;
+    }
   }
 }

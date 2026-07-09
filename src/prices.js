@@ -609,30 +609,21 @@ const SEED_PRICE_SOURCE_IDS = new Set(SEED_PRICE_SOURCES.map((s) => s.id));
 const DELETED_SEED_KEY = "deletedPriceSeedIds";
 
 // Đọc danh sách id seed mà người dùng đã chủ động xoá (để không tự thêm lại).
-function getDeletedSeedIds() {
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get(DELETED_SEED_KEY, (obj) => {
-        const arr = obj && Array.isArray(obj[DELETED_SEED_KEY]) ? obj[DELETED_SEED_KEY] : [];
-        resolve(new Set(arr));
-      });
-    } catch (e) {
-      resolve(new Set());
-    }
-  });
+// Lưu theo TÀI KHOẢN trên server (qua /api/settings).
+async function getDeletedSeedIds() {
+  const arr = await DB.getSetting(DELETED_SEED_KEY, []);
+  return new Set(Array.isArray(arr) ? arr : []);
 }
 
 // Ghi nhớ 1 id seed vừa bị xoá.
 async function rememberDeletedSeed(id) {
   const set = await getDeletedSeedIds();
   set.add(id);
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.set({ [DELETED_SEED_KEY]: [...set] }, () => resolve());
-    } catch (e) {
-      resolve();
-    }
-  });
+  try {
+    await DB.setSetting(DELETED_SEED_KEY, [...set]);
+  } catch (e) {
+    /* bỏ qua */
+  }
 }
 
 // Dọn các nguồn TRÙNG LẶP đời cũ (seed vòng trước) có tên chứa

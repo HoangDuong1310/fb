@@ -5,11 +5,11 @@
  * products, sources, advisories, conversations...) đi qua web backend bằng
  * apiFetch() trong api.js (gắn Bearer token, parse JSON, ném khi non-2xx).
  *
- * NGOẠI LỆ — JOBS: hàng đợi job (đăng bài/bình luận) là TRẠNG THÁI TỰ ĐỘNG HOÁ
- * CỤC BỘ của từng thiết bị, không chia sẻ. Vì vậy job vẫn nằm trong
- * chrome.storage.local (KHÔNG gọi API). Khi chạy ngoài extension (test bằng
- * plain Node, không có `chrome`) thì rơi về một store in-memory để module nạp
- * được mà không crash.
+ * NAY MỌI THỨ THEO TÀI KHOẢN: hàng đợi job (đăng bài/bình luận), hộp thư
+ * Messenger (inbox threads) và lịch sử nhóm đã đăng (posted groups) cũng ĐI QUA
+ * server theo user (isolation bằng JWT). Chỉ token/đăng nhập và trạng thái
+ * tab/session mới còn ở chrome.storage.local. Nhờ vậy dữ liệu đồng bộ trên mọi
+ * thiết bị của cùng một tài khoản.
  *
  * QUAN TRỌNG: TÊN HÀM XUẤT RA & HÌNH DẠNG GIÁ TRỊ TRẢ VỀ được GIỮ NGUYÊN để
  * crawl.js / advisory.js / prices.js / background.js / dashboard views không
@@ -136,345 +136,242 @@ async function deleteGroup(groupId) {
 
 /* ============================= JOBS ====================================== */
 //
-// Job = trạng thái tự động hoá CỤC BỘ của thiết bị. KHÔNG gọi API. Lưu trong
-// chrome.storage.local; ngoài extension thì dùng store in-memory để test chạy
-// được mà không cần `chrome`.
-const JOBS_KEY = "localJobs";
+// Job = hàng đợi tự động hoá (đăng bài / bình luận / nhắn tin). TRƯỚC ĐÂY lưu
+// CỤC BỘ trong chrome.storage.local ("localJobs"); NAY đã chuyển LÊN SERVER theo
+// TÀI KHOẢN người dùng qua /api/jobs (đồng bộ mọi thiết bị, không còn giới hạn
+// ~10MB của chrome.storage). Toàn bộ logic hàng đợi (cấp id, chống trùng, khôi
+// phục job kẹt, trần số tin/ngày) nằm ở server (web/routes/jobs.js); ở đây chỉ
+// là lớp gọi API mỏng, GIỮ NGUYÊN tên hàm + hình dạng bản ghi trả về để
+// crawl.js / background.js / dashboard không phải đổi gì.
 
-// Một job ở trạng thái "running" lâu hơn ngưỡng này được coi là bị KẸT (do
-// service worker MV3 bị Chrome tắt giữa chừng) và sẽ được khôi phục để chạy lại.
-const STUCK_RUNNING_MS = 3 * 60 * 1000; // 3 phút
-// Số lần thử tối đa trước khi đánh dấu lỗi (tránh lặp vô hạn / đăng trùng mãi).
-const MAX_JOB_ATTEMPTS = 3;
-
-// Store in-memory dự phòng (khi không có chrome.storage). { seq, jobs:[] }.
-let _memJobs = { seq: 1, jobs: [] };
-
-/** Có đang chạy trong môi trường extension có chrome.storage không? */
-function hasChromeStorage() {
-  return (
-    typeof chrome !== "undefined" &&
-    chrome &&
-    chrome.storage &&
-    chrome.storage.local
-  );
-}
-
-/** Đọc toàn bộ store job ({ seq, jobs }). */
-function readJobs() {
-  if (!hasChromeStorage()) {
-    return Promise.resolve(_memJobs);
-  }
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get(JOBS_KEY, (r) => {
-        void chrome.runtime.lastError;
-        const v = (r && r[JOBS_KEY]) || { seq: 1, jobs: [] };
-        if (!Array.isArray(v.jobs)) v.jobs = [];
-        if (typeof v.seq !== "number") v.seq = 1;
-        resolve(v);
-      });
-    } catch (e) {
-      resolve({ seq: 1, jobs: [] });
-    }
-  });
-}
-
-/**
- * Ghi toàn bộ store job.
- *
- * QUAN TRỌNG: chrome.storage.local có hạn mức ~10MB (không có quyền
- * "unlimitedStorage" thì KHÔNG được vượt). Khi vượt hạn mức (vd tạo hàng
- * loạt job kèm nhiều ảnh cho nhiều nhóm), chrome.storage.local.set() vẫn gọi
- * callback nhưng đặt chrome.runtime.lastError — nếu bỏ qua lỗi này thì lời
- * gọi coi như "thành công" trong khi KHÔNG có gì được lưu, khiến hàng đợi
- * trống trơn dù trước đó báo tạo việc thành công. Vì vậy PHẢI reject để lỗi
- * lan lên tới UI (thay vì nuốt lỗi bằng `void chrome.runtime.lastError`).
- */
-function writeJobs(store) {
-  if (!hasChromeStorage()) {
-    _memJobs = store;
-    return Promise.resolve();
-  }
-  return new Promise((resolve, reject) => {
-    try {
-      chrome.storage.local.set({ [JOBS_KEY]: store }, () => {
-        const err = chrome.runtime.lastError;
-        if (err) {
-          reject(new Error(err.message || String(err)));
-          return;
-        }
-        resolve();
-      });
-    } catch (e) {
-      reject(e instanceof Error ? e : new Error(String(e)));
-    }
-  });
-}
-
-// CONCURRENCY CAVEAT (single-writer assumption): the job mutators below
-// (createJob / updateJob / deleteJob / clearFinishedJobs) run a
-// read-modify-write cycle over the whole store. They assume a single writer
-// per device (the background service worker). Two overlapping writers could
-// race on read/write and lose an update or reuse a seq. This is acceptable for
-// device-local automation state and is NOT redesigned here.
-/** Tạo một job (đăng bài / bình luận). Trả về job đã lưu (kèm id). */
+/** Tạo một job (đăng bài / bình luận / nhắn tin). Trả về job đã lưu (kèm id). */
 async function createJob(job) {
-  const j = job || {};
-  const store = await readJobs();
-  const id = store.seq++;
-  const record = {
-    type: "post",
-    status: "pending",
-    attempts: 0,
-    result: null,
-    error: null,
-    createdAt: Date.now(),
-    scheduledAt: j.scheduledAt || Date.now(),
-    ...j,
-    id,
-  };
-  store.jobs.push(record);
-  await writeJobs(store);
-  return record;
+  return apiFetch("/api/jobs", {
+    method: "POST",
+    body: JSON.stringify({ job: job || {} }),
+  });
 }
 
 /** Tạo nhiều job cùng lúc (batch). Trả về mảng job đã lưu. */
 async function createJobs(jobs) {
-  const store = await readJobs();
-  const results = [];
-  for (const j of jobs || []) {
-    const id = store.seq++;
-    const record = {
-      type: "post",
-      status: "pending",
-      attempts: 0,
-      result: null,
-      error: null,
-      createdAt: Date.now(),
-      scheduledAt: j.scheduledAt || Date.now(),
-      ...j,
-      id,
-    };
-    store.jobs.push(record);
-    results.push(record);
-  }
-  await writeJobs(store);
-  return results;
+  return apiFetch("/api/jobs/batch", {
+    method: "POST",
+    body: JSON.stringify({ jobs: Array.isArray(jobs) ? jobs : [] }),
+  });
 }
 
 /** Cập nhật một job theo id (gộp các trường truyền vào). Trả về job merged hoặc null. */
 async function updateJob(id, patch) {
-  const store = await readJobs();
-  const idx = store.jobs.findIndex((j) => j.id === id);
-  if (idx < 0) return null;
-  // Pin `id` last so a caller-supplied `{ id: ... }` in patch cannot rewrite
-  // the primary key (symmetric with createJob, which also pins id last).
-  const merged = {
-    ...store.jobs[idx],
-    ...patch,
-    updatedAt: Date.now(),
-    id: store.jobs[idx].id,
-  };
-  store.jobs[idx] = merged;
-  await writeJobs(store);
-  return merged;
+  try {
+    return await apiFetch("/api/jobs/" + encodeURIComponent(id), {
+      method: "PATCH",
+      body: JSON.stringify({ patch: patch || {} }),
+    });
+  } catch (e) {
+    // 404 -> job không tồn tại: giữ hợp đồng cũ (trả null thay vì ném).
+    if (/\b404\b/.test(String(e && e.message))) return null;
+    throw e;
+  }
 }
 
 /** Lấy toàn bộ job (tùy chọn lọc theo type), mới nhất trước. */
 async function getJobs(type) {
-  const store = await readJobs();
-  let result = store.jobs.slice();
-  if (type) result = result.filter((j) => j.type === type);
-  result.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  return result;
+  return apiFetch("/api/jobs" + qs({ type }));
 }
 
 /** Lấy các job đang chờ tới hạn chạy (status=pending và scheduledAt<=now). */
 async function getDueJobs(now) {
-  const t = now || Date.now();
-  const store = await readJobs();
-  const out = store.jobs.filter(
-    (j) => j.status === "pending" && (j.scheduledAt || 0) <= t
-  );
-  out.sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0));
-  return out;
+  return apiFetch("/api/jobs/due" + qs({ now: now || Date.now() }));
 }
 
 /**
- * Khôi phục các job bị KẸT ở trạng thái "running": service worker MV3 có thể bị
- * Chrome tắt giữa chừng khi đang chạy một job, để lại job đó mãi ở "running" —
- * getDueJobs (chỉ lấy "pending") sẽ KHÔNG bao giờ chạy lại nó, nên một mẻ lớn
- * (vd 39 nhóm) chỉ chạy được vài bài rồi đứng. Hàm này đưa job kẹt về "pending"
- * để guồng lịch chạy lại, hoặc đánh "error" nếu đã thử quá số lần cho phép.
- * Trả về số job đã thay đổi.
+ * Khôi phục các job bị KẸT ở trạng thái "running" (client MV3 bị tắt giữa
+ * chừng). Server đưa job kẹt về "pending" để chạy lại, hoặc "error" nếu đã thử
+ * quá số lần. Trả về số job đã thay đổi.
  */
 async function recoverStuckJobs(now) {
-  const t = now || Date.now();
-  const store = await readJobs();
-  let changed = 0;
-  for (const j of store.jobs) {
-    if (j.status !== "running") continue;
-    const last = j.updatedAt || j.createdAt || 0;
-    if (t - last <= STUCK_RUNNING_MS) continue; // còn đang chạy hợp lệ
-    if ((j.attempts || 0) >= MAX_JOB_ATTEMPTS) {
-      j.status = "error";
-      j.error = "Bị gián đoạn nhiều lần (service worker tắt giữa chừng).";
-    } else {
-      j.status = "pending"; // thử lại ở tick sau
-    }
-    j.updatedAt = t;
-    changed++;
-  }
-  if (changed) await writeJobs(store);
-  return changed;
+  const r = await apiFetch("/api/jobs/recover-stuck", {
+    method: "POST",
+    body: JSON.stringify({ now: now || Date.now() }),
+  });
+  return (r && r.changed) || 0;
 }
 
 /** Xóa một job theo id. Trả về true. */
 async function deleteJob(id) {
-  const store = await readJobs();
-  store.jobs = store.jobs.filter((j) => j.id !== id);
-  await writeJobs(store);
+  await apiFetch("/api/jobs/" + encodeURIComponent(id), { method: "DELETE" });
   return true;
 }
 
 /** Xóa các job đã hoàn tất hoặc lỗi (dọn dẹp). Trả về số job đã xóa. */
 async function clearFinishedJobs() {
-  const store = await readJobs();
-  const before = store.jobs.length;
-  store.jobs = store.jobs.filter(
-    (j) => j.status !== "done" && j.status !== "error"
-  );
-  const deleted = before - store.jobs.length;
-  await writeJobs(store);
-  return deleted;
+  const r = await apiFetch("/api/jobs/clear-finished", { method: "POST" });
+  return (r && r.deleted) || 0;
 }
 
 /** Xóa TOÀN BỘ job trong hàng đợi (bất kể trạng thái). Trả về số job đã xóa. */
 async function clearAllJobs() {
-  const store = await readJobs();
-  const deleted = store.jobs.length;
-  store.jobs = [];
-  await writeJobs(store);
-  return deleted;
+  const r = await apiFetch("/api/jobs/clear-all", { method: "POST" });
+  return (r && r.deleted) || 0;
+}
+
+/* ============ GIỚI HẠN AN TOÀN CHO JOB CHÀO HÀNG (message) ============== */
+//
+// Gửi tin nhắn chào hàng qua inbox rủi ro cao hơn đăng bài / bình luận, nên áp
+// hạn mức BẢO THỦ ở server — coi như chốt chặn cuối (UI vẫn duyệt tay từng tin):
+// (1) trần số tin mỗi ngày; (2) CHỐNG TRÙNG — không tạo 2 job chào hàng tới cùng
+// một người khi job cũ chưa kết thúc hoặc đã gửi thành công.
+
+// Trần số tin nhắn chào hàng mỗi ngày (theo lịch ngày địa phương). Giữ NGUYÊN
+// hằng số này ở client để các nơi hiển thị/ước lượng còn dùng; server áp cùng trần.
+const MESSAGE_DAILY_CAP = 15;
+
+/**
+ * Đếm số job chào hàng (type="message") ĐÃ CHIẾM SUẤT trong ngày chứa `now`.
+ * Mốc 00:00 tính theo giờ ĐỊA PHƯƠNG của client nên truyền `now` (ms) lên server.
+ */
+async function countMessageJobsToday(now) {
+  const r = await apiFetch("/api/jobs/message-count-today" + qs({ now: now || Date.now() }));
+  return (r && r.count) || 0;
+}
+
+/**
+ * Tìm job chào hàng đang "sống" (pending/running/done) gửi tới cùng một trang
+ * cá nhân khách (meta.authorProfile) để CHỐNG TRÙNG. Trả về job hoặc null.
+ */
+async function findLiveMessageJobByProfile(authorProfile) {
+  const key = String(authorProfile || "").trim();
+  if (!key) return null;
+  const r = await apiFetch("/api/jobs/live-message" + qs({ authorProfile: key }));
+  return (r && r.job) || null;
+}
+
+/* ============ HỘP THƯ MESSENGER (inbox threads) ========================= */
+//
+// Các cuộc HỘI THOẠI CÓ SẴN trong Messenger thật của người dùng, quét được từ
+// DOM khi họ bấm "Quét hộp thư". TRƯỚC ĐÂY lưu cục bộ (chrome.storage.local
+// "inboxThreads"); NAY chuyển LÊN SERVER theo TÀI KHOẢN qua /api/inbox. Mỗi
+// thread định danh bằng `threadId`; quét lại là UPSERT (gộp) ở server, giữ
+// draft/nháp + tên hợp lệ + tin cũ + trạng thái đọc. Client chỉ gọi API.
+
+/** Lấy toàn bộ hội thoại hộp thư, mới cập nhật trước. */
+async function getInboxThreads() {
+  const list = await apiFetch("/api/inbox");
+  return Array.isArray(list) ? list : [];
+}
+
+/** Lấy MỘT hội thoại theo threadId, hoặc null. */
+async function getInboxThread(threadId) {
+  const key = String(threadId || "").trim();
+  if (!key) return null;
+  return apiFetch("/api/inbox/" + encodeURIComponent(key));
+}
+
+/**
+ * UPSERT một danh sách hội thoại quét được (theo threadId). Server gộp vào bản
+ * ghi cũ (giữ draft/nháp, tên hợp lệ, tin nhắn + trạng thái đọc). Trả về
+ * { added, updated, total }.
+ */
+async function upsertInboxThreads(threads) {
+  return apiFetch("/api/inbox/upsert", {
+    method: "POST",
+    body: JSON.stringify({ threads: Array.isArray(threads) ? threads : [] }),
+  });
+}
+
+/** Cập nhật một hội thoại theo threadId (gộp trường). Trả về bản ghi hoặc null. */
+async function updateInboxThread(threadId, patch) {
+  const key = String(threadId || "").trim();
+  if (!key) return null;
+  try {
+    return await apiFetch("/api/inbox/" + encodeURIComponent(key), {
+      method: "PATCH",
+      body: JSON.stringify({ patch: patch || {} }),
+    });
+  } catch (e) {
+    if (/\b404\b/.test(String(e && e.message))) return null;
+    throw e;
+  }
+}
+
+/** Xoá một hội thoại khỏi hộp thư. Trả về true. */
+async function deleteInboxThread(threadId) {
+  const key = String(threadId || "").trim();
+  await apiFetch("/api/inbox/" + encodeURIComponent(key), { method: "DELETE" });
+  return true;
 }
 
 /* ===================== POSTED GROUPS (lịch sử đăng) ====================== */
 //
-// Lưu CỤC BỘ theo thiết bị (chrome.storage.local) danh sách nhóm mà từng tài
-// khoản đã đăng bài, kèm số lần đăng (count) và lần đăng gần nhất
-// (lastPostedAt). Dùng để gợi ý "nhóm đăng gần đây / nhóm hay đăng" theo tài
-// khoản. KHÔNG gọi API, KHÔNG chia sẻ giữa người dùng. Khi không có
-// chrome.storage (môi trường test) thì dùng store in-memory.
-const POSTED_GROUPS_KEY = "postedGroups";
-
-// Số nhóm tối đa giữ lại cho mỗi tài khoản (tránh phình to vô hạn).
-const MAX_POSTED_GROUPS_PER_USER = 100;
-
-// Store in-memory dự phòng. Cấu trúc: { [userId]: PostedGroup[] }.
-let _memPostedGroups = {};
-
-/** Đọc toàn bộ map nhóm-đã-đăng ({ [userId]: PostedGroup[] }). */
-function readPostedGroups() {
-  if (!hasChromeStorage()) {
-    return Promise.resolve(_memPostedGroups);
-  }
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get(POSTED_GROUPS_KEY, (r) => {
-        void chrome.runtime.lastError;
-        const v = (r && r[POSTED_GROUPS_KEY]) || {};
-        resolve(v && typeof v === "object" ? v : {});
-      });
-    } catch (e) {
-      resolve({});
-    }
-  });
-}
-
-/** Ghi toàn bộ map nhóm-đã-đăng. */
-function writePostedGroups(map) {
-  if (!hasChromeStorage()) {
-    _memPostedGroups = map;
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.set({ [POSTED_GROUPS_KEY]: map }, () => {
-        void chrome.runtime.lastError;
-        resolve();
-      });
-    } catch (e) {
-      resolve();
-    }
-  });
-}
-
-/** Khóa tài khoản dùng làm key trong map (mặc định "_local" khi chưa đăng nhập). */
-function postedGroupsKeyFor(userId) {
-  return userId == null || userId === "" ? "_local" : String(userId);
-}
+// Danh sách nhóm mà từng NICK FACEBOOK đã đăng bài, kèm số lần đăng (count) và
+// lần đăng gần nhất (lastPostedAt). TRƯỚC ĐÂY lưu cục bộ (chrome.storage.local
+// "postedGroups", map theo FB account id); NAY chuyển LÊN SERVER theo TÀI KHOẢN
+// người dùng qua /api/posted-groups, VẪN tách theo từng nick FB (`userId` ở đây
+// chính là FB account id -> gửi lên làm `fbAccountId`).
 
 /**
- * Ghi nhận một tài khoản vừa đăng vào các nhóm. Tăng count và cập nhật
- * lastPostedAt cho mỗi nhóm. `groups` là mảng { groupId, groupName }.
- * Trả về danh sách nhóm-đã-đăng mới nhất của tài khoản.
+ * Ghi nhận một nick FB vừa đăng vào các nhóm (tăng count + cập nhật lastPostedAt).
+ * `userId` là FB account id (có thể null -> "_local"). `groups` là mảng
+ * { groupId, groupName }. Trả về danh sách nhóm-đã-đăng mới nhất của nick đó.
  */
 async function recordPostedGroups(userId, groups) {
-  const list = Array.isArray(groups) ? groups : [];
-  const map = await readPostedGroups();
-  const key = postedGroupsKeyFor(userId);
-  const arr = Array.isArray(map[key]) ? map[key] : [];
-  const byId = new Map(arr.map((g) => [g.groupId, g]));
-  const now = Date.now();
-  for (const g of list) {
-    const groupId = g && g.groupId != null ? String(g.groupId) : "";
-    if (!groupId) continue;
-    const groupName = (g && g.groupName) || groupId;
-    const existing = byId.get(groupId);
-    if (existing) {
-      existing.count = (existing.count || 0) + 1;
-      existing.lastPostedAt = now;
-      existing.groupName = groupName;
-    } else {
-      byId.set(groupId, { groupId, groupName, count: 1, lastPostedAt: now });
-    }
-  }
-  // Sắp theo lần đăng gần nhất giảm dần rồi cắt bớt nếu quá ngưỡng.
-  let next = [...byId.values()].sort(
-    (a, b) => (b.lastPostedAt || 0) - (a.lastPostedAt || 0)
-  );
-  if (next.length > MAX_POSTED_GROUPS_PER_USER) {
-    next = next.slice(0, MAX_POSTED_GROUPS_PER_USER);
-  }
-  map[key] = next;
-  await writePostedGroups(map);
-  return next;
+  return apiFetch("/api/posted-groups/record", {
+    method: "POST",
+    body: JSON.stringify({
+      fbAccountId: userId == null || userId === "" ? "_local" : String(userId),
+      groups: Array.isArray(groups) ? groups : [],
+    }),
+  });
 }
 
 /**
- * Lấy danh sách nhóm-đã-đăng của một tài khoản, kèm hai cách sắp xếp gợi ý.
+ * Lấy danh sách nhóm-đã-đăng của một nick FB, kèm hai cách sắp xếp gợi ý.
  * Trả về { recent: PostedGroup[], frequent: PostedGroup[] }.
  */
 async function getPostedGroups(userId, opts = {}) {
-  const map = await readPostedGroups();
-  const key = postedGroupsKeyFor(userId);
-  const arr = Array.isArray(map[key]) ? map[key].slice() : [];
-  const limit =
-    typeof opts.limit === "number" && opts.limit > 0 ? opts.limit : 10;
-  const recent = arr
-    .slice()
-    .sort((a, b) => (b.lastPostedAt || 0) - (a.lastPostedAt || 0))
-    .slice(0, limit);
-  const frequent = arr
-    .slice()
-    .sort(
-      (a, b) =>
-        (b.count || 0) - (a.count || 0) ||
-        (b.lastPostedAt || 0) - (a.lastPostedAt || 0)
-    )
-    .slice(0, limit);
-  return { recent, frequent };
+  return apiFetch(
+    "/api/posted-groups" +
+      qs({
+        fbAccountId: userId == null || userId === "" ? "_local" : String(userId),
+        limit: typeof opts.limit === "number" && opts.limit > 0 ? opts.limit : undefined,
+      })
+  );
+}
+
+/* ============================ SETTINGS ================================== */
+//
+// Cấu hình nhỏ theo TÀI KHOẢN (key/value JSON) — thay cho các khoá trước đây ở
+// chrome.storage.local: aiConfig, aiModelList, fbSelectors, crawlSettings,
+// uiPrefs, deletedPriceSeedIds, autoCrawlConfig, autoSyncConfig,
+// watchRepliesConfig. Đồng bộ trên mọi thiết bị của cùng một tài khoản.
+//
+// LƯU Ý: chỉ gọi được từ ngữ cảnh CÓ token (background/popup/dashboard).
+// Content script KHÔNG gọi trực tiếp — phải nhờ background qua message.
+
+/**
+ * Đọc một khoá cấu hình. Trả về `value` (hoặc `def` nếu chưa có / lỗi mạng).
+ */
+async function getSetting(key, def = null) {
+  try {
+    const r = await apiFetch("/api/settings/" + encodeURIComponent(key));
+    return r && "value" in r && r.value != null ? r.value : def;
+  } catch (e) {
+    return def;
+  }
+}
+
+/** Ghi (upsert) một khoá cấu hình. Trả về giá trị đã ghi. */
+async function setSetting(key, value) {
+  const r = await apiFetch("/api/settings/" + encodeURIComponent(key), {
+    method: "PUT",
+    body: JSON.stringify({ value: value ?? null }),
+  });
+  return r && "value" in r ? r.value : value;
+}
+
+/** Xoá một khoá cấu hình. */
+async function deleteSetting(key) {
+  return apiFetch("/api/settings/" + encodeURIComponent(key), { method: "DELETE" });
 }
 
 /* ============================ PRODUCTS =================================== */
@@ -844,7 +741,7 @@ export {
   saveGroups,
   getGroups,
   deleteGroup,
-  // jobs (chrome.storage.local — device-local, NOT API)
+  // jobs (hàng đợi — theo TÀI KHOẢN qua /api/jobs)
   createJob,
   createJobs,
   updateJob,
@@ -854,9 +751,23 @@ export {
   deleteJob,
   clearFinishedJobs,
   clearAllJobs,
-  // posted groups (lịch sử đăng — device-local, NOT API)
+  // giới hạn an toàn cho job chào hàng (message)
+  countMessageJobsToday,
+  findLiveMessageJobByProfile,
+  MESSAGE_DAILY_CAP,
+  // hộp thư Messenger (inbox threads — theo TÀI KHOẢN qua /api/inbox)
+  getInboxThreads,
+  getInboxThread,
+  upsertInboxThreads,
+  updateInboxThread,
+  deleteInboxThread,
+  // posted groups (lịch sử đăng — theo TÀI KHOẢN qua /api/posted-groups)
   recordPostedGroups,
   getPostedGroups,
+  // settings (cấu hình nhỏ theo TÀI KHOẢN qua /api/settings)
+  getSetting,
+  setSetting,
+  deleteSetting,
   // products
   saveProducts,
   getProducts,

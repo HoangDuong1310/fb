@@ -36,6 +36,13 @@ Thumbs.db
 
 # ===== Đóng gói extension =====
 fb-group-crawler.zip
+a.zip
+dist/
 
 # ===== Repo server riêng (đẩy lên fb-ui.git, không nhúng vào repo extension) =====
 server/
+
+# ===== Skill files (công cụ dev cục bộ — không nhúng vào repo) =====
+skills-lock.json
+.agents/
+docs/superpowers/

@@ -25,24 +25,27 @@ export function populateModelSelect(models, selected) {
     .join("");
 }
 
-export function loadAIConfig() {
-  chrome.storage.local.get(["aiConfig", "aiModelList"], (r) => {
-    const cfg = (r && r.aiConfig) || {};
-    const cached = (r && Array.isArray(r.aiModelList) && r.aiModelList) || [];
-    $("aiApiBase").value = cfg.apiBase || "";
-    $("aiApiKey").value = cfg.apiKey || "";
-    const model = cfg.model || "gpt-5.5";
-    populateModelSelect(cached, model);
-    if ($("aiModelCustom")) $("aiModelCustom").value = "";
-    // Nếu chưa có cache model -> tự tải nền (im lặng) khi đã có API key.
-    if (!cached.length && cfg.apiKey) reloadModels(true);
-  });
+export async function loadAIConfig() {
+  const [cfgRes, listRes] = await Promise.all([
+    bg("GET_SETTING", { key: "aiConfig" }),
+    bg("GET_SETTING", { key: "aiModelList" }),
+  ]);
+  const cfg = (cfgRes && cfgRes.ok && cfgRes.value) || {};
+  const cached =
+    (listRes && listRes.ok && Array.isArray(listRes.value) && listRes.value) || [];
+  $("aiApiBase").value = cfg.apiBase || "";
+  $("aiApiKey").value = cfg.apiKey || "";
+  const model = cfg.model || "gpt-5.5";
+  populateModelSelect(cached, model);
+  if ($("aiModelCustom")) $("aiModelCustom").value = "";
+  // Nếu chưa có cache model -> tự tải nền (im lặng) khi đã có API key.
+  if (!cached.length && cfg.apiKey) reloadModels(true);
 }
 
 // Lưu cấu hình AI. opts.silent = true: tự lưu nền (không toast, không đồng bộ
 // lại dropdown) để dùng cho auto-save khi người dùng gõ/đổi rồi rời ô — tránh
 // làm gián đoạn thao tác gõ. Khi bấm nút "Lưu cấu hình" thì gọi không silent.
-export function saveAIConfig(opts = {}) {
+export async function saveAIConfig(opts = {}) {
   const silent = !!opts.silent;
   // Ưu tiên ô nhập thủ công nếu người dùng gõ, ngược lại lấy từ dropdown.
   const custom = ($("aiModelCustom") && $("aiModelCustom").value || "").trim();
@@ -52,18 +55,20 @@ export function saveAIConfig(opts = {}) {
     apiKey: ($("aiApiKey").value || "").trim(),
     model: custom || picked || "gpt-5.5",
   };
-  chrome.storage.local.set({ aiConfig: cfg }, () => {
-    void chrome.runtime.lastError;
-    if (silent) return;
-    toast("Đã lưu cấu hình AI.", "ok");
-    // Đồng bộ lại dropdown nếu nhập model thủ công.
-    if (custom) {
-      chrome.storage.local.get("aiModelList", (r) => {
-        populateModelSelect((r && r.aiModelList) || [], cfg.model);
-        if ($("aiModelCustom")) $("aiModelCustom").value = "";
-      });
-    }
-  });
+  const res = await bg("SET_SETTING", { key: "aiConfig", value: cfg });
+  if (silent) return;
+  if (!res || !res.ok) {
+    toast((res && res.error) || "Lưu cấu hình AI thất bại.", "err", 5000);
+    return;
+  }
+  toast("Đã lưu cấu hình AI.", "ok");
+  // Đồng bộ lại dropdown nếu nhập model thủ công.
+  if (custom) {
+    const listRes = await bg("GET_SETTING", { key: "aiModelList" });
+    const list = (listRes && listRes.ok && listRes.value) || [];
+    populateModelSelect(list, cfg.model);
+    if ($("aiModelCustom")) $("aiModelCustom").value = "";
+  }
 }
 
 // Tải danh sách model từ endpoint qua background. silent=true thì không báo lỗi ồn ào.
@@ -88,7 +93,7 @@ export async function reloadModels(silent) {
     if (!silent) toast((res && res.error) || "Không tải được danh sách model.", "err", 5000);
     return;
   }
-  chrome.storage.local.set({ aiModelList: res.models });
+  await bg("SET_SETTING", { key: "aiModelList", value: res.models });
   const current = ($("aiModel") && $("aiModel").value || "").trim();
   populateModelSelect(res.models, current);
   if (!silent) toast(`Đã tải ${res.models.length} model.`, "ok");

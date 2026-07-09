@@ -3,11 +3,11 @@
  * (src/remote-commands.js).
  *
  * Runs under plain Node via `node --test "test/*.test.js"` (NOT in an
- * extension), so there is no `chrome` global here. src/db.js falls back to an
- * in-memory job store in that case, so the create_post dispatch path runs
- * end-to-end and returns a real { jobId } without any DB mocking. We mock the
- * global `fetch` to capture every request and assert the PATCH lifecycle
- * (running -> completed | failed) the runner reports back to the server.
+ * extension), so there is no `chrome` global here. The job queue is now
+ * SERVER-SIDE: create_post dispatch calls DB.createJob -> POST /api/jobs, so
+ * the fetch mock must return a saved job record (with a numeric id) for that
+ * endpoint. We mock the global `fetch` to capture every request and assert the
+ * PATCH lifecycle (running -> completed | failed) the runner reports back.
  */
 
 import { test } from "node:test";
@@ -98,13 +98,17 @@ test("pollRemoteCommands runs a create_post command: GET pending then running + 
         ],
       });
     }
+    // create_post dispatch: POST /api/jobs -> server returns the saved job.
+    if (String(url).endsWith("/api/jobs") && init && init.method === "POST") {
+      return jsonResponse(200, { id: 101, type: "post", status: "pending" });
+    }
     // Subsequent calls: the PATCH status reports.
     return jsonResponse(200, { ok: true });
   };
 
   await pollRemoteCommands();
 
-  // 1 GET + 2 PATCH (running, completed).
+  // 1 GET + 1 POST (job) + 2 PATCH (running, completed).
   const patches = calls.filter((c) => c.method === "PATCH");
   assert.equal(patches.length, 2, "should report running then completed");
 

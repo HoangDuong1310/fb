@@ -500,12 +500,16 @@ function setSelectorBox(text) {
 }
 
 function loadAIConfig() {
-  chrome.storage.local.get("aiConfig", (r) => {
-    const cfg = (r && r.aiConfig) || {};
-    els.aiApiBase.value = cfg.apiBase || "https://danglamgiau.com/v1";
-    els.aiApiKey.value = cfg.apiKey || "";
-    els.aiModel.value = cfg.model || "gpt-5.5";
-  });
+  chrome.runtime.sendMessage(
+    { type: "GET_SETTING", key: "aiConfig" },
+    (res) => {
+      void chrome.runtime.lastError;
+      const cfg = (res && res.value) || {};
+      els.aiApiBase.value = cfg.apiBase || "https://danglamgiau.com/v1";
+      els.aiApiKey.value = cfg.apiKey || "";
+      els.aiModel.value = cfg.model || "gpt-5.5";
+    }
+  );
 }
 
 function saveAIConfig() {
@@ -514,9 +518,14 @@ function saveAIConfig() {
     apiKey: els.aiApiKey.value.trim(),
     model: els.aiModel.value.trim() || "gpt-5.5",
   };
-  chrome.storage.local.set({ aiConfig: cfg }, () => {
-    setStatus("Đã lưu cấu hình AI.", "ok");
-  });
+  chrome.runtime.sendMessage(
+    { type: "SET_SETTING", key: "aiConfig", value: cfg },
+    (res) => {
+      void chrome.runtime.lastError;
+      if (res && res.ok) setStatus("Đã lưu cấu hình AI.", "ok");
+      else setStatus("Lưu cấu hình AI thất bại.", "err");
+    }
+  );
 }
 
 async function discoverSelectors() {

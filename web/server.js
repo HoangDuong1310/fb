@@ -31,6 +31,10 @@ import remoteCommandsRoutes, {
 import keywordsRoutes from "./routes/keywords.js";
 import groupPricesRoutes from "./routes/group-prices.js";
 import meRoutes from "./routes/me.js";
+import settingsRoutes from "./routes/settings.js";
+import jobsRoutes from "./routes/jobs.js";
+import inboxRoutes from "./routes/inbox.js";
+import postedGroupsRoutes from "./routes/posted-groups.js";
 
 /* ── Express app ──────────────────────────────────────────────────────────── */
 const app = express();
@@ -77,6 +81,10 @@ app.use("/api/remote-commands", remoteCommandsRoutes);
 app.use("/api/keywords", keywordsRoutes);
 app.use("/api/group-prices", groupPricesRoutes);
 app.use("/api/me", meRoutes);
+app.use("/api/settings", settingsRoutes);
+app.use("/api/jobs", jobsRoutes);
+app.use("/api/inbox", inboxRoutes);
+app.use("/api/posted-groups", postedGroupsRoutes);
 
 // Health check
 app.get("/health", (_req, res) => res.json({ ok: true }));

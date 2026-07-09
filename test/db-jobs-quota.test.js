@@ -1,85 +1,85 @@
 /**
- * db-jobs-quota.test.js — Kiểm thử writeJobs() (qua createJob/createJobs) khi
- * chrome.storage.local.set() vượt hạn mức lưu trữ (QUOTA_BYTES) và đặt
- * chrome.runtime.lastError trong callback.
+ * db-jobs-quota.test.js — The job queue is now SERVER-SIDE per user, so the
+ * safety cap for outreach messages (MESSAGE_DAILY_CAP) and all write validation
+ * are enforced in web/routes/jobs.js, not in the client.
  *
- * Bug đã sửa: trước đây writeJobs() bỏ qua lastError (`void chrome.runtime.lastError`)
- * và luôn resolve, khiến createJobs() báo "thành công" dù KHÔNG có gì được lưu
- * (hàng đợi trống dù tạo nhiều job kèm nhiều ảnh cho nhiều nhóm). Nay writeJobs()
- * PHẢI reject để lỗi lan lên tới background.js -> UI.
+ * The ORIGINAL bug this suite guarded: the old local writeJobs() swallowed
+ * chrome.storage's lastError and always resolved, so createJobs() reported
+ * "success" even though NOTHING was saved (an empty queue despite creating many
+ * jobs). The invariant survives the migration in a new form: when the SERVER
+ * rejects a write (quota/cap exceeded, or any non-2xx), the thin client MUST
+ * propagate that failure — never fake success.
  *
- * Cần globalThis.chrome giả (có chrome.storage.local) TRƯỚC khi import db.js, vì
- * db.js kiểm tra hasChromeStorage() = typeof chrome !== "undefined" && chrome.storage.local.
- * Dùng dynamic import để đảm bảo module được nạp lại đúng lúc.
+ * apiFetch() throws on non-2xx including the status + server error body, so we
+ * assert createJob/createJobs reject (and surface the reason) on a 429 cap and
+ * on a 500, and resolve normally on 200. Same fetch-mock pattern as
+ * api-client.test.js — runs under plain Node, no chrome, no backend.
  */
 
-import { test } from "node:test";
+import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-function installFakeChromeStorage({ failSet } = {}) {
-  let stored = {};
-  globalThis.chrome = {
-    storage: {
-      local: {
-        get(key, cb) {
-          chrome.runtime.lastError = undefined;
-          cb({ [key]: stored[key] });
-        },
-        set(obj, cb) {
-          if (failSet) {
-            chrome.runtime.lastError = {
-              message: "Resource::kQuotaBytes quota exceeded",
-            };
-            cb();
-            chrome.runtime.lastError = undefined;
-            return;
-          }
-          chrome.runtime.lastError = undefined;
-          Object.assign(stored, obj);
-          cb();
-        },
-      },
-    },
-    runtime: { lastError: undefined },
+import { setBaseUrl, setToken } from "../src/api.js";
+import { MESSAGE_DAILY_CAP, createJob, createJobs } from "../src/db.js";
+
+function jsonResponse(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
   };
-  return { getStored: () => stored };
 }
 
-test("writeJobs (qua createJob) reject khi chrome.storage.local.set vượt hạn mức", async () => {
-  installFakeChromeStorage({ failSet: true });
-  const DB = await import("../src/db.js?quota-fail-" + Date.now());
+beforeEach(() => {
+  setBaseUrl("http://localhost:3300");
+  setToken("tok-test");
+});
+
+test("MESSAGE_DAILY_CAP stays exported for UI estimates (kept in sync with server)", () => {
+  assert.equal(typeof MESSAGE_DAILY_CAP, "number");
+  assert.ok(MESSAGE_DAILY_CAP > 0, "cap must be a positive number");
+});
+
+test("createJob rejects (does NOT fake success) when the server refuses the write with 429 cap", async () => {
+  global.fetch = async () =>
+    jsonResponse(429, { error: "message daily cap exceeded" });
 
   await assert.rejects(
-    () => DB.createJob({ type: "post", content: "x" }),
-    /quota/i,
-    "createJob phải reject (không được nuốt lastError) khi ghi storage thất bại"
+    () => createJob({ type: "message", content: "hi" }),
+    (err) => {
+      assert.ok(err instanceof Error);
+      assert.match(String(err.message), /429/);
+      assert.match(String(err.message), /cap/i);
+      return true;
+    },
+    "createJob must surface the server rejection, not swallow it"
   );
 });
 
-test("writeJobs (qua createJobs batch) reject khi vượt hạn mức, KHÔNG báo thành công giả", async () => {
-  installFakeChromeStorage({ failSet: true });
-  const DB = await import("../src/db.js?quota-fail-batch-" + Date.now());
+test("createJobs (batch) rejects when the server refuses the write, no phantom success", async () => {
+  global.fetch = async () => jsonResponse(429, { error: "quota exceeded" });
 
   await assert.rejects(
     () =>
-      DB.createJobs([
+      createJobs([
         { type: "post", content: "a" },
         { type: "post", content: "b" },
       ]),
-    /quota/i
+    /429/,
+    "a failed batch write must reject so the failure reaches background.js -> UI"
   );
 });
 
-test("writeJobs thành công bình thường khi KHÔNG vượt hạn mức (đối chứng)", async () => {
-  const { getStored } = installFakeChromeStorage({ failSet: false });
-  const DB = await import("../src/db.js?quota-ok-" + Date.now());
+test("createJob rethrows a generic server 500 (no silent swallow)", async () => {
+  global.fetch = async () => jsonResponse(500, { error: "boom" });
 
-  const job = await DB.createJob({ type: "post", content: "ok" });
-  assert.ok(job.id != null);
-  const stored = getStored();
-  const savedStore = Object.values(stored)[0];
-  assert.ok(
-    savedStore && Array.isArray(savedStore.jobs) && savedStore.jobs.length === 1,
-    "phải thực sự ghi vào storage khi không lỗi"
-  );
+  await assert.rejects(() => createJob({ type: "post" }), /500/);
+});
+
+test("createJob resolves with the saved record when the server accepts the write (control)", async () => {
+  const saved = { id: 11, type: "post", status: "pending" };
+  global.fetch = async () => jsonResponse(200, saved);
+
+  const out = await createJob({ type: "post", content: "ok" });
+  assert.deepEqual(out, saved, "a successful write returns the server record");
 });

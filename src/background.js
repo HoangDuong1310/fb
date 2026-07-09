@@ -31,7 +31,7 @@ import {
   seedPriceSources,
 } from "./prices.js";
 import { listSheetTabs, previewSheet, importSheetTabs } from "./sheets.js";
-import { discoverSelectors, listModels, spinPostContent, generateProfileSkill } from "./ai.js";
+import { discoverSelectors, listModels, spinPostContent, generatePostContent, generateProfileFull, draftPitch, draftInboxReply } from "./ai.js";
 import { clearProfileCache } from "./prompts.js";
 import {
   generateAdvisories,
@@ -52,6 +52,8 @@ import {
   noteCrawlDoneReason,
   runJob,
   executeDeletePost,
+  scanInbox,
+  readInboxThread,
   processDueJobs,
   scheduleTickSoon,
   AUTOCRAWL_ALARM,
@@ -184,22 +186,52 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
-    case "GEN_PROFILE_SKILL": {
-      generateProfileSkill(msg.payload || {})
+    case "AI_GENERATE_CONTENT": {
+      generatePostContent(msg.payload || {})
+        .then((r) => sendResponse(r))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "GEN_PROFILE_FULL": {
+      generateProfileFull(msg.payload || {})
         .then((r) => sendResponse(r))
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
     case "GET_SELECTORS": {
-      chrome.storage.local.get("fbSelectors", (r) => {
-        sendResponse({ ok: true, selectors: (r && r.fbSelectors) || null });
-      });
+      DB.getSetting("fbSelectors")
+        .then((selectors) => sendResponse({ ok: true, selectors: selectors || null }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
     case "CLEAR_SELECTORS": {
-      chrome.storage.local.remove("fbSelectors", () => sendResponse({ ok: true }));
+      DB.deleteSetting("fbSelectors")
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "GET_SETTING": {
+      DB.getSetting(msg.key, msg.def ?? null)
+        .then((value) => sendResponse({ ok: true, value }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "SET_SETTING": {
+      DB.setSetting(msg.key, msg.value)
+        .then((value) => sendResponse({ ok: true, value }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "DELETE_SETTING": {
+      DB.deleteSetting(msg.key)
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
@@ -717,6 +749,217 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         scheduleTickSoon();
         sendResponse({ ok: true, jobId: job.id });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Soạn NHÁP tin CHÀO HÀNG (inbox riêng) cho MỘT khách tiềm năng vừa đăng bài.
+    // Trả về nội dung để UI hiển thị cho người dùng DUYỆT/chỉnh tay -> KHÔNG tự gửi.
+    // Hỗ trợ cả 2 chế độ: AI tự soạn theo bài đăng, hoặc bám ý người dùng tự điền
+    // (msg.userPitch) — đúng yêu cầu "gửi chào hàng theo nội dung user điền".
+    case "GEN_PITCH": {
+      (async () => {
+        const res = await draftPitch({
+          postText: msg.postText || "",
+          authorName: msg.authorName || "",
+          groupName: msg.groupName || "",
+          userPitch: msg.userPitch || "",
+        });
+        sendResponse(res);
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Duyệt tin chào hàng -> tạo MỘT "message" job để gửi inbox qua DOM (thủ công
+    // từng tin). Cho phép truyền nội dung đã chỉnh tay (msg.message). targetUrl là
+    // link hội thoại Messenger suy ra từ profile tác giả bài đăng.
+    case "APPROVE_PITCH": {
+      (async () => {
+        const message = (msg.message != null ? String(msg.message) : "").trim();
+        if (!message) return sendResponse({ ok: false, error: "Nội dung chào hàng rỗng, không thể gửi." });
+        const authorProfile = String(msg.authorProfile || "").trim();
+        if (!authorProfile) {
+          return sendResponse({ ok: false, error: "Thiếu link trang cá nhân của khách nên chưa mở được hộp thoại." });
+        }
+        // Suy ra link Messenger dạng /messages/t/<id-hoặc-username> từ profile.
+        // profile.php?id=<số> -> /messages/t/<số>; /<username> -> /messages/t/<username>.
+        const deriveThread = (profileUrl) => {
+          try {
+            const u = new URL(profileUrl);
+            const idParam = u.searchParams.get("id");
+            if (idParam) return "https://www.facebook.com/messages/t/" + idParam;
+            const seg = u.pathname.split("/").filter(Boolean)[0] || "";
+            if (seg && seg !== "profile.php") return "https://www.facebook.com/messages/t/" + seg;
+          } catch (_) {}
+          return "";
+        };
+        const targetUrl = deriveThread(authorProfile);
+        if (!targetUrl) {
+          return sendResponse({ ok: false, error: "Không dựng được link Messenger từ trang cá nhân của khách." });
+        }
+
+        // ── Chốt chặn an toàn ──────────────────────────────────────
+        // 1. Kill-switch / circuit-breaker (crawl bị FB chặn → dừng hết)
+        const blockState = await getCrawlBlockState();
+        if (blockState && blockState.blocked) {
+          return sendResponse({
+            ok: false,
+            error: "Hệ thống đang tạm dừng do phát hiện rủi ro (kill-switch). Lý do: " +
+              (blockState.reason || "không rõ") + ". Thử lại sau.",
+          });
+        }
+        // 2. Chống trùng — đã có job chào hàng tới cùng người chưa kết thúc?
+        const dup = await DB.findLiveMessageJobByProfile(authorProfile);
+        if (dup) {
+          return sendResponse({
+            ok: false,
+            error: "Đã có tin chào hàng tới người này trong hàng đợi (job " + dup.id + "). Không tạo thêm.",
+          });
+        }
+        // 3. Trần số tin nhắn chào hàng mỗi ngày
+        const todayCount = await DB.countMessageJobsToday();
+        if (todayCount >= DB.MESSAGE_DAILY_CAP) {
+          return sendResponse({
+            ok: false,
+            error: "Đã đạt trần " + DB.MESSAGE_DAILY_CAP + " tin nhắn chào hàng trong ngày. Thử lại ngày mai.",
+          });
+        }
+
+        const job = await DB.createJob({
+          type: "message",
+          targetUrl,
+          content: message,
+          scheduledAt: Date.now(),
+          meta: {
+            source: "pitch",
+            postId: msg.postId || "",
+            authorName: msg.authorName || "",
+            authorProfile,
+            groupId: msg.groupId || "",
+            groupName: msg.groupName || "",
+            postText: msg.postText || "",
+          },
+        });
+        scheduleTickSoon();
+        sendResponse({ ok: true, jobId: job.id });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Trả quota chào hàng inbox hôm nay (dùng cho UI hiển thị thanh quota).
+    case "GET_PITCH_QUOTA": {
+      (async () => {
+        const todayCount = await DB.countMessageJobsToday();
+        sendResponse({ ok: true, todayCount, dailyCap: DB.MESSAGE_DAILY_CAP });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    /* =============== HỘP THƯ MESSENGER (hội thoại có sẵn) =============== */
+
+    // Lấy danh sách hội thoại đã quét (device-local). Không gọi Facebook.
+    case "GET_INBOX_THREADS": {
+      DB.getInboxThreads()
+        .then((threads) => sendResponse({ ok: true, threads }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // QUÉT hộp thư thật: mở tab /messages ở nền, đọc danh sách hội thoại (và
+    // đọc chi tiết tin nếu deep=true). READ-ONLY — chỉ chạy khi người dùng bấm.
+    case "SCAN_INBOX": {
+      scanInbox({ deep: !!msg.deep, maxThreads: msg.maxThreads })
+        .then((res) => sendResponse(res))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // MỞ & ĐỌC một hội thoại cụ thể (đọc tin mới nhất, cập nhật store).
+    case "OPEN_INBOX_THREAD": {
+      readInboxThread(msg.threadId)
+        .then((res) => sendResponse(res))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Soạn NHÁP trả lời (AI) cho một hội thoại có sẵn — KHÔNG tự gửi.
+    case "GEN_INBOX_REPLY": {
+      (async () => {
+        const res = await draftInboxReply({
+          contactName: msg.contactName || "",
+          messages: Array.isArray(msg.messages) ? msg.messages : [],
+          userHint: msg.userHint || "",
+        });
+        sendResponse(res);
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Duyệt trả lời -> tạo "message" job gửi vào ĐÚNG hội thoại (targetUrl là
+    // link /messages/t/<threadId>). Dùng lại pipeline message: kill-switch,
+    // trần ngày, giãn cách. Không dùng chống-trùng-theo-profile (trả lời hội
+    // thoại có sẵn có thể diễn ra nhiều lượt).
+    case "APPROVE_INBOX_REPLY": {
+      (async () => {
+        const message = (msg.message != null ? String(msg.message) : "").trim();
+        if (!message) return sendResponse({ ok: false, error: "Nội dung trả lời rỗng, không thể gửi." });
+        const threadId = String(msg.threadId || "").trim();
+        if (!threadId) return sendResponse({ ok: false, error: "Thiếu mã hội thoại." });
+
+        const blockState = await getCrawlBlockState();
+        if (blockState && blockState.blocked) {
+          return sendResponse({
+            ok: false,
+            error: "Hệ thống đang tạm dừng do phát hiện rủi ro (kill-switch). Lý do: " +
+              (blockState.reason || "không rõ") + ". Thử lại sau.",
+          });
+        }
+        // Trần số tin nhắn mỗi ngày (dùng chung với chào hàng để bảo thủ).
+        const todayCount = await DB.countMessageJobsToday();
+        if (todayCount >= DB.MESSAGE_DAILY_CAP) {
+          return sendResponse({
+            ok: false,
+            error: "Đã đạt trần " + DB.MESSAGE_DAILY_CAP + " tin nhắn trong ngày. Thử lại ngày mai.",
+          });
+        }
+
+        const targetUrl = "https://www.facebook.com/messages/t/" + encodeURIComponent(threadId);
+        const job = await DB.createJob({
+          type: "message",
+          targetUrl,
+          content: message,
+          scheduledAt: Date.now(),
+          meta: {
+            source: "inbox",
+            threadId,
+            contactName: msg.contactName || "",
+          },
+        });
+        // Ghi nháp đã gửi vào thread + xoá nháp chờ.
+        try {
+          const thread = await DB.getInboxThread(threadId);
+          const messages = (thread && Array.isArray(thread.messages)) ? thread.messages.slice() : [];
+          messages.push({ mine: true, text: message, ts: Date.now() });
+          await DB.updateInboxThread(threadId, { messages, draft: null, lastJobId: job.id });
+        } catch (e) {}
+        scheduleTickSoon();
+        sendResponse({ ok: true, jobId: job.id });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Lưu nháp trả lời cho một hội thoại (không gửi).
+    case "SAVE_INBOX_DRAFT": {
+      DB.updateInboxThread(msg.threadId, { draft: msg.draft != null ? String(msg.draft) : null })
+        .then((thread) => sendResponse({ ok: true, thread }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Xoá một hội thoại khỏi hộp thư (chỉ cục bộ, không đụng Facebook).
+    case "DELETE_INBOX_THREAD": {
+      DB.deleteInboxThread(msg.threadId)
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
