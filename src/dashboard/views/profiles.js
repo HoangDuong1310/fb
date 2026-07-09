@@ -102,19 +102,22 @@ export function onProfileAction(e) {
   if (act === "profile-delete") return deleteProfileUI(id);
   if (act === "profile-save") return saveProfileEdit();
   if (act === "profile-cancel") return closeEditor();
-  if (act === "profile-gen-skill") return generateSkillUI(btn.dataset.field);
+  if (act === "profile-gen-full") return generateFullUI();
 }
 
 /**
- * Gọi AI sinh nội dung cho MỘT trường skill đang để trống/thiếu. Lấy ngữ cảnh từ
- * chính trình sửa đang mở (tên/mô tả/danh mục) để AI viết đúng giọng ngành, rồi
- * điền thẳng vào textarea tương ứng. Dùng toast "dính" làm chỉ báo đang chạy.
+ * Gọi AI sinh TOÀN BỘ hồ sơ trong một lần: người dùng mô tả ngành + yêu cầu bằng
+ * lời (ô pf_ai_request), AI tự điền cả 4 trường skill (classifyIntro/draftPersona/
+ * extractIntro/buildPersona) cùng lúc, đồng thời gợi ý tên/mô tả/danh mục nếu đang
+ * để trống. Lấy thêm ngữ cảnh từ tên/mô tả/danh mục đang nhập để AI viết đúng giọng.
  */
-async function generateSkillUI(field) {
-  if (!field) return;
-  const ta = $("pf_" + field);
-  if (!ta) return;
+async function generateFullUI() {
   const val = (key) => ($(key) && $(key).value ? $(key).value : "");
+  const request = val("pf_ai_request").trim();
+  if (!request) {
+    toast("Hãy mô tả ngành và yêu cầu của bạn để AI tạo hồ sơ.", "err", 4000);
+    return;
+  }
   const profile = {
     name: val("pf_name").trim(),
     description: val("pf_description").trim(),
@@ -123,20 +126,31 @@ async function generateSkillUI(field) {
       .map((s) => s.trim())
       .filter(Boolean),
   };
-  if (!profile.name && !profile.description && profile.categories.length === 0) {
-    toast("Hãy nhập tên / mô tả / danh mục trước để AI có ngữ cảnh sinh nội dung.", "err", 4000);
+  const loading = toast("Đang tạo toàn bộ hồ sơ bằng AI...", "info", 0);
+  const res = await bg("GEN_PROFILE_FULL", { payload: { request, profile } });
+  if (!res || !res.ok || !res.fields) {
+    loading.update((res && res.error) || "Tạo hồ sơ bằng AI thất bại.", "err");
+    loading.close(4500);
     return;
   }
-  const loading = toast("Đang tạo nội dung bằng AI...", "info", 0);
-  const res = await bg("GEN_PROFILE_SKILL", { field, profile });
-  if (res && res.ok && res.text) {
-    ta.value = res.text;
-    loading.update("Đã tạo nội dung bằng AI.", "ok");
-    loading.close(2200);
-  } else {
-    loading.update((res && res.error) || "Tạo nội dung bằng AI thất bại.", "err");
-    loading.close(4500);
+  const f = res.fields;
+  // 4 trường skill: luôn ghi đè bằng nội dung AI trả về (khi có).
+  ["classifyIntro", "draftPersona", "extractIntro", "buildPersona"].forEach((k) => {
+    const ta = $("pf_" + k);
+    if (ta && typeof f[k] === "string" && f[k].trim()) ta.value = f[k];
+  });
+  // Tên/mô tả/danh mục: điền luôn từ nội dung AI trả về (khi có) để cả form trên
+  // cũng được sinh từ 1 mô tả duy nhất. Người dùng có thể sửa lại sau.
+  const nameEl = $("pf_name");
+  if (nameEl && f.name) nameEl.value = f.name;
+  const descEl = $("pf_description");
+  if (descEl && f.description) descEl.value = f.description;
+  const catsEl = $("pf_categories");
+  if (catsEl && Array.isArray(f.categories) && f.categories.length) {
+    catsEl.value = f.categories.join(", ");
   }
+  loading.update("Đã tạo hồ sơ bằng AI. Kiểm tra và chỉnh lại nếu cần.", "ok");
+  loading.close(2600);
 }
 
 async function activateProfile(id) {
@@ -183,15 +197,11 @@ function openEditorWith(p, isNew) {
   panel.hidden = false;
   if (title) title.textContent = isNew ? "Tạo hồ sơ mới" : "Sửa hồ sơ: " + (p.name || p.id);
   const cats = Array.isArray(p.categories) ? p.categories.join(", ") : "";
-  // Mỗi trường skill kèm nút "Tạo bằng AI" để AI sinh nội dung khi người dùng để
-  // trống / nhập thiếu. data-field cho biết trường nào cần điền sau khi AI trả về.
+  // 4 trường skill: chỉ còn textarea. Việc điền nội dung do một nút "Tạo toàn bộ
+  // hồ sơ bằng AI" duy nhất (bên dưới) đảm nhiệm, không còn nút AI theo từng trường.
   const fieldsHTML = PROFILE_TEXT_FIELDS.map(
     (f) =>
-      '<label class="field"><span class="field-label-row">' +
-      "<span>" + esc(f.label) + "</span>" +
-      '<button type="button" class="btn ghost tiny" data-act="profile-gen-skill" data-field="' +
-      esc(f.key) + '">✨ Tạo bằng AI</button>' +
-      "</span>" +
+      '<label class="field"><span>' + esc(f.label) + "</span>" +
       '<textarea id="pf_' + f.key + '" rows="' + f.rows + '" class="input">' +
       esc(p[f.key] || "") +
       "</textarea></label>"
@@ -223,6 +233,12 @@ function openEditorWith(p, isNew) {
     '<div class="form-section-head">' +
     "<h3>Nội dung huấn luyện AI theo ngành</h3>" +
     "<p>Các đoạn hướng dẫn quyết định cách AI phân loại ý định, soạn trả lời, trích giá và ghép bộ. Khung JSON bắt buộc do hệ thống tự nối — bạn chỉ điền nội dung đặc thù ngành.</p>" +
+    "</div>" +
+    '<div class="ai-gen-box">' +
+    '<label class="field"><span>Mô tả ngành &amp; yêu cầu của bạn (cho AI)</span>' +
+    '<textarea id="pf_ai_request" rows="4" class="input" placeholder="vd: Mình bán điện thoại &amp; phụ kiện chính hãng, khách chủ yếu hỏi giá và trả góp. Viết giọng thân thiện, chốt đơn nhanh, ưu tiên tư vấn iPhone và Samsung."></textarea>' +
+    '<small class="field-hint">Mô tả ngành hàng và cách bạn muốn AI tư vấn. AI sẽ tự điền cả 4 trường bên dưới cùng lúc.</small></label>' +
+    '<button type="button" class="btn primary" data-act="profile-gen-full">Tạo toàn bộ hồ sơ bằng AI</button>' +
     "</div>" +
     fieldsHTML +
     "</div>" +

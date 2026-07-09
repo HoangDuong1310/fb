@@ -136,6 +136,46 @@
     }
   };
 
+  // ĐỆM RIÊNG cho gói MESSENGER (hộp thư + nội dung hội thoại).
+  //
+  // VÌ SAO: giống feed nhóm, Messenger bắn gói GraphQL danh sách hội thoại
+  // (thread list) và gói nội dung tin nhắn (messages) SỚM khi mở /messages/,
+  // trước khi content.js kịp gắn listener ở document_idle. Giữ đệm riêng để
+  // gói inbox không bị các gói presence/typing/badge đẩy ra khỏi đệm chung.
+  const INBOX_BUFFER_MAX = 24;
+  const inboxBuffer = [];
+
+  // Nhận diện gói Messenger CHỈ dựa vào chuỗi body request (không parse JSON,
+  // không import parser). fb_api_req_friendly_name của Messenger web chứa các
+  // dấu hiệu dưới đây (đã lowercase). Cố ý "rộng tay": thà giữ dư còn hơn lọt.
+  const INBOX_SIGNS = [
+    "mwchatweb",             // MWChatWeb* (thread list, messages)
+    "loadthreadlist",        // *LoadThreadListQuery / InboxThreadList
+    "loadmessages",          // *LoadMessagesQuery
+    "inboxthread",           // InboxThread*
+    "threadlistquery",       // *ThreadListQuery
+    "messengerinbox",        // MessengerInbox*
+    "cometthread",           // Comet*Thread*
+    "messagerangequery",     // MessageRange (nội dung hội thoại)
+    "messagethreadquery",
+  ];
+  const isInboxBody = (bodyStr) => {
+    try {
+      if (!bodyStr) return false;
+      const low = bodyStr.toLowerCase();
+      for (const sign of INBOX_SIGNS) {
+        if (low.indexOf(sign) !== -1) return true;
+      }
+      // Dự phòng: friendly không khớp nhưng có "thread" + (message|inbox).
+      return (
+        low.indexOf("thread") !== -1 &&
+        (low.indexOf("message") !== -1 || low.indexOf("inbox") !== -1)
+      );
+    } catch (e) {
+      return false;
+    }
+  };
+
   // CHẨN ĐOÁN runtime: đối tượng thống kê đọc được từ ngoài (qua
   // chrome.scripting.executeScript world:"MAIN"). Dùng để phân biệt 2 gốc rễ
   // khi popup lấy 0 bài:
@@ -148,8 +188,10 @@
     xhrPatched: false,
     seen: 0,       // tổng số gói /api/graphql/ đã bắt (mọi loại, không chỉ feed)
     feedSeen: 0,   // số gói được nhận diện là feed nhóm
+    inboxSeen: 0,  // số gói được nhận diện là Messenger (inbox/hội thoại)
     buffered: 0,
     feedBuffered: 0,
+    inboxBuffered: 0,
     lastUrl: "",
     lastAt: 0,
   };
@@ -179,6 +221,12 @@
         feedBuffer.push(msg);
         if (feedBuffer.length > FEED_BUFFER_MAX) feedBuffer.shift();
       }
+      // GÓI MESSENGER: giữ trong đệm RIÊNG (thread list + nội dung hội thoại).
+      const isInbox = isInboxBody(msg.reqBody);
+      if (isInbox) {
+        inboxBuffer.push(msg);
+        if (inboxBuffer.length > INBOX_BUFFER_MAX) inboxBuffer.shift();
+      }
       // Cập nhật stat để probe MAIN-world đọc được.
       try {
         const s = window.__FBC_GQL_STAT__;
@@ -186,7 +234,9 @@
           s.seen++;
           s.buffered = buffer.length;
           s.feedBuffered = feedBuffer.length;
+          s.inboxBuffered = inboxBuffer.length;
           if (isFeed) s.feedSeen++;
+          if (isInbox) s.inboxSeen++;
           s.lastUrl = String(url || "").slice(0, 120);
           s.lastAt = Date.now();
         }
@@ -283,6 +333,14 @@
         for (const msg of feedBuffer) {
           sent.add(msg);
           window.postMessage(msg, "*");
+        }
+        // PHÁT inboxBuffer: đảm bảo content.js nhận gói Messenger (thread list +
+        // nội dung hội thoại) FB bắn sớm khi mở /messages/.
+        for (const msg of inboxBuffer) {
+          if (!sent.has(msg)) {
+            sent.add(msg);
+            window.postMessage(msg, "*");
+          }
         }
         for (const msg of buffer) {
           if (!sent.has(msg)) window.postMessage(msg, "*");

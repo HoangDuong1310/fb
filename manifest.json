@@ -29,7 +29,9 @@
     {
       "matches": [
         "https://www.facebook.com/groups/*",
-        "https://web.facebook.com/groups/*"
+        "https://web.facebook.com/groups/*",
+        "https://www.facebook.com/messages/*",
+        "https://web.facebook.com/messages/*"
       ],
       "js": ["src/fb-api-hook.js"],
       "run_at": "document_start",
@@ -38,7 +40,9 @@
     {
       "matches": [
         "https://www.facebook.com/groups/*",
-        "https://web.facebook.com/groups/*"
+        "https://web.facebook.com/groups/*",
+        "https://www.facebook.com/messages/*",
+        "https://web.facebook.com/messages/*"
       ],
       "js": ["src/content.js"],
       "run_at": "document_idle"
@@ -46,7 +50,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["src/gql-parse.js", "src/gql-comments.js"],
+      "resources": ["src/gql-parse.js", "src/gql-comments.js", "src/gql-messenger.js"],
       "matches": [
         "https://www.facebook.com/*",
         "https://web.facebook.com/*"

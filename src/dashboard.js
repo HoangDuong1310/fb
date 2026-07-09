@@ -15,7 +15,7 @@
  */
 
 import { $, store, toast, modal, syncToasts } from "./dashboard/core.js";
-import { switchView } from "./dashboard/nav.js";
+import { switchView, initNav, getCurrentView } from "./dashboard/nav.js";
 import {
   CRAWL_FIELDS,
   saveCrawlSettings,
@@ -68,6 +68,9 @@ import {
   updatePostGroupCount,
   togglePostSelectAll,
   filterPostGroups,
+  setPostMode,
+  generatePostDraft,
+  fillPitchBrief,
 } from "./dashboard/views/jobs.js";
 import {
   saveAIConfig,
@@ -118,6 +121,13 @@ import {
   deleteConvUI,
 } from "./dashboard/views/conversations.js";
 import {
+  loadPitchView,
+  reloadPitches,
+  genPitchUI,
+  editPitchUI,
+  approvePitchUI,
+} from "./dashboard/views/pitch.js";
+import {
   exportAllPosts,
   clearAllPosts,
   clearAllAdvisories,
@@ -142,12 +152,11 @@ import { switchRcTab } from "./dashboard/views/remote-commands.js";
 
 /* ============================ SỰ KIỆN UI ============================== */
 function bindEvents() {
-  document.querySelectorAll(".nav-item").forEach((b) =>
-    b.addEventListener("click", () => switchView(b.dataset.view))
-  );
+  // Điều hướng 2 cấp (workspace + sub-tab) do nav.js quản lý.
+  initNav();
   $("btnGlobalRefresh").addEventListener("click", () => {
-    const active = document.querySelector(".nav-item.active");
-    loadGroups().then(() => switchView(active ? active.dataset.view : "overview"));
+    const current = getCurrentView() || "overview";
+    loadGroups().then(() => switchView(current));
     toast("Đã làm mới.", "info", 1500);
   });
 
@@ -265,6 +274,15 @@ function bindEvents() {
 
   // Đăng bài (đa nhóm + trang cá nhân, AI xào nấu, ảnh đính kèm)
   if ($("btnPreparePost")) $("btnPreparePost").addEventListener("click", preparePost);
+  // Chuyển chế độ soạn: tự soạn / AI tự viết
+  if ($("postModeToggle"))
+    $("postModeToggle").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-postmode]");
+      if (btn) setPostMode(btn.dataset.postmode);
+    });
+  if ($("btnGenPost")) $("btnGenPost").addEventListener("click", generatePostDraft);
+  // Chào hàng: điền yêu cầu từ sản phẩm trong kho của tôi
+  if ($("btnPitchFill")) $("btnPitchFill").addEventListener("click", fillPitchBrief);
   if ($("btnPostAddImg"))
     $("btnPostAddImg").addEventListener("click", () => $("postImages").click());
   if ($("postImages"))
@@ -441,6 +459,18 @@ function bindEvents() {
       else if (act === "approve") approveConvReplyUI(id);
       else if (act === "close") toggleConvClose(id);
       else if (act === "del") deleteConvUI(id);
+    });
+
+  // Pitch inbox: event delegation
+  if ($("pitchList"))
+    $("pitchList").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-pitch-act]");
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const act = btn.dataset.pitchAct;
+      if (act === "gen") genPitchUI(id);
+      else if (act === "edit") editPitchUI(id);
+      else if (act === "approve") approvePitchUI(id);
     });
 
   // Cài đặt — quản lý dữ liệu
@@ -629,16 +659,12 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   if (msg.type === "CRAWL_BLOCK") {
     // Circuit-breaker vừa bật/tắt: cập nhật banner ở tab Cài đặt nếu đang mở.
-    const active = document.querySelector(".nav-item.active");
-    if (active && active.dataset.view === "settings") loadCrawlBlockBanner();
+    if (getCurrentView() === "settings") loadCrawlBlockBanner();
     return;
   }
   if (msg.type === "CRAWL_DONE" && msg.result) {
     // Refresh banner tạm ngưng auto-crawl nếu tab Cài đặt đang mở.
-    {
-      const active = document.querySelector(".nav-item.active");
-      if (active && active.dataset.view === "settings") loadCrawlBlockBanner();
-    }
+    if (getCurrentView() === "settings") loadCrawlBlockBanner();
     // Đang crawl hàng loạt (pool song song): nhả slot rồi lấp nhóm kế tiếp
     if (store.batch) {
       updateBatchStatus(`vừa xong +${msg.result.newCount} bài mới`);
@@ -675,9 +701,9 @@ chrome.runtime.onMessage.addListener((msg) => {
       return;
     }
     loadGroups().then(() => {
-      const active = document.querySelector(".nav-item.active");
-      if (active && ["posts", "overview", "groups"].includes(active.dataset.view)) {
-        switchView(active.dataset.view);
+      const cur = getCurrentView();
+      if (["posts", "overview", "groups"].includes(cur)) {
+        switchView(cur);
       }
     });
   }
@@ -692,20 +718,18 @@ chrome.runtime.onMessage.addListener((msg) => {
     }
   }
   if (msg.type === "JOB_UPDATE") {
-    const active = document.querySelector(".nav-item.active");
-    if (active && active.dataset.view === "autopost") loadJobs("post");
-    if (active && active.dataset.view === "autocomment") loadJobs("comment");
-    if (active && active.dataset.view === "overview") renderOverview();
+    const cur = getCurrentView();
+    if (cur === "autopost") loadJobs("post");
+    if (cur === "autocomment") loadJobs("comment");
+    if (cur === "overview") renderOverview();
   }
   if (msg.type === "CONVERSATION_UPDATE") {
-    const active = document.querySelector(".nav-item.active");
-    if (active && active.dataset.view === "conversations") reloadConversations();
+    if (getCurrentView() === "conversations") reloadConversations();
   }
   // Service worker báo 401 (hết phiên / chưa đăng nhập): nạp lại view web hiện
   // hành để hiện trạng thái "Cần đăng nhập" thay vì dữ liệu trống gây hiểu nhầm.
   if (msg.type === "AUTH_REQUIRED") {
-    const active = document.querySelector(".nav-item.active");
-    const view = active && active.dataset.view;
+    const view = getCurrentView();
     if (view === "groupprices") reloadGroupPrices();
     else if (view === "keywords") reloadKeywords();
     else if (view === "profiles") loadProfilesView();

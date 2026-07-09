@@ -591,11 +591,13 @@
   }
 
   function loadSelectors() {
+    // Content script KHÔNG có token để gọi API — nhờ background lấy selectors
+    // theo TÀI KHOẢN (background dùng DB.getSetting("fbSelectors")).
     return new Promise((resolve) => {
       try {
-        chrome.storage.local.get("fbSelectors", (r) => {
+        chrome.runtime.sendMessage({ type: "GET_SELECTORS" }, (res) => {
           void chrome.runtime.lastError;
-          resolve((r && r.fbSelectors) || null);
+          resolve((res && res.selectors) || null);
         });
       } catch (e) {
         resolve(null);
@@ -1108,6 +1110,19 @@
     commentChunks: [],
     commentCount: 0,
     commentBufferMax: 16,
+    // ---- MESSENGER (hộp thư) ----
+    // Mẫu request DANH SÁCH hội thoại (thread list) gần nhất (để replay phân trang).
+    inboxListTemplate: null,
+    // Chunks JSON của response thread-list gần nhất (dùng cho TRANG 1).
+    inboxListChunks: [],
+    inboxListCount: 0,
+    // Mẫu request NỘI DUNG hội thoại (messages) gần nhất, theo threadId.
+    inboxMsgTemplate: null,
+    inboxMsgChunks: [],
+    inboxMsgCount: 0,
+    // threadId gắn với inboxMsgTemplate gần nhất (để biết mẫu thuộc hội thoại nào).
+    inboxMsgThreadId: null,
+    inboxRunning: false,
   };
 
   // Import động gql-comments.js (bộ phân tích bình luận PURE). Cache sau lần đầu.
@@ -1126,6 +1141,15 @@
     const url = chrome.runtime.getURL("src/gql-parse.js");
     _gqlMod = await import(url);
     return _gqlMod;
+  }
+
+  // Import động gql-messenger.js (bộ phân tích hộp thư PURE). Cache sau lần đầu.
+  let _msgrMod = null;
+  async function loadMessengerModule() {
+    if (_msgrMod) return _msgrMod;
+    const url = chrome.runtime.getURL("src/gql-messenger.js");
+    _msgrMod = await import(url);
+    return _msgrMod;
   }
 
   // Nhờ MAIN world fetch hộ (để dùng đúng credential/header của trang), chờ
@@ -1228,6 +1252,9 @@
             `[API] bắt feed nhóm #${apiSniff.feedCount}` +
               ` | friendly=${req.friendly} doc_id=${req.doc_id}`
           );
+        } else if (await tryCaptureMessenger(req, d)) {
+          // Đã bắt & lưu gói Messenger (thread-list hoặc nội dung hội thoại).
+          // tryCaptureMessenger tự log + lưu template; không xử lý thêm ở đây.
         } else if (
           mod2 &&
           mod2.isCommentRequest(req.friendly, req.raw || d.reqBody)
@@ -1503,6 +1530,297 @@
     }
   }
 
+  // =======================================================================
+  // MESSENGER (hộp thư) qua API nội bộ FB — bắt thụ động + replay phân trang.
+  // Cùng mô hình an toàn với feed nhóm: KHÔNG tự dựng request từ đầu, chỉ dùng
+  // lại MẪU do trang tự bắn (giữ nguyên fb_dtsg/doc_id/header tự nhiên) và nhờ
+  // MAIN world fetch hộ (replayViaPage) để phân trang thread-list + tin nhắn.
+  // =======================================================================
+
+  // Bắt & lưu gói Messenger từ luồng __FBC_GQL. Trả true nếu đã nhận diện là gói
+  // Messenger (thread-list HOẶC nội dung hội thoại) để handler dừng phân nhánh.
+  async function tryCaptureMessenger(req, d) {
+    try {
+      const mgr = await loadMessengerModule();
+      const chunks = Array.isArray(d.chunks) ? d.chunks : [];
+      if (mgr.isThreadListRequest(req.friendly, req.variables)) {
+        apiSniff.inboxListCount += 1;
+        apiSniff.inboxListTemplate = {
+          url: d.url,
+          raw: req.raw,
+          friendly: req.friendly,
+          fb_dtsg: req.fb_dtsg,
+          doc_id: req.doc_id,
+          lsd: req.lsd,
+          variables: req.variables,
+        };
+        if (chunks.length) apiSniff.inboxListChunks = chunks;
+        dlog(
+          `[API] bắt Messenger thread-list #${apiSniff.inboxListCount}` +
+            ` | friendly=${req.friendly} chunks=${chunks.length}`
+        );
+        return true;
+      }
+      if (mgr.isThreadMessagesRequest(req.friendly, req.variables)) {
+        apiSniff.inboxMsgCount += 1;
+        // Cố gắng rút threadId từ variables để biết mẫu này thuộc hội thoại nào.
+        let tid = null;
+        try {
+          const vs = JSON.stringify(req.variables || {});
+          const m =
+            vs.match(/"thread_?fbid"\s*:\s*"?(\d{5,})"?/i) ||
+            vs.match(/"other_user_id"\s*:\s*"?(\d{5,})"?/i) ||
+            vs.match(/"thread_id"\s*:\s*"?(\d{5,})"?/i) ||
+            vs.match(/"id"\s*:\s*"?(\d{8,})"?/i);
+          if (m) tid = m[1];
+        } catch (_) {}
+        apiSniff.inboxMsgTemplate = {
+          url: d.url,
+          raw: req.raw,
+          friendly: req.friendly,
+          fb_dtsg: req.fb_dtsg,
+          doc_id: req.doc_id,
+          lsd: req.lsd,
+          variables: req.variables,
+        };
+        apiSniff.inboxMsgThreadId = tid;
+        if (chunks.length) apiSniff.inboxMsgChunks = chunks;
+        dlog(
+          `[API] bắt Messenger messages #${apiSniff.inboxMsgCount}` +
+            ` | friendly=${req.friendly} thread=${tid || "?"} chunks=${chunks.length}`
+        );
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // Đợi có mẫu (template) Messenger sau khi pull đệm hook + chờ FB tự bắn. Trả
+  // template hoặc null nếu quá hạn. `kind` = "list" | "msg".
+  async function waitInboxTemplate(kind, timeoutMs = 15000) {
+    const pollMs = 1200;
+    const start = Date.now();
+    const get = () =>
+      kind === "list" ? apiSniff.inboxListTemplate : apiSniff.inboxMsgTemplate;
+    pullBufferedGql();
+    while ((!get() || !get().doc_id) && Date.now() - start < timeoutMs) {
+      // Cuộn nhẹ vùng danh sách/hội thoại để kích hoạt lazy-load của Messenger.
+      try {
+        window.scrollBy(0, Math.round((window.innerHeight || 700) * 0.5));
+      } catch (_) {}
+      pullBufferedGql();
+      await sleep(pollMs);
+    }
+    return get() && get().doc_id ? get() : null;
+  }
+
+  // Phát hiện FB chặn (checkpoint / hết phiên / giới hạn tần suất) từ replay.
+  function detectInboxBlock(status, txt) {
+    if (status === 429)
+      return "FB giới hạn tần suất (HTTP 429). Đã dừng để bảo vệ tài khoản; thử lại sau.";
+    if (status === 401 || status === 403)
+      return `FB từ chối truy cập (HTTP ${status}). Phiên đăng nhập có thể đã hết hạn hoặc bị chặn.`;
+    if (status >= 500) return `FB lỗi máy chủ (HTTP ${status}). Đã dừng, thử lại sau.`;
+    const head = String(txt || "").toLowerCase();
+    if (
+      head.includes("checkpoint") ||
+      head.includes("/login/") ||
+      head.includes("login_required") ||
+      head.includes("please log in") ||
+      head.includes("www.facebook.com/login")
+    )
+      return "FB yêu cầu xác minh/đăng nhập lại (checkpoint). Đã dừng để tránh rủi ro khoá tài khoản.";
+    return null;
+  }
+
+  // QUÉT DANH SÁCH HỘI THOẠI qua API: trang 1 dùng chunks đã sniff, các trang
+  // sau replay bằng end_cursor. Trả { ok, threads, reason }.
+  // ID Facebook của CHÍNH chủ tài khoản, đọc từ cookie c_user (chuẩn trên
+  // facebook.com). Dùng để phân biệt tin "của tôi" vs "của đối phương".
+  function getSelfFbId() {
+    try {
+      const m = document.cookie.match(/(?:^|;\s*)c_user=(\d+)/);
+      if (m && m[1]) return m[1];
+    } catch (e) {}
+    // Fallback: một số shape comet nhúng viewer id / actorID trong DOM/script.
+    try {
+      const html = document.documentElement.innerHTML;
+      const m =
+        html.match(/"USER_ID"\s*:\s*"(\d+)"/) ||
+        html.match(/"actorID"\s*:\s*"(\d+)"/) ||
+        html.match(/"viewerID"\s*:\s*"(\d+)"/);
+      if (m && m[1] && m[1] !== "0") return m[1];
+    } catch (e) {}
+    return "";
+  }
+
+  async function runInboxListApi(options) {
+    const opts = {
+      maxThreads: (options && options.maxThreads) || 40,
+      maxPages: (options && options.maxPages) || 12,
+      pageDelay: (options && options.pageDelay) || 1200,
+      ...(options || {}),
+    };
+    const mgr = await loadMessengerModule();
+    const origin = location.origin;
+    const ctx = {
+      origin,
+      selfId: (options && options.selfId) || getSelfFbId() || "",
+    };
+
+    const tpl = await waitInboxTemplate("list");
+    // Dù chưa có template replay, nếu đã có chunks trang 1 vẫn trả được 1 trang.
+    const collected = [];
+    const seen = new Set();
+    const ingest = (chunks) => {
+      const { threads, pageInfo } = mgr.extractThreadsFromChunks(chunks, ctx);
+      for (const t of threads) {
+        if (seen.has(t.threadId)) continue;
+        seen.add(t.threadId);
+        collected.push(t);
+      }
+      return pageInfo;
+    };
+
+    let cursor = null;
+    if (apiSniff.inboxListChunks && apiSniff.inboxListChunks.length) {
+      const pi = ingest(apiSniff.inboxListChunks);
+      cursor = pi.endCursor;
+    }
+    if (!tpl && collected.length === 0) {
+      return {
+        ok: false,
+        threads: [],
+        reason:
+          "Chưa bắt được request danh sách hội thoại (thread-list) qua API.",
+      };
+    }
+
+    let pages = collected.length ? 1 : 0;
+    let blockedReason = null;
+    const rint = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
+    while (
+      tpl &&
+      !blockedReason &&
+      collected.length < opts.maxThreads &&
+      pages < opts.maxPages &&
+      cursor
+    ) {
+      const vars = JSON.parse(JSON.stringify(tpl.variables || {}));
+      setCursorInVariables(vars, cursor);
+      const body = buildReplayBody(tpl, vars);
+      const res = await replayViaPage({ url: tpl.url, body, friendly: tpl.friendly });
+      if (!res.ok) break;
+      blockedReason = detectInboxBlock(res.status, res.blockText);
+      if (blockedReason) break;
+      const pi = ingest(res.chunks);
+      pages += 1;
+      if (!pi.hasNext || !pi.endCursor || pi.endCursor === cursor) break;
+      cursor = pi.endCursor;
+      await sleep(Math.round(opts.pageDelay * (0.7 + Math.random() * 0.9)));
+    }
+
+    const threads = collected.slice(0, opts.maxThreads);
+    return {
+      ok: true,
+      threads,
+      reason: blockedReason || `Đã lấy ${threads.length} hội thoại (API).`,
+    };
+  }
+
+  // ĐỌC NỘI DUNG một hội thoại qua API. Nếu người dùng đang mở đúng thread thì
+  // trang tự bắn gói messages => dùng luôn; nếu không, replay bằng template gần
+  // nhất (best-effort). Trả { ok, messages, reason }.
+  async function runInboxThreadApi(options) {
+    const opts = {
+      threadId: String((options && options.threadId) || ""),
+      maxMessages: (options && options.maxMessages) || 60,
+      maxPages: (options && options.maxPages) || 8,
+      pageDelay: (options && options.pageDelay) || 1200,
+      ...(options || {}),
+    };
+    const mgr = await loadMessengerModule();
+    // Với chat 1:1, threadId chính là other_user_id -> dùng làm otherId để
+    // phân biệt tin của đối phương mà KHÔNG phụ thuộc selfId.
+    const ctx = {
+      selfId: (options && options.selfId) || getSelfFbId() || "",
+      otherId: (options && options.otherId) || opts.threadId || "",
+    };
+
+    const tpl = await waitInboxTemplate("msg");
+    const collected = [];
+    const seen = new Set();
+    let threadName = "";
+    const ingest = (chunks) => {
+      const { messages, pageInfo, name } = mgr.extractMessagesFromChunks(
+        chunks,
+        ctx
+      );
+      if (!threadName && name) threadName = name;
+      for (const m of messages) {
+        const key = String(m.ts || "") + "|" + m.text.slice(0, 80);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        collected.push(m);
+      }
+      return pageInfo;
+    };
+
+    let cursor = null;
+    if (apiSniff.inboxMsgChunks && apiSniff.inboxMsgChunks.length) {
+      const pi = ingest(apiSniff.inboxMsgChunks);
+      cursor = pi.endCursor;
+    }
+    if (!tpl && collected.length === 0) {
+      return {
+        ok: false,
+        messages: [],
+        reason: "Chưa bắt được request nội dung hội thoại qua API.",
+      };
+    }
+
+    let pages = collected.length ? 1 : 0;
+    let blockedReason = null;
+    while (
+      tpl &&
+      !blockedReason &&
+      collected.length < opts.maxMessages &&
+      pages < opts.maxPages &&
+      cursor
+    ) {
+      const vars = JSON.parse(JSON.stringify(tpl.variables || {}));
+      // Messenger phân trang tin nhắn thường dùng 'before' (cursor lùi về quá khứ).
+      if ("before" in vars) vars.before = cursor;
+      setCursorInVariables(vars, cursor);
+      const body = buildReplayBody(tpl, vars);
+      const res = await replayViaPage({ url: tpl.url, body, friendly: tpl.friendly });
+      if (!res.ok) break;
+      blockedReason = detectInboxBlock(res.status, res.blockText);
+      if (blockedReason) break;
+      const pi = ingest(res.chunks);
+      pages += 1;
+      if (!pi.hasNext || !pi.endCursor || pi.endCursor === cursor) break;
+      cursor = pi.endCursor;
+      await sleep(Math.round(opts.pageDelay * (0.7 + Math.random() * 0.9)));
+    }
+
+    // Chuẩn hoá lại CŨ -> MỚI (ingest có thể trộn nhiều trang).
+    collected.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    const messages = collected.slice(-opts.maxMessages);
+    // Tỷ lệ tin xác định được ai gửi (mineKnown). Tầng trên dùng để quyết định
+    // tin cậy API hay rơi về DOM.
+    const known = messages.filter((m) => m.mineKnown === true).length;
+    const knownRatio = messages.length ? known / messages.length : 0;
+    return {
+      ok: true,
+      messages,
+      name: threadName || "",
+      knownRatio,
+      selfId: ctx.selfId || "",
+      reason: blockedReason || `Đã lấy ${messages.length} tin nhắn (API).`,
+    };
+  }
+
   // ---- Lắng nghe lệnh từ background/popup --------------------------------
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -1625,6 +1943,34 @@
           });
         } catch (e) {
           sendResponse({ ok: false, error: String(e) });
+        }
+      })();
+      return true; // async
+    }
+
+    // Quét danh sách hội thoại Messenger qua API (tier-2 replay-trong-trang).
+    // Trả { ok, threads, reason }. Nền có DOM dự phòng nếu ok=false.
+    if (msg.type === "START_INBOX_API_SCAN") {
+      (async () => {
+        try {
+          const res = await runInboxListApi(msg.options || {});
+          sendResponse(res);
+        } catch (e) {
+          sendResponse({ ok: false, threads: [], reason: String(e) });
+        }
+      })();
+      return true; // async
+    }
+
+    // Đọc nội dung một hội thoại Messenger qua API (tier-2 replay).
+    // Trả { ok, messages, reason }. Nền có DOM dự phòng nếu ok=false.
+    if (msg.type === "READ_INBOX_THREAD_API") {
+      (async () => {
+        try {
+          const res = await runInboxThreadApi(msg.options || msg || {});
+          sendResponse(res);
+        } catch (e) {
+          sendResponse({ ok: false, messages: [], reason: String(e) });
         }
       })();
       return true; // async

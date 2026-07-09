@@ -183,6 +183,113 @@ export function filterPostGroups(query) {
   });
 }
 
+/* ------------------- Chế độ soạn nội dung (tự soạn / AI viết) ------------ */
+// Cache biến thể AI vừa sinh (để preparePost dùng lại khi số mục tiêu khớp,
+// khỏi gọi AI thêm một lần nữa cho cùng nội dung).
+let lastGenerated = null;
+// Kho sản phẩm của tôi để dựng gợi ý "chào hàng" (nạp lười khi mở chế độ AI viết).
+let pitchProducts = [];
+
+export function setPostMode(mode) {
+  const isGen = mode === "generate";
+  const toggle = $("postModeToggle");
+  if (toggle) {
+    toggle.querySelectorAll("[data-postmode]").forEach((b) => {
+      b.classList.toggle("active", b.dataset.postmode === mode);
+    });
+  }
+  const pitch = $("postPitchField");
+  const brief = $("postBriefField");
+  const gen = $("postGenControls");
+  if (pitch) pitch.hidden = !isGen;
+  if (brief) brief.hidden = !isGen;
+  if (gen) gen.hidden = !isGen;
+  // Lần đầu bật chế độ AI viết thì nạp kho để dựng danh sách chào hàng.
+  if (isGen && !pitchProducts.length) loadPitchProducts();
+}
+
+/**
+ * loadPitchProducts — Nạp sản phẩm "Kho của tôi" và đổ vào ô chọn để người dùng
+ * lấy nhanh làm nội dung chào hàng. Liên kết dữ liệu kho ↔ đăng bài (không nhập tay lại).
+ */
+export async function loadPitchProducts() {
+  const sel = $("postPitchProduct");
+  if (!sel) return;
+  try {
+    const res = await bg("GET_PRODUCTS");
+    const all = (res && res.products) || [];
+    pitchProducts = all.filter((p) => p.owned || p.source === "mystore");
+  } catch {
+    pitchProducts = [];
+  }
+  const opts = ['<option value="">— Chọn sản phẩm để AI tự soạn yêu cầu —</option>'];
+  pitchProducts.forEach((p, i) => {
+    const price = p.price != null ? " · " + Number(p.price).toLocaleString("vi-VN") + "₫" : "";
+    opts.push(`<option value="${i}">${esc((p.name || "SP") + price)}</option>`);
+  });
+  sel.innerHTML = opts.join("");
+}
+
+/**
+ * fillPitchBrief — Từ sản phẩm đang chọn trong kho, dựng sẵn "brief" chào hàng
+ * (tên, giá, bảo hành, cửa hàng, tồn kho) rồi đổ vào ô yêu cầu để AI viết bài.
+ */
+export function fillPitchBrief() {
+  const sel = $("postPitchProduct");
+  const briefEl = $("postJobBrief");
+  if (!sel || !briefEl) return;
+  const idx = parseInt(sel.value, 10);
+  if (Number.isNaN(idx) || !pitchProducts[idx]) {
+    return toast("Hãy chọn một sản phẩm trong kho trước.", "err");
+  }
+  const p = pitchProducts[idx];
+  const lines = ["Viết bài chào hàng cho sản phẩm sau:"];
+  lines.push("- Tên: " + (p.name || ""));
+  if (p.price != null) lines.push("- Giá: " + Number(p.price).toLocaleString("vi-VN") + "₫");
+  if (p.category) lines.push("- Loại: " + p.category);
+  if (p.brand) lines.push("- Hãng: " + p.brand);
+  if (p.warranty) lines.push("- Bảo hành: " + p.warranty);
+  if (p.store) lines.push("- Cửa hàng: " + p.store);
+  if (p.inStock === false) lines.push("- Tình trạng: tạm hết hàng (nhận đặt trước)");
+  else lines.push("- Tình trạng: còn hàng");
+  briefEl.value = lines.join("\n");
+  toast("Đã điền yêu cầu từ kho. Bổ sung ưu đãi/liên hệ rồi bấm ✨ để AI viết bài.", "ok");
+}
+
+/**
+ * generatePostDraft — Gọi AI TỰ VIẾT nội dung từ "brief" (yêu cầu) của người
+ * dùng rồi đổ vào ô "Nội dung gốc" để họ xem/sửa trước khi tạo hàng đợi. Nếu đã
+ * chọn nhiều nhóm, xin AI đúng số biến thể để mỗi nhóm một bài khác nhau.
+ */
+export async function generatePostDraft() {
+  const brief = ($("postJobBrief").value || "").trim();
+  if (!brief) return toast("Hãy nhập yêu cầu để AI viết nội dung.", "err");
+  const tone = ($("postTone") && $("postTone").value) || "than-thien";
+  // Số biến thể mong muốn = số mục tiêu (nhóm + trang cá nhân), tối thiểu 1.
+  const targetCount =
+    getSelectedPostGroups().length + ($("postToProfile").checked ? 1 : 0);
+  const count = Math.max(1, targetCount);
+
+  const loading = toast("Đang nhờ AI viết nội dung...", "info", 60000);
+  const res = await bg("AI_GENERATE_CONTENT", { payload: { brief, tone, count } });
+  loading.close();
+
+  if (!res || !res.ok || !Array.isArray(res.variants) || !res.variants.length) {
+    return toast((res && res.error) || "AI chưa viết được nội dung.", "err");
+  }
+  // Đổ biến thể đầu vào ô nội dung gốc; nếu có nhiều mục tiêu, người dùng vẫn
+  // có thể bật "AI xào nấu" để tự chia biến thể ở bước xem trước.
+  $("postJobContent").value = res.variants[0];
+  toast(
+    res.variants.length > 1
+      ? `AI đã viết ${res.variants.length} biến thể — bản đầu đã điền vào ô nội dung. Xem trước để chỉnh từng bài.`
+      : "AI đã viết xong nội dung. Kiểm tra rồi tạo hàng đợi.",
+    "ok"
+  );
+  // Lưu lại toàn bộ biến thể để preparePost dùng trực tiếp (khỏi gọi AI lần nữa).
+  lastGenerated = { content: res.variants[0], variants: res.variants };
+}
+
 /* --------------------------- Tạo bài (batch) ---------------------------- */
 export async function preparePost() {
   const toProfile = $("postToProfile").checked;
@@ -202,7 +309,18 @@ export async function preparePost() {
   let variants;
   // fallbackInfo: thông báo bền vững hiển thị trong modal xem trước khi AI không xào nấu được
   let fallbackInfo = null;
-  if (useAI && targets.length > 1) {
+
+  // Nếu vừa nhờ AI TỰ VIẾT đúng số biến thể cho số mục tiêu này và người dùng
+  // chưa sửa nội dung gốc, dùng thẳng các biến thể đó — khỏi gọi AI xào nấu lại.
+  const canReuseGen =
+    lastGenerated &&
+    Array.isArray(lastGenerated.variants) &&
+    lastGenerated.variants.length === targets.length &&
+    lastGenerated.content === content;
+
+  if (canReuseGen) {
+    variants = lastGenerated.variants.slice();
+  } else if (useAI && targets.length > 1) {
     const loading = toast("Đang nhờ AI xào nấu nội dung...", "info", 60000);
     const res = await bg("AI_SPIN_CONTENT", { payload: { content, count: targets.length } });
     loading.close();
