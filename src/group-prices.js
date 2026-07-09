@@ -33,6 +33,7 @@
  */
 
 import { extractMoneyFigures } from "./advisory.js";
+import { hasAnyKeyword } from "./keyword-match.js";
 import { apiFetch as realApiFetch } from "./api.js";
 import * as DB from "./db.js";
 import { getAIConfig, fetchWithTimeout, parseSelectorJson } from "./util.js";
@@ -43,11 +44,23 @@ const BATCH_SIZE = 15;
 
 /* =============================== TẦNG 1 ================================== */
 
+// TÍN HIỆU MUA/HỎI GIÁ — nếu bài chứa bất kỳ cụm nào thì đó là NGƯỜI MUA đang
+// hỏi, KHÔNG phải rao bán. Loại thẳng để giá của người mua ("cần mua ... tầm
+// 5tr") không lọt vào mặt bằng giá thị trường. Khớp theo ranh giới từ + bỏ dấu.
+const BUY_GUARD = [
+  "cần mua", "muốn mua", "tìm mua", "cần con", "ai bán", "ai pass",
+  "giá bao nhiêu", "bao nhiêu tiền", "tầm giá", "tầm tiền", "ngân sách",
+  "ai dư", "có ai bán", "chỗ nào bán", "mua ở đâu",
+];
+
 /**
  * tier1Pass(text, sellKeywords) — lọc thô tầng 1.
  * TRUE chỉ khi text có ĐỒNG THỜI: (a) một con số tiền (extractMoneyFigures) và
- * (b) ít nhất một từ khóa dấu hiệu BÁN (so khớp trên text đã lowercase).
- * FALSE cho bài hỏi/mua ("cần mua ... giá bao nhiêu") dù có số model.
+ * (b) ít nhất một từ khóa dấu hiệu BÁN — SO KHỚP THEO RANH GIỚI TỪ + BỎ DẤU
+ * (dùng chung keyword-match.js) nên "banh" không dính "ban", "thanh ly" không
+ * dấu vẫn khớp "thanh lý".
+ * FALSE cho bài hỏi/mua: (a) không có money figure, HOẶC (b) dính BUY_GUARD
+ * ("cần mua ... tầm 5tr, ai pass") dù có số tiền + từ "pass".
  */
 export function tier1Pass(text, sellKeywords) {
   const s = String(text || "");
@@ -56,8 +69,9 @@ export function tier1Pass(text, sellKeywords) {
   if (keywords.length === 0) return false;
   const hasMoney = extractMoneyFigures(s).length > 0;
   if (!hasMoney) return false;
-  const lower = s.toLowerCase();
-  return keywords.some((k) => k && lower.includes(String(k).toLowerCase()));
+  // Người mua đang hỏi giá -> loại (chống ô nhiễm mặt bằng giá).
+  if (hasAnyKeyword(s, BUY_GUARD)) return false;
+  return hasAnyKeyword(s, keywords);
 }
 
 /* =============================== TẦNG 2 ================================== */

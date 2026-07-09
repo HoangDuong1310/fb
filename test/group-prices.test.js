@@ -61,6 +61,20 @@ test("tier1Pass: tolerates empty/undefined text and empty keyword list", () => {
   assert.equal(tier1Pass("Bán giá 5.000.000", []), false);
 });
 
+test("tier1Pass: FALSE via BUY_GUARD even with money AND a sell keyword", () => {
+  // Buyer post that ALSO trips a sell keyword ("pass") and has a real money
+  // figure — but "cần mua" (buy-guard) must veto it so buyer prices never
+  // pollute the market baseline.
+  const text = "Cần mua RTX 4060 giá tầm 5.000.000, bạn nào pass lại inbox mình";
+  assert.equal(tier1Pass(text, SELL), false);
+});
+
+test("tier1Pass: word-boundary + deaccent — 'thanh ly' (no accents) still passes", () => {
+  // Accent-less seller input must still match "thanh lý" via deaccent matching.
+  const text = "Thanh ly nhanh laptop cu gia 3.000.000 con dung tot";
+  assert.equal(tier1Pass(text, SELL), true);
+});
+
 /* ----------------------------- selectForAI ------------------------------- */
 
 test("selectForAI: keeps only un-parsed posts that pass tier1", () => {

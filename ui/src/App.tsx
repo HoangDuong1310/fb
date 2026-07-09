@@ -5,6 +5,7 @@ import {
   MessageCircleReply,
   Megaphone,
   Tag,
+  KeyRound,
   Wrench,
   Sparkles,
   ShieldAlert,
@@ -15,6 +16,7 @@ import { Feed } from "@/views/Feed";
 import { Comments } from "@/views/Comments";
 import { Compose } from "@/views/Compose";
 import { Prices } from "@/views/Prices";
+import { Keywords } from "@/views/Keywords";
 import { Tools } from "@/views/Tools";
 
 /* -------------------------------------------------------------------------
@@ -25,7 +27,14 @@ import { Tools } from "@/views/Tools";
    never the driver. Views are stubbed here and built out per-todo.
    ------------------------------------------------------------------------- */
 
-type ViewId = "messenger" | "feed" | "comments" | "compose" | "prices" | "tools";
+type ViewId =
+  | "messenger"
+  | "feed"
+  | "comments"
+  | "compose"
+  | "prices"
+  | "keywords"
+  | "tools";
 
 interface NavItem {
   id: ViewId;
@@ -66,6 +75,12 @@ const NAV: NavItem[] = [
     icon: Tag,
   },
   {
+    id: "keywords",
+    label: "Từ khóa",
+    hint: "Bộ lọc lead tự học — duyệt từ khóa AI đề xuất",
+    icon: KeyRound,
+  },
+  {
     id: "tools",
     label: "Công cụ",
     hint: "Thu thập, giá thị trường, cấu hình",
@@ -93,6 +108,10 @@ const VIEW_TITLE: Record<ViewId, { title: string; sub: string }> = {
   prices: {
     title: "Giá & Sản phẩm",
     sub: "Giá sàn từ nhóm, so giá sản phẩm cửa hàng và kho hàng của bạn.",
+  },
+  keywords: {
+    title: "Từ khóa & Đề xuất",
+    sub: "Bộ lọc lead tự học theo thời gian. Duyệt từ khóa do AI đề xuất để lần sau lọc chuẩn hơn.",
   },
   tools: {
     title: "Công cụ",
@@ -201,6 +220,8 @@ export function App() {
             <Compose />
           ) : view === "prices" ? (
             <Prices />
+          ) : view === "keywords" ? (
+            <Keywords />
           ) : (
             <Tools />
           )}

@@ -18,6 +18,7 @@
  */
 
 import { bg } from "./core.js";
+import { normForMatch, scoreHits, hasAnyKeyword } from "../keyword-match.js";
 
 // Tín hiệu KHÁCH CẦN MUA (ý định mua, đi tìm hàng).
 const BUY_BASE = [
@@ -26,7 +27,7 @@ const BUY_BASE = [
   "lên cấu hình", "lên đời", "ngân sách", "tầm giá", "khoảng giá", "tầm tiền",
   "giá bao nhiêu", "bao nhiêu tiền", "báo giá", "ở đâu rẻ", "nên mua", "cần con",
   "có sẵn không", "còn hàng không", "shop nào", "chỗ nào bán", "mua ở đâu",
-  "order", "đặt hàng", "muốn lấy", "cần lấy",
+  "đặt hàng", "muốn lấy", "cần lấy",
 ];
 
 // Tín hiệu CẦN HỖ TRỢ (hỏi kỹ thuật, so sánh, hoặc sự cố/hỏng hóc).
@@ -34,23 +35,41 @@ const SUPPORT_BASE = [
   "có nên", "loại nào", "con nào", "hãng nào", "so sánh", "khác gì",
   "dùng được không", "chạy được không", "hợp không", "tương thích",
   "có tốt không", "review", "đánh giá", "thắc mắc", "cho hỏi", "xin hỏi",
-  "ai biết", "giúp với", "giúp em", "giúp mình", "cứu với",
-  "bị lỗi", "bị hư", "bị hỏng", "lỗi gì", "hư gì", "hỏng gì", "bị sao",
-  "bị làm sao", "không lên", "không vào", "không nhận", "không khởi động",
-  "màn hình đen", "đèn đỏ", "tự tắt", "tự khởi động lại", "kêu bíp", "giật lag",
-  "sửa", "khắc phục", "cách fix", "fix", "bị gì", "bị treo", "đơ máy",
+  "ai biết", "giúp với", "giúp em", "giúp mình", "cứu với", "bị lỗi", "bị hư",
+  "bị hỏng", "lỗi gì", "hư gì", "hỏng gì", "bị sao", "bị làm sao", "không lên",
+  "không vào", "không nhận", "không khởi động", "màn hình đen", "đèn đỏ",
+  "tự tắt", "tự khởi động lại", "kêu bíp", "giật lag",
+  // "sửa" trần bị loại (dễ dính THỢ/SHOP "nhận sửa chữa"); chỉ giữ cụm phía KHÁCH.
+  "cần sửa", "sửa giúp", "sửa ở đâu", "khắc phục",
+  "cách fix", "bị gì", "bị treo", "đơ máy",
+];
+
+// Shop/thợ chào dịch vụ (thu mua, nhận sửa, mua bán trao đổi...) -> BÊN BÁN,
+// không phải khách cần hỗ trợ/cần mua. Ép cứng nhãn seller.
+const SHOP_OFFER = [
+  "thu mua", "nhận thu mua", "chuyên thu mua", "nhận sửa", "nhận sửa chữa",
+  "chuyên sửa", "nhận bọc", "nhận thay", "nhận order", "nhận ký gửi",
+  "nhận thanh lý", "trao đổi mua bán", "mua bán trao đổi", "chuyên mua bán",
+  "nhận lên đời", "nhận vệ sinh",
 ];
 
 // Tín hiệu NGƯỜI BÁN (để loại khỏi lead).
 const SELLER_BASE = [
   "cần bán", "cần pass", "pass lại", "pass nhanh", "thanh lý", "thanh lí",
   "để lại", "nhượng lại", "bán nhanh", "bán gấp", "ra đi", "lên đời nên bán",
-  "giá bán", "giá fix", "fix nhẹ", "fixnhẹ", "bớt lộc", "có fix", "đã qua sử dụng",
-  "hàng còn bảo hành", "còn bảo hành", "còn bh", "fullbox", "full box", "newseal",
-  "new seal", "like new", "likenew", "freeship", "free ship", "ship cod", "ship toàn quốc",
-  "ib zalo", "inbox zalo", "liên hệ zalo", "call zalo", "alo zalo", "sđt", "số đt",
-  "giao lưu", "gl ", "bao test", "bao ship", "bảo hành shop", "shop mình",
-  "bên mình có", "cửa hàng mình", "có hoá đơn", "xuất hoá đơn", "nhận order sỉ",
+  "giá bán", "giá fix", "fix nhẹ", "fixnhẹ", "bớt lộc", "có fix",
+  "đã qua sử dụng", "hàng còn bảo hành", "còn bảo hành", "còn bh", "fullbox",
+  "full box", "newseal", "new seal", "like new", "likenew", "freeship",
+  "free ship", "ship cod", "ship toàn quốc", "ib zalo", "inbox zalo",
+  "liên hệ zalo", "call zalo", "alo zalo", "sđt", "số đt", "giao lưu", "gl",
+  "bao test", "bao ship", "bảo hành shop", "shop mình", "bên mình có",
+  "cửa hàng mình", "có hoá đơn", "xuất hoá đơn", "nhận order sỉ",
+];
+
+// Tín hiệu bán CHẮC CHẮN -> ép nhãn seller ngay (chặn người bán lọt vào lead).
+const STRONG_SELLER = [
+  "cần bán", "bán gấp", "bán nhanh", "thanh lý", "thanh lí",
+  "cần pass", "pass lại", "pass nhanh", "nhượng lại", "nhận order sỉ",
 ];
 
 // Nhãn lead nội bộ -> type trong DB. "seller" gộp chung type "sell".
@@ -77,27 +96,34 @@ const norm = (s) =>
     .replace(/\s+/g, " ")
     .trim();
 
-function countHits(text, keywords) {
-  let n = 0;
-  for (const k of keywords) {
-    if (k && text.includes(k)) n++;
-  }
-  return n;
-}
-
-const QUESTION_HINT = /[?？]|(^|\s)(sao|tại sao|vì sao|làm sao|thế nào|như nào|ntn)\b/;
+// Từ để hỏi, dạng KHÔNG DẤU (khớp trên `hay` đã deaccent). normForMatch bỏ hết
+// dấu câu nên "?" phải dò trên text GỐC (xem classifyLead), không nhét vào đây.
+const QUESTION_HINT = /(^|\s)(sao|tai sao|vi sao|lam sao|the nao|nhu nao|ntn)\b/;
 
 /**
  * Phân loại một bài viết. Trả { label, score, signals }.
+ *
+ * Dùng matcher RANH GIỚI TỪ + BỎ DẤU + CHẤM ĐIỂM ĐẶC HIỆU (src/keyword-match.js):
+ *   - "thanh ly" không dấu vẫn bắt được người bán;
+ *   - "gl" không dính trong "google";
+ *   - cụm dài (đặc hiệu) nặng hơn token đơn ngắn.
+ * STRONG_SELLER / SHOP_OFFER ép cứng nhãn seller (người bán / shop chào dịch vụ).
  */
 export function classifyLead(text) {
-  const t = norm(text);
-  if (!t) return { label: "other", score: 0, signals: { buy: 0, support: 0, seller: 0 } };
+  const hay = normForMatch(text);
+  if (!hay) return { label: "other", score: 0, signals: { buy: 0, support: 0, seller: 0 } };
 
-  const buy = countHits(t, kw("buy"));
-  let support = countHits(t, kw("support"));
-  const seller = countHits(t, kw("seller"));
-  if (QUESTION_HINT.test(t) && buy === 0) support += 1;
+  if (hasAnyKeyword(text, STRONG_SELLER) || hasAnyKeyword(text, SHOP_OFFER)) {
+    const sel = scoreHits(text, kw("seller")).score;
+    return { label: "seller", score: sel, signals: { buy: 0, support: 0, seller: sel } };
+  }
+
+  const buy = scoreHits(text, kw("buy")).score;
+  let support = scoreHits(text, kw("support")).score;
+  const seller = scoreHits(text, kw("seller")).score;
+  // Câu hỏi = có "?" (dò trên text GỐC vì `hay` đã bỏ dấu câu) hoặc từ để hỏi.
+  const isQuestion = /[?？]/.test(String(text ?? "")) || QUESTION_HINT.test(hay);
+  if (isQuestion && buy === 0) support += 1;
 
   const signals = { buy, support, seller };
 

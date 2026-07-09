@@ -23,6 +23,7 @@ import {
   LEAD_META,
   matchLeadMode,
   type LeadMode,
+  type LeadLabel,
 } from "@/lib/leadfilter";
 
 interface Post {
@@ -40,10 +41,22 @@ interface Post {
   groupId?: string;
   reactions?: number;
   comments?: number;
+  leadLabel?: string;
+  leadSource?: string;
+  leadVer?: number;
+  leadAt?: number;
 }
 
 interface PostsResponse extends BgResponse {
   posts?: Post[];
+}
+
+interface ReclassifyResponse extends BgResponse {
+  processed?: number;
+  ruleCount?: number;
+  aiCount?: number;
+  promoted?: number;
+  queued?: number;
 }
 
 interface UsedProduct {
@@ -152,6 +165,12 @@ function Avatar({ name, size = 40 }: { name: string; size?: number }) {
   );
 }
 
+// Nhãn ưu tiên: lead_label đã lưu (rule/AI/sửa tay) mới tới rule on-device.
+function resolveLeadLabel(p: Post): LeadLabel {
+  if (p.leadLabel && p.leadLabel in LEAD_META) return p.leadLabel as LeadLabel;
+  return classifyLead(p.text || "").label;
+}
+
 export function Feed() {
   const [posts, setPosts] = useState<Post[]>([]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -172,6 +191,7 @@ export function Feed() {
   const [sending, setSending] = useState<Record<string, boolean>>({});
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast>(null);
+  const [reclassifying, setReclassifying] = useState(false);
   const toastTimer = useRef<number | null>(null);
 
   function flash(kind: NonNullable<Toast>["kind"], text: string, ms = 3200) {
@@ -210,8 +230,7 @@ export function Feed() {
       .sort((a, b) => sortKey(b) - sortKey(a))
       .filter((p) => {
         if (leadMode !== "all") {
-          const lead = classifyLead(p.text || "");
-          if (!matchLeadMode(lead.label, leadMode)) return false;
+          if (!matchLeadMode(resolveLeadLabel(p), leadMode)) return false;
         }
         if (term) {
           const hay = `${p.text || ""} ${p.authorName || ""}`.toLowerCase();
@@ -329,6 +348,50 @@ export function Feed() {
     }
   }
 
+  // Sửa nhãn tay: cập nhật lạc quan + gọi SW; hỏng thì hoàn tác.
+  async function setLeadLabelUI(post: Post, label: LeadLabel) {
+    const id = post.postId;
+    const prev = posts;
+    setPosts((list) =>
+      list.map((p) =>
+        p.postId === id ? { ...p, leadLabel: label, leadSource: "manual" } : p,
+      ),
+    );
+    const res = await bg("SET_LEAD_LABEL", { postId: id, label });
+    if (!res.ok) {
+      setPosts(prev);
+      flash("err", res.error || "Không lưu được nhãn.");
+    } else {
+      flash("ok", "Đã lưu nhãn. Hệ thống sẽ học dần từ chỉnh sửa này.");
+    }
+  }
+
+  // Phân loại lại toàn kho: rule chốt ca rõ, AI xử ca mơ hồ, rồi học từ khoá.
+  async function reclassify() {
+    setReclassifying(true);
+    try {
+      const res = await bg<ReclassifyResponse>("RUN_LEAD_CLASSIFICATION");
+      if (!res.ok) {
+        flash("err", res.error || "Phân loại lại thất bại.");
+        return;
+      }
+      const parts: string[] = [];
+      if (res.processed != null) parts.push(`${res.processed} bài`);
+      if (res.aiCount) parts.push(`${res.aiCount} qua AI`);
+      if (res.promoted) parts.push(`+${res.promoted} từ khoá mới`);
+      if (res.queued) parts.push(`${res.queued} chờ duyệt`);
+      flash(
+        "ok",
+        "Đã phân loại lại" +
+          (parts.length ? ": " + parts.join(", ") : "") +
+          ".",
+      );
+      await load();
+    } finally {
+      setReclassifying(false);
+    }
+  }
+
   return (
     <div className="relative mx-auto flex w-full max-w-[720px] flex-col gap-3">
       {/* Toolbar */}
@@ -344,16 +407,32 @@ export function Feed() {
                   : `${total} bài viết`}
             </span>
           </div>
-          <button
-            onClick={load}
-            disabled={loading}
-            className="inline-flex items-center gap-1.5 rounded-sm border border-line bg-surface-2 px-2.5 py-1 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-60"
-          >
-            <RefreshCw
-              className={cn("size-3.5", loading && "animate-spin text-accent")}
-            />
-            Làm mới
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={reclassify}
+              disabled={loading || reclassifying}
+              title="Phân loại lại toàn kho: rule chốt ca rõ, AI xử ca mơ hồ, rồi tự học thêm từ khoá"
+              className="inline-flex items-center gap-1.5 rounded-sm border border-line bg-surface-2 px-2.5 py-1 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-60"
+            >
+              <Sparkles
+                className={cn(
+                  "size-3.5 text-accent",
+                  reclassifying && "animate-pulse",
+                )}
+              />
+              {reclassifying ? "Đang phân loại…" : "Phân loại lại"}
+            </button>
+            <button
+              onClick={load}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 rounded-sm border border-line bg-surface-2 px-2.5 py-1 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-60"
+            >
+              <RefreshCw
+                className={cn("size-3.5", loading && "animate-spin text-accent")}
+              />
+              Làm mới
+            </button>
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {LEAD_FILTERS.map((f) => (
@@ -412,8 +491,9 @@ export function Feed() {
             const text = post.text || "";
             const isLong = text.length > 280;
             const isExpanded = !!expanded[id];
-            const lead = classifyLead(text);
-            const showBadge = lead.label !== "other";
+            const leadLabel = resolveLeadLabel(post);
+            const showBadge = leadLabel !== "other";
+            const isManual = post.leadSource === "manual";
             const draft = drafts[id] ?? "";
             const meta = analysis[id];
             const imgs = (post.images || []).slice(0, 4);
@@ -453,12 +533,14 @@ export function Feed() {
                       </span>
                       {showBadge && (
                         <span
+                          title={isManual ? "Bạn đã sửa nhãn này" : undefined}
                           className={cn(
                             "inline-flex items-center gap-1 rounded-sm border px-2 py-0.5 text-xs font-medium",
-                            LEAD_TONE_CLS[lead.label],
+                            LEAD_TONE_CLS[leadLabel],
                           )}
                         >
-                          {LEAD_META[lead.label].text}
+                          {LEAD_META[leadLabel].text}
+                          {isManual && " ✎"}
                         </span>
                       )}
                     </div>
@@ -484,6 +566,30 @@ export function Feed() {
                     </a>
                   )}
                 </header>
+
+                {/* Đổi nhãn phân loại — dạy hệ thống học từ khoá mới */}
+                <div className="flex items-center gap-2 px-4 pt-2 text-xs text-ink-faint">
+                  <span>Nhãn:</span>
+                  <select
+                    value={leadLabel}
+                    onChange={(e) =>
+                      setLeadLabelUI(post, e.target.value as LeadLabel)
+                    }
+                    title="Đổi nhãn phân loại (dạy hệ thống học từ khoá mới)"
+                    className="rounded-sm border border-line bg-bg px-1.5 py-0.5 text-xs text-ink-soft focus:border-accent/60 focus-visible:outline-none"
+                  >
+                    {(["buy", "support", "seller", "other"] as LeadLabel[]).map(
+                      (v) => (
+                        <option key={v} value={v}>
+                          {LEAD_META[v].text}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                  {isManual && (
+                    <span className="text-accent">✎ đã sửa tay</span>
+                  )}
+                </div>
 
                 {/* Body */}
                 {text && (

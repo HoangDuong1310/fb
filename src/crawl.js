@@ -1676,6 +1676,32 @@ async function executeWatchReplies(conv) {
   const meta = conv.meta || {};
   const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
   await waitTabComplete(tab.id, 30000);
+  // NGẮT MẠCH (đồng bộ với feed/inbox): nếu FB đá tab sang trang
+  // checkpoint/đăng nhập thì coi như tài khoản đang bị chặn -> đóng tab và báo
+  // blockReason để processReplyWatch arm ngắt mạch chung, không mở thêm tab.
+  try {
+    const cur = await new Promise((r) =>
+      chrome.tabs.get(tab.id, (t) => {
+        void chrome.runtime.lastError;
+        r(t);
+      })
+    );
+    const landed = String((cur && (cur.url || cur.pendingUrl)) || "").toLowerCase();
+    if (
+      landed.includes("/checkpoint") ||
+      landed.includes("/login/") ||
+      landed.includes("/login.php") ||
+      landed.includes("login_required")
+    ) {
+      try { await chrome.tabs.remove(tab.id); } catch (e) {}
+      return {
+        ok: false,
+        blocked: true,
+        blockReason:
+          "FB yêu cầu xác minh/đăng nhập lại (checkpoint). Đã dừng để tránh rủi ro khoá tài khoản.",
+      };
+    }
+  } catch (e) {}
   await sleep(3500);
   let res;
   try {
@@ -2364,8 +2390,20 @@ async function processReplyWatch(opts = {}) {
   const cfg = await getWatchConfig();
   // Khi gọi thủ công (manual=true) thì chạy kể cả khi alarm tắt.
   if (!cfg.enabled && !opts.manual) return { ok: false, error: "Theo dõi reply đang tắt." };
+  // NGẮT MẠCH CHUNG (feed/inbox/comment): đang trong thời gian nghỉ vì FB chặn
+  // thì bỏ qua lượt này để bảo vệ tài khoản, không mở tab nào cả.
+  const blockState = await getCrawlBlockState();
+  if (blockState && blockState.blocked) {
+    return {
+      ok: false,
+      blocked: true,
+      error: blockState.reason || "Đang tạm nghỉ vì FB chặn crawl.",
+      blockedUntil: blockState.blockedUntil,
+    };
+  }
   _watching = true;
   let checked = 0, newReplies = 0, noParent = 0;
+  let blocked = false;
   // Lưu chẩn đoán của hội thoại GẦN NHẤT để báo người dùng vì sao ra ít/không
   // có reply: số anchor bình luận, số anchor reply tổng/khớp, các parentId khác
   // thấy trên trang, điểm khớp mềm, vài mẫu text. Giúp phân biệt "trang chưa
@@ -2383,6 +2421,13 @@ async function processReplyWatch(opts = {}) {
       const c = convs[i];
       const res = await executeWatchReplies(c);
       checked += 1;
+      // Phát hiện FB chặn (redirect checkpoint/login) -> arm ngắt mạch chung và
+      // dừng lượt ngay, không mở thêm tab cho các hội thoại còn lại.
+      if (res && res.blocked && res.blockReason) {
+        await setCrawlBlock(res.blockReason);
+        blocked = true;
+        break;
+      }
       // Không định vị được bình luận của ta trên trang -> đếm để báo rõ.
       if (res && res.ok && res.noParent) {
         noParent += 1;
@@ -2432,7 +2477,13 @@ async function processReplyWatch(opts = {}) {
   } finally {
     _watching = false;
   }
-  return { ok: true, checked, newReplies, noParent, diag: lastDiag };
+  // Lượt hoàn tất mà KHÔNG bị chặn -> reset ngắt mạch (đồng bộ với feed/inbox:
+  // một lượt sạch coi như bằng chứng tài khoản chưa bị khoá). Gate ở đầu hàm đã
+  // bảo đảm không bao giờ xoá nhầm một đợt chặn còn hiệu lực.
+  if (!blocked && checked > 0) {
+    try { await clearCrawlBlock(); } catch (e) {}
+  }
+  return { ok: true, checked, newReplies, noParent, blocked, diag: lastDiag };
 }
 
 /** Khôi phục alarm theo-dõi-reply khi service worker khởi động lại. */

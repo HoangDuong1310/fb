@@ -37,7 +37,10 @@ Thumbs.db
 # ===== Đóng gói extension =====
 fb-group-crawler.zip
 a.zip
-dist/
+# Bỏ qua build output nói chung, NHƯNG commit dist/ui vì extension nạp
+# chrome.runtime.getURL("dist/ui/index.html") lúc chạy — cần có sẵn trong zip giao user.
+dist/*
+!dist/ui/
 
 # ===== Repo server riêng (đẩy lên fb-ui.git, không nhúng vào repo extension) =====
 server/

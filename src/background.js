@@ -73,6 +73,7 @@ import {
   initReplyWatch,
 } from "./crawl.js";
 import { runGroupPriceExtraction } from "./group-prices.js";
+import { runLeadClassification } from "./lead-classify.js";
 import { pollRemoteCommands, connectRealtime, disconnectRealtime } from "./remote-commands.js";
 
 /* ----------------------- XÁC THỰC WEB BACKEND (state) ------------------ */
@@ -1073,6 +1074,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    // Chạy phễu phân loại lead (rule chốt ca rõ, AI cho ca mơ hồ, rồi ĐÀO
+    // keyword tự làm giàu bộ lọc). Toàn bộ ở SW vì cần token + apiFetch.
+    // Trả { processed, ruleCount, aiCount, promoted, queued }.
+    case "RUN_LEAD_CLASSIFICATION": {
+      (async () => {
+        await readyPromise;
+        const result = await runLeadClassification();
+        sendResponse({ ok: true, ...result });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Đổi nhãn lead THỦ CÔNG cho một bài (nguồn 'manual' — không bị phễu tự
+    // động ghi đè). Người dùng dạy hệ thống ca khó -> vòng học lấy làm chuẩn.
+    case "SET_LEAD_LABEL": {
+      (async () => {
+        await readyPromise;
+        await API.apiFetch("/api/posts/" + encodeURIComponent(msg.postId), {
+          method: "PATCH",
+          body: JSON.stringify({ leadLabel: msg.label, leadSource: "manual" }),
+        });
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     // Danh sách từ khóa đã học (lọc theo type nếu có).
     case "GET_KEYWORDS": {
       (async () => {
@@ -1122,6 +1149,51 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await API.apiFetch("/api/keywords/" + encodeURIComponent(msg.id), {
           method: "DELETE",
         });
+        sendResponse({ ok: true });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Hàng chờ vòng học keyword: danh sách đề xuất (lọc theo status/label nếu có).
+    case "GET_KEYWORD_CANDIDATES": {
+      (async () => {
+        await readyPromise;
+        const params = new URLSearchParams();
+        if (msg.status) params.set("status", String(msg.status));
+        if (msg.label) params.set("label", String(msg.label));
+        const qs = params.toString();
+        const data = await API.apiFetch(
+          "/api/keyword-candidates" + (qs ? "?" + qs : "")
+        );
+        sendResponse({ ok: true, candidates: (data && data.candidates) || [] });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Duyệt/loại một đề xuất. approved -> backend tự thăng cấp sang learned_keywords.
+    case "SET_CANDIDATE_STATUS": {
+      (async () => {
+        await readyPromise;
+        const data = await API.apiFetch(
+          "/api/keyword-candidates/" + encodeURIComponent(msg.id),
+          {
+            method: "PATCH",
+            body: JSON.stringify({ status: msg.status }),
+          }
+        );
+        sendResponse({ ok: true, ...(data || {}) });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Xóa hẳn một đề xuất khỏi hàng chờ.
+    case "DELETE_KEYWORD_CANDIDATE": {
+      (async () => {
+        await readyPromise;
+        await API.apiFetch(
+          "/api/keyword-candidates/" + encodeURIComponent(msg.id),
+          { method: "DELETE" }
+        );
         sendResponse({ ok: true });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
