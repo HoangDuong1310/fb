@@ -213,6 +213,17 @@ button {
   outline-offset: 2px;
 }
 
+/* Local fallback for the spinner keyframe so the reduced-motion exception below
+   always has a valid animation to reference, independent of Tailwind internals. */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Reduced motion — not optional (WCAG); crossfade/instant in place of transforms */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -222,5 +233,17 @@ button {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
+  }
+
+  /* Exception: loading spinners MUST keep turning — a frozen spinner reads as
+     "đứng đơ" (hung) and hides that work is actually running. A steady rotation
+     is a status indicator, not decorative motion, so we exempt it from the
+     iteration-count/duration clamp above while still honoring reduced motion
+     everywhere else. Slightly slower spin keeps it calm for sensitive users. */
+  .animate-spin {
+    animation-name: spin !important;
+    animation-duration: 1.2s !important;
+    animation-timing-function: linear !important;
+    animation-iteration-count: infinite !important;
   }
 }

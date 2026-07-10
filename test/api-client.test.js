@@ -124,6 +124,72 @@ test("apiFetch with skipAuthHandler on 401 does NOT clear token or call onUnauth
   );
 });
 
+test("apiFetch on 403 ACCOUNT_INACTIVE clears the token and calls onUnauthorized with reason", async () => {
+  setBaseUrl("http://localhost:3300");
+  setToken("tok-locked");
+
+  let unauthorizedCalled = false;
+  let reasonAtCallback = "unset";
+  let tokenAtCallback = "unset";
+  onUnauthorized((reason) => {
+    unauthorizedCalled = true;
+    reasonAtCallback = reason;
+    tokenAtCallback = getToken();
+  });
+
+  global.fetch = async () =>
+    jsonResponse(403, {
+      error: "account locked",
+      code: "ACCOUNT_INACTIVE",
+      status: "locked",
+    });
+
+  await assert.rejects(
+    () => apiFetch("/api/groups"),
+    (err) => {
+      assert.ok(err instanceof Error);
+      assert.match(String(err.message), /403/);
+      return true;
+    }
+  );
+
+  assert.equal(unauthorizedCalled, true, "onUnauthorized handler must run on 403 ACCOUNT_INACTIVE");
+  assert.equal(reasonAtCallback, "locked", "handler must receive the 'locked' reason");
+  assert.equal(tokenAtCallback, null, "token must be cleared before handler runs");
+  assert.equal(getToken(), null, "token must remain cleared after 403 ACCOUNT_INACTIVE");
+});
+
+test("apiFetch on a plain 403 (not ACCOUNT_INACTIVE) does NOT clear token or call onUnauthorized", async () => {
+  setBaseUrl("http://localhost:3300");
+  setToken("tok-forbidden");
+
+  let unauthorizedCalled = false;
+  onUnauthorized(() => {
+    unauthorizedCalled = true;
+  });
+
+  global.fetch = async () => jsonResponse(403, { error: "admin only" });
+
+  await assert.rejects(
+    () => apiFetch("/api/admin/users"),
+    (err) => {
+      assert.match(String(err.message), /403/);
+      return true;
+    }
+  );
+
+  assert.equal(
+    unauthorizedCalled,
+    false,
+    "onUnauthorized must NOT run for a permission-only 403"
+  );
+  assert.equal(
+    getToken(),
+    "tok-forbidden",
+    "token must NOT be cleared for a permission-only 403"
+  );
+});
+
 test("apiFetch throws on non-2xx including the status and server error body", async () => {
   setBaseUrl("http://localhost:3300");
   setToken("tok-ok");

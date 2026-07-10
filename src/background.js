@@ -180,17 +180,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    // Viết lại nội dung (spin) — SERVER-SIDE qua POST /api/ai/spin-post để key AI
+    // không rời server. LƯU Ý: spinPostContent (server) đọc payload.content, còn
+    // route nhận {text, options} rồi trải options ra -> phải nhét content vào
+    // options. UI (Compose) gửi payload {content, count}.
     case "AI_SPIN_CONTENT": {
-      spinPostContent(msg.payload || {})
-        .then((r) => sendResponse(r))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const p = msg.payload || {};
+        const content = String(p.content || "").trim();
+        const result = await API.apiFetch("/api/ai/spin-post", {
+          method: "POST",
+          body: JSON.stringify({
+            text: content,
+            options: { content, count: p.count },
+          }),
+        });
+        sendResponse(result);
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
+    // Viết mới nội dung bán hàng — SERVER-SIDE qua POST /api/ai/generate-content.
+    // UI (Compose) gửi payload {brief, tone, count}.
     case "AI_GENERATE_CONTENT": {
-      generatePostContent(msg.payload || {})
-        .then((r) => sendResponse(r))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const p = msg.payload || {};
+        const result = await API.apiFetch("/api/ai/generate-content", {
+          method: "POST",
+          body: JSON.stringify({ brief: p.brief, tone: p.tone, count: p.count }),
+        });
+        sendResponse(result);
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -233,6 +261,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       DB.deleteSetting(msg.key)
         .then(() => sendResponse({ ok: true }))
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // ---- Cấu hình AI theo tài khoản (server-side, key không rời server) ----
+    // Đọc qua GET /api/me/ai-config. Server KHÔNG trả key thô, chỉ trả hasKey +
+    // keyMasked cùng apiBase/model (và giá trị default/effective). Đây thay cho
+    // đường cũ /api/settings/aiConfig (không tồn tại trên server đã deploy).
+    case "GET_AI_CONFIG": {
+      (async () => {
+        await readyPromise;
+        const config = await API.apiFetch("/api/me/ai-config");
+        sendResponse({ ok: true, config });
+      })().catch((e) =>
+        sendResponse({ ok: false, error: String((e && e.message) || e) })
+      );
+      return true;
+    }
+
+    // Ghi qua PUT /api/me/ai-config. Server CHỈ ghi key khi truyền chuỗi khác
+    // rỗng và không chứa dấu che "•"; gửi clearKey:true để xoá key. Nhờ vậy lưu
+    // lại form mà không gõ lại key sẽ giữ nguyên key cũ trên server.
+    case "SET_AI_CONFIG": {
+      (async () => {
+        await readyPromise;
+        const p = msg.payload || {};
+        const config = await API.apiFetch("/api/me/ai-config", {
+          method: "PUT",
+          body: JSON.stringify({
+            apiBase: p.apiBase,
+            model: p.model,
+            apiKey: p.apiKey,
+            clearKey: p.clearKey === true,
+          }),
+        });
+        sendResponse({ ok: true, config });
+      })().catch((e) =>
+        sendResponse({ ok: false, error: String((e && e.message) || e) })
+      );
       return true;
     }
 
@@ -465,11 +531,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
-    // ---- Lấy danh sách model khả dụng từ endpoint ------------------------
+    // ---- Lấy danh sách model khả dụng (SERVER-SIDE proxy) ----------------
+    // GET /api/ai/models: server dùng key đã lưu để gọi endpoint /models của nhà
+    // cung cấp, key không rời server. Trả { ok, models } hoặc { ok:false, error }.
     case "LIST_MODELS": {
-      listModels()
-        .then((r) => sendResponse(r))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const result = await API.apiFetch("/api/ai/models");
+        sendResponse(result);
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -829,6 +902,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           type: "message",
           targetUrl,
           content: message,
+          images: Array.isArray(msg.images) ? msg.images : [],
           scheduledAt: Date.now(),
           meta: {
             source: "pitch",
@@ -851,6 +925,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       (async () => {
         const todayCount = await DB.countMessageJobsToday();
         sendResponse({ ok: true, todayCount, dailyCap: DB.MESSAGE_DAILY_CAP });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    /* =============== MẪU TIN CHÀO HÀNG (lưu trên server) =============== */
+
+    // Lấy danh sách mẫu tin chào hàng của tài khoản (tuỳ chọn lọc theo kind).
+    case "GET_MSG_TEMPLATES": {
+      (async () => {
+        const templates = await DB.getMessageTemplates(msg.kind);
+        sendResponse({ ok: true, templates });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Lưu (tạo mới nếu không có id, hoặc cập nhật) một mẫu tin chào hàng.
+    case "SAVE_MSG_TEMPLATE": {
+      (async () => {
+        const name = (msg.name != null ? String(msg.name) : "").trim();
+        if (!name) return sendResponse({ ok: false, error: "Tên mẫu tin không được để trống." });
+        const res = await DB.saveMessageTemplate({
+          id: msg.id,
+          name,
+          content: msg.content ?? "",
+          images: Array.isArray(msg.images) ? msg.images : [],
+          kind: msg.kind || "pitch",
+        });
+        sendResponse(res);
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Xoá một mẫu tin chào hàng theo id.
+    case "DELETE_MSG_TEMPLATE": {
+      (async () => {
+        await DB.deleteMessageTemplate(msg.id);
+        sendResponse({ ok: true });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
@@ -981,9 +1092,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Phân tích MỘT bài theo yêu cầu (nút "AI phân tích") -> soạn nháp trả lời
     // ngay, KHÔNG lưu sẵn. Người dùng xem rồi tự copy / tạo việc bình luận.
     case "ANALYZE_POST": {
-      analyzePost(msg.post || {})
-        .then((res) => sendResponse(res))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      // Phương án A: phân tích chạy SERVER-SIDE (POST /api/ai/analyze) để key AI
+      // không rời server. apiFetch NÉM lỗi khi server trả 422 (vd chưa cấu hình
+      // key) -> bắt lại, bỏ tiền tố "API 4xx:" cho gọn rồi trả {ok:false,error}.
+      (async () => {
+        await readyPromise;
+        const result = await API.apiFetch("/api/ai/analyze", {
+          method: "POST",
+          body: JSON.stringify({ post: msg.post || {} }),
+        });
+        sendResponse(result);
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -1091,11 +1213,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "SET_LEAD_LABEL": {
       (async () => {
         await readyPromise;
-        await API.apiFetch("/api/posts/" + encodeURIComponent(msg.postId), {
+        const data = await API.apiFetch("/api/posts/" + encodeURIComponent(msg.postId), {
           method: "PATCH",
           body: JSON.stringify({ leadLabel: msg.label, leadSource: "manual" }),
         });
-        sendResponse({ ok: true });
+        // Backend trả { updated: affectedRows }. Nếu 0 → không ghi được hàng nào
+        // (sai postId, không phải bài của mình, hoặc backend cũ nuốt field) ⇒
+        // báo lỗi thay vì false-success để UI không hiện "thành công" giả.
+        const updated = data && typeof data.updated === "number" ? data.updated : null;
+        if (updated === 0) {
+          sendResponse({ ok: false, error: "Không lưu được nhãn (không tìm thấy bài hoặc không có quyền)." });
+          return;
+        }
+        sendResponse({ ok: true, updated });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
@@ -1362,9 +1492,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 try {
   // Khởi tạo client xác thực web backend: nạp token + user đã lưu vào cache,
   // và đăng ký handler 401 -> xoá token và báo UI cần đăng nhập lại.
-  API.onUnauthorized(() => {
+  API.onUnauthorized((reason) => {
     setAuthUser(null);
-    broadcast("AUTH_REQUIRED");
+    // reason: "locked" | "pending" | "inactive" | "expired" — để popup hiển thị
+    // thông báo phù hợp (vd tài khoản bị admin khóa vs phiên hết hạn).
+    broadcast("AUTH_REQUIRED", { reason });
   });
   // Nạp token + user SONG SONG và giữ promise để các handler phụ thuộc token
   // (AUTH_STATE/AUTH_LOGIN) await trước khi đọc cache — tránh đua với message

@@ -377,7 +377,26 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.type) return;
 
   if (msg.type === "AUTH_REQUIRED") {
-    showLoggedOut("Phiên đăng nhập hết hạn, vui lòng đăng nhập lại.");
+    // reason được truyền từ background: "locked" | "pending" | "inactive" | "expired".
+    // Hiển thị thông báo phù hợp để user biết lý do bị đăng xuất.
+    let note;
+    switch (msg.reason) {
+      case "locked":
+        note =
+          "Tài khoản của bạn đã bị khóa. Vui lòng liên hệ quản trị viên để được hỗ trợ.";
+        break;
+      case "pending":
+        note =
+          "Tài khoản của bạn đang chờ được duyệt. Vui lòng thử lại sau khi được phê duyệt.";
+        break;
+      case "inactive":
+        note =
+          "Tài khoản của bạn hiện không hoạt động. Vui lòng liên hệ quản trị viên.";
+        break;
+      default:
+        note = "Phiên đăng nhập hết hạn, vui lòng đăng nhập lại.";
+    }
+    showLoggedOut(note);
     return;
   }
 

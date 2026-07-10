@@ -594,7 +594,7 @@ export function Feed() {
                 {/* Body */}
                 {text && (
                   <div className="px-4 pt-3">
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink">
+                    <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-sm leading-relaxed text-ink">
                       {isLong && !isExpanded
                         ? `${text.slice(0, 280)}…`
                         : text}
@@ -699,7 +699,7 @@ export function Feed() {
                             key={i}
                             className="rounded-md border border-line-soft bg-surface px-3 py-2"
                           >
-                            <p className="whitespace-pre-wrap text-xs leading-relaxed text-ink-soft">
+                            <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-xs leading-relaxed text-ink-soft">
                               {c.content || "(trống)"}
                             </p>
                             {c.commentedAt != null && (

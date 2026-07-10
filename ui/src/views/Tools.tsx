@@ -101,6 +101,20 @@ interface AutoCrawlResponse extends BgResponse {
 interface ModelsResponse extends BgResponse {
   models?: string[];
 }
+// Shape server trả về từ GET/PUT /api/me/ai-config (bọc trong { ok, config }).
+// Server KHÔNG bao giờ trả key thô — chỉ hasKey + keyMasked ("••••abcd").
+interface AiConfigResponse extends BgResponse {
+  config?: {
+    apiBase?: string;
+    apiBaseDefault?: string;
+    apiBaseEffective?: string;
+    model?: string;
+    modelDefault?: string;
+    modelEffective?: string;
+    hasKey?: boolean;
+    keyMasked?: string;
+  };
+}
 
 const TABS: { id: TabId; label: string; icon: typeof ListChecks }[] = [
   { id: "queue", label: "Hàng đợi", icon: ListChecks },
@@ -1122,6 +1136,11 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
   });
   const [models, setModels] = useState<string[]>(FALLBACK_MODELS);
   const [customModel, setCustomModel] = useState("");
+  // Trạng thái key trên SERVER: server không trả key thô nên UI chỉ biết ĐÃ có
+  // key hay chưa (hasKey) và bản che (keyMasked, vd "••••abcd") để hiện gợi ý.
+  // Ô nhập key luôn để TRỐNG lúc tải; người dùng chỉ gõ khi muốn đổi key.
+  const [hasKey, setHasKey] = useState(false);
+  const [keyMasked, setKeyMasked] = useState("");
   const [settings, setSettings] = useState<CrawlSettings>(CRAWL_DEFAULTS);
   const [stats, setStats] = useState<Stats>({});
   const [loading, setLoading] = useState(true);
@@ -1132,16 +1151,23 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
 
   async function load() {
     setLoading(true);
-    const [store, sres] = await Promise.all([
-      storageGet(["aiConfig", "aiModelList", "crawlSettings"]),
+    // aiConfig sống trên SERVER theo tài khoản (GET /api/me/ai-config). Đây cũng
+    // là nơi service worker dùng key để phân tích/soạn nội dung, nên key KHÔNG
+    // rời server. Server chỉ trả apiBase/model + hasKey/keyMasked, KHÔNG trả key
+    // thô. aiModelList/crawlSettings chỉ dùng nội bộ tab này nên vẫn ở local.
+    const [store, sres, aiRes] = await Promise.all([
+      storageGet(["aiModelList", "crawlSettings"]),
       bg<StatsResponse>("GET_STATS"),
+      bg<AiConfigResponse>("GET_AI_CONFIG"),
     ]);
-    const cfg = (store.aiConfig as Partial<AiConfig>) || {};
+    const cfg = (aiRes.ok && aiRes.config) || {};
     setAi({
       apiBase: cfg.apiBase || "",
-      apiKey: cfg.apiKey || "",
+      apiKey: "", // luôn trống — server không trả key thô
       model: cfg.model || "gpt-5.5",
     });
+    setHasKey(!!cfg.hasKey);
+    setKeyMasked(cfg.keyMasked || "");
     const cached = store.aiModelList;
     if (Array.isArray(cached) && cached.length) setModels(cached as string[]);
     const saved = store.crawlSettings as Partial<CrawlSettings> | undefined;
@@ -1158,13 +1184,34 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
   async function saveAi() {
     setSavingAi(true);
     const model = customModel.trim() || ai.model || "gpt-5.5";
-    const cfg: AiConfig = {
+    const typedKey = ai.apiKey.trim();
+    // Lưu lên SERVER qua PUT /api/me/ai-config (SET_AI_CONFIG). Chỉ gửi apiKey
+    // khi người dùng THỰC SỰ gõ key mới; để trống -> server giữ nguyên key cũ
+    // (nhờ vậy lưu lại form mà không gõ lại key không làm mất key). Key không
+    // rời server, service worker dùng chính key này khi phân tích/soạn nội dung.
+    const payload: {
+      apiBase: string;
+      model: string;
+      apiKey?: string;
+    } = {
       apiBase: ai.apiBase.trim() || "https://danglamgiau.com/v1",
-      apiKey: ai.apiKey.trim(),
       model,
     };
-    await storageSet({ aiConfig: cfg });
-    setAi(cfg);
+    if (typedKey) payload.apiKey = typedKey;
+    const res = await bg<AiConfigResponse>("SET_AI_CONFIG", { payload });
+    if (!res.ok) {
+      setSavingAi(false);
+      flash("err", res.error || "Không lưu được cấu hình AI.");
+      return;
+    }
+    const cfg = res.config || {};
+    setAi({
+      apiBase: cfg.apiBase || payload.apiBase,
+      apiKey: "", // luôn xoá ô key sau khi lưu — không giữ key thô ở UI
+      model: cfg.model || model,
+    });
+    setHasKey(!!cfg.hasKey);
+    setKeyMasked(cfg.keyMasked || "");
     if (customModel.trim() && !models.includes(model)) {
       setModels((m) => [model, ...m]);
     }
@@ -1243,14 +1290,25 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
           <span className="flex items-center gap-1.5">
             <KeyRound className="size-3.5" />
             API Key
+            {hasKey && (
+              <span className="ml-auto inline-flex items-center gap-1 text-[11px] font-normal text-green">
+                <CheckCircle2 className="size-3" />
+                Đã lưu key
+              </span>
+            )}
           </span>
           <input
             type="password"
             value={ai.apiKey}
             onChange={(e) => setAi((a) => ({ ...a, apiKey: e.target.value }))}
-            placeholder="sk-…"
+            placeholder={hasKey ? keyMasked || "••••••••" : "sk-…"}
             className="rounded-sm border border-line bg-surface-2 px-2.5 py-1.5 text-sm font-normal text-ink outline-none placeholder:text-ink-faint focus:border-accent/60"
           />
+          {hasKey && (
+            <span className="text-[11px] font-normal text-ink-faint">
+              Đã có key trên máy chủ. Để trống nếu giữ nguyên, hoặc nhập key mới để thay.
+            </span>
+          )}
         </label>
 
         <div className="flex flex-col gap-1 text-xs font-medium text-ink-soft">

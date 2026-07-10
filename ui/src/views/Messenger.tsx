@@ -14,11 +14,22 @@ import {
   Megaphone,
   ScanLine,
   Trash2,
+  Plus,
+  Pencil,
+  FileText,
+  ImagePlus,
 } from "lucide-react";
 import { bg, type BgResponse } from "@/lib/bg";
 import { colorFor, initials } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
 import { useIncremental } from "@/lib/useIncremental";
+import {
+  classifyLead,
+  LEAD_META,
+  matchLeadMode,
+  type LeadLabel,
+  type LeadMode,
+} from "@/lib/leadfilter";
 
 /* -------------------------------------------------------------------------
    Messenger view — two surfaces behind a tab switch:
@@ -200,22 +211,55 @@ export function Messenger() {
 }
 
 /* ========================================================================
-   PITCH PANE — cold outreach to crawled-post prospects (unchanged flow).
+   PITCH PANE — cold outreach to crawled-post LEADS using reusable, server-
+   stored message templates.
+
+   Data source (đổi từ GET_ADVISORIES sang GET_ALL_POSTS): lấy toàn bộ bài đã
+   crawl, phân loại lead ngay trên máy (classifyLead) rồi lọc còn những bài
+   VỪA là lead (mặc định "cần mua" + "cần hỗ trợ") VỪA có link trang cá nhân
+   (authorProfile) — vì phải có profile mới nhắn tin được.
+
+   Mẫu tin (message templates) lưu HOÀN TOÀN TRÊN SERVER qua:
+     GET_MSG_TEMPLATES / SAVE_MSG_TEMPLATE / DELETE_MSG_TEMPLATE
+   Chọn mẫu → thay {{ten}} bằng tên Facebook của khách (vẫn sửa được) → gửi.
+   Nút "AI gợi ý" (GEN_PITCH) và pipeline duyệt-gửi (APPROVE_PITCH) giữ nguyên.
    ======================================================================== */
 
-interface Advisory {
+interface Prospect {
   postId: string;
   authorName?: string;
   authorProfile?: string;
   groupId?: string;
   groupName?: string;
   postText?: string;
-  intent?: string;
-  reply?: string;
   permalink?: string;
+  leadLabel: LeadLabel;
 }
-interface AdvisoriesResponse extends BgResponse {
-  advisories?: Advisory[];
+interface Template {
+  id: number | string;
+  name: string;
+  content: string;
+  images?: string[];
+  kind?: string;
+}
+interface TemplatesResponse extends BgResponse {
+  templates?: Template[];
+}
+interface SaveTemplateResponse extends BgResponse {
+  id?: number | string;
+}
+interface PostRow {
+  postId: string;
+  text?: string;
+  authorName?: string;
+  authorProfile?: string;
+  groupId?: string;
+  groupName?: string;
+  permalink?: string;
+  leadLabel?: string;
+}
+interface AllPostsResponse extends BgResponse {
+  posts?: PostRow[];
 }
 interface QuotaResponse extends BgResponse {
   todayCount?: number;
@@ -228,10 +272,40 @@ interface ApprovePitchResponse extends BgResponse {
   jobId?: string | number;
 }
 
+// Thay {{ten}} (không phân biệt hoa thường, cho phép khoảng trắng) bằng tên khách.
+function fillTemplate(content: string, name: string): string {
+  const who = (name || "bạn").trim() || "bạn";
+  return String(content ?? "").replace(/\{\{\s*ten\s*\}\}/gi, who);
+}
+
+// Chuyển FileList -> mảng data URL để đính kèm ảnh (giống Compose).
+function readFiles(fileList: FileList): Promise<string[]> {
+  return Promise.all(
+    [...fileList].map(
+      (f) =>
+        new Promise<string | null>((resolve) => {
+          const fr = new FileReader();
+          fr.onload = () =>
+            resolve(typeof fr.result === "string" ? fr.result : null);
+          fr.onerror = () => resolve(null);
+          fr.readAsDataURL(f);
+        }),
+    ),
+  ).then((arr) => arr.filter((x): x is string => !!x));
+}
+
+const PITCH_LEAD_FILTERS: { id: LeadMode; label: string }[] = [
+  { id: "lead", label: "Khách tiềm năng" },
+  { id: "buy", label: "Cần mua" },
+  { id: "support", label: "Cần hỗ trợ" },
+  { id: "all", label: "Tất cả" },
+];
+
 function PitchPane() {
-  const [items, setItems] = useState<Advisory[]>([]);
+  const [items, setItems] = useState<Prospect[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [leadMode, setLeadMode] = useState<LeadMode>("lead");
   const [todayCount, setTodayCount] = useState(0);
   const [dailyCap, setDailyCap] = useState(15);
   const [loading, setLoading] = useState(true);
@@ -239,6 +313,19 @@ function PitchPane() {
   const [genLoading, setGenLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [confirming, setConfirming] = useState(false);
+
+  // Mẫu tin (server-backed).
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [tplLoading, setTplLoading] = useState(false);
+  const [pickedTplId, setPickedTplId] = useState<string>("");
+  const [editor, setEditor] = useState<Template | null>(null);
+  const [tplSaving, setTplSaving] = useState(false);
+
+  // Ảnh đính kèm cho tin sắp gửi (theo từng prospect) + input file ẩn.
+  const [imageDrafts, setImageDrafts] = useState<Record<string, string[]>>({});
+  const composeFileInput = useRef<HTMLInputElement>(null);
+  const editorFileInput = useRef<HTMLInputElement>(null);
+
   const { toast, flash } = useToast();
 
   const remaining = Math.max(0, dailyCap - todayCount);
@@ -249,6 +336,7 @@ function PitchPane() {
     [items, selectedId],
   );
   const composeText = selectedId ? (drafts[selectedId] ?? "") : "";
+  const composeImages = selectedId ? (imageDrafts[selectedId] ?? []) : [];
 
   const {
     visible: windowed,
@@ -257,23 +345,36 @@ function PitchPane() {
     loadMore,
     shown,
     total,
-  } = useIncremental<Advisory, HTMLLIElement>(items, { pageSize: 20 });
+  } = useIncremental<Prospect, HTMLLIElement>(items, { pageSize: 20 });
 
   async function load() {
     setLoading(true);
     setLoadError(null);
-    const res = await bg<AdvisoriesResponse>("GET_ADVISORIES", {
-      status: "pending",
-    });
+    const res = await bg<AllPostsResponse>("GET_ALL_POSTS", { groupId: "" });
     if (!res.ok) {
-      setLoadError(res.error || "Không tải được danh sách khách.");
+      setLoadError(res.error || "Không tải được danh sách bài viết.");
       setLoading(false);
       return;
     }
-    const all = res.advisories ?? [];
-    const list = all.filter(
-      (a) => a.authorProfile && String(a.authorProfile).trim() !== "",
-    );
+    const list: Prospect[] = (res.posts ?? [])
+      .filter((p) => p.authorProfile && String(p.authorProfile).trim() !== "")
+      .map((p) => {
+        const label =
+          p.leadLabel && p.leadLabel in LEAD_META
+            ? (p.leadLabel as LeadLabel)
+            : classifyLead(p.text || "").label;
+        return {
+          postId: p.postId,
+          authorName: p.authorName,
+          authorProfile: p.authorProfile,
+          groupId: p.groupId,
+          groupName: p.groupName,
+          postText: p.text,
+          permalink: p.permalink,
+          leadLabel: label,
+        };
+      })
+      .filter((p) => matchLeadMode(p.leadLabel, leadMode));
     setItems(list);
     setSelectedId((prev) =>
       prev && list.some((a) => a.postId === prev)
@@ -289,18 +390,83 @@ function PitchPane() {
     setLoading(false);
   }
 
+  async function loadTemplates() {
+    setTplLoading(true);
+    const res = await bg<TemplatesResponse>("GET_MSG_TEMPLATES", {});
+    setTplLoading(false);
+    if (res.ok) setTemplates(res.templates ?? []);
+    else flash("err", res.error || "Không tải được mẫu tin.", 5000);
+  }
+
   useEffect(() => {
     load();
+    loadTemplates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Lọc lại khi đổi bộ lọc lead (chỉ chạy sau lần load đầu).
+  const didMount = useRef(false);
+  useEffect(() => {
+    if (!didMount.current) {
+      didMount.current = true;
+      return;
+    }
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leadMode]);
 
   function setCompose(text: string) {
     if (!selectedId) return;
     setDrafts((d) => ({ ...d, [selectedId]: text }));
   }
 
+  // Ảnh cho tin sắp gửi (theo prospect đang chọn).
+  async function onPickComposeImages(list: FileList | null) {
+    if (!list || !list.length || !selectedId) return;
+    const urls = await readFiles(list);
+    const key = selectedId;
+    setImageDrafts((d) => ({ ...d, [key]: [...(d[key] ?? []), ...urls] }));
+    setConfirming(false);
+  }
+  function removeComposeImage(idx: number) {
+    if (!selectedId) return;
+    const key = selectedId;
+    setImageDrafts((d) => ({
+      ...d,
+      [key]: (d[key] ?? []).filter((_, i) => i !== idx),
+    }));
+  }
+  // Ảnh cho mẫu tin đang soạn trong editor.
+  async function onPickEditorImages(list: FileList | null) {
+    if (!list || !list.length) return;
+    const urls = await readFiles(list);
+    setEditor((ed) =>
+      ed ? { ...ed, images: [...(ed.images ?? []), ...urls] } : ed,
+    );
+  }
+  function removeEditorImage(idx: number) {
+    setEditor((ed) =>
+      ed ? { ...ed, images: (ed.images ?? []).filter((_, i) => i !== idx) } : ed,
+    );
+  }
+
   function pickProspect(id: string) {
     setSelectedId(id);
+    setConfirming(false);
+  }
+
+  // Áp mẫu tin đang chọn vào ô soạn, thay {{ten}} bằng tên khách.
+  function applyPickedTemplate(tplId: string) {
+    setPickedTplId(tplId);
+    if (!tplId || !selected) return;
+    const tpl = templates.find((t) => String(t.id) === tplId);
+    if (!tpl) return;
+    setCompose(fillTemplate(tpl.content || "", selected.authorName || ""));
+    // Mẫu có ảnh đính kèm sẵn -> nạp luôn vào tin sắp gửi.
+    if (selectedId) {
+      const imgs = Array.isArray(tpl.images) ? tpl.images : [];
+      setImageDrafts((d) => ({ ...d, [selectedId]: imgs }));
+    }
     setConfirming(false);
   }
 
@@ -325,12 +491,13 @@ function PitchPane() {
     if (!selected) return;
     const message = composeText.trim();
     if (!message) {
-      flash("err", "Nội dung trống. Hãy tự viết hoặc để AI gợi ý.");
+      flash("err", "Nội dung trống. Hãy chọn mẫu, tự viết hoặc để AI gợi ý.");
       return;
     }
     setSending(true);
     const res = await bg<ApprovePitchResponse>("APPROVE_PITCH", {
       message,
+      images: composeImages,
       authorProfile: selected.authorProfile || "",
       authorName: selected.authorName || "",
       postId: selected.postId || "",
@@ -347,9 +514,59 @@ function PitchPane() {
         delete next[selected.postId];
         return next;
       });
+      setImageDrafts((d) => {
+        const next = { ...d };
+        delete next[selected.postId];
+        return next;
+      });
       await load();
     } else {
       flash("err", res.error || "Không tạo được lịch gửi.", 5000);
+    }
+  }
+
+  // ── Mẫu tin: tạo / sửa / xoá (lưu trên server) ──
+  function newTemplate() {
+    setEditor({ id: "", name: "", content: "", images: [], kind: "pitch" });
+  }
+  function editTemplate(tpl: Template) {
+    setEditor({ ...tpl });
+  }
+  async function saveTemplate() {
+    if (!editor) return;
+    const name = (editor.name || "").trim();
+    if (!name) {
+      flash("err", "Đặt tên cho mẫu tin trước đã.");
+      return;
+    }
+    setTplSaving(true);
+    const res = await bg<SaveTemplateResponse>("SAVE_MSG_TEMPLATE", {
+      id: editor.id || undefined,
+      name,
+      content: editor.content ?? "",
+      images: editor.images ?? [],
+      kind: editor.kind || "pitch",
+    });
+    setTplSaving(false);
+    if (res.ok) {
+      flash("ok", "Đã lưu mẫu tin.");
+      setEditor(null);
+      await loadTemplates();
+    } else {
+      flash("err", res.error || "Không lưu được mẫu tin.", 5000);
+    }
+  }
+  async function deleteTemplate(id: number | string) {
+    setTplSaving(true);
+    const res = await bg("DELETE_MSG_TEMPLATE", { id });
+    setTplSaving(false);
+    if (res.ok) {
+      flash("ok", "Đã xoá mẫu tin.");
+      if (String(pickedTplId) === String(id)) setPickedTplId("");
+      if (editor && String(editor.id) === String(id)) setEditor(null);
+      await loadTemplates();
+    } else {
+      flash("err", res.error || "Không xoá được mẫu tin.", 5000);
     }
   }
 
@@ -374,6 +591,24 @@ function PitchPane() {
             </span>
           </div>
 
+          <div className="flex flex-wrap gap-1 border-b border-line-soft px-2.5 py-2">
+            {PITCH_LEAD_FILTERS.map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => setLeadMode(f.id)}
+                className={cn(
+                  "rounded-sm px-2 py-1 text-xs font-medium transition-colors",
+                  leadMode === f.id
+                    ? "bg-accent text-on-accent"
+                    : "bg-surface-2 text-ink-faint hover:text-ink",
+                )}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+
           <div className="min-h-0 flex-1 overflow-y-auto">
             {loading ? (
               <ListSkeleton />
@@ -396,8 +631,8 @@ function PitchPane() {
                   Chưa có khách nào để nhắn tin
                 </p>
                 <p className="text-xs leading-snug text-ink-faint">
-                  Cần advisory ở trạng thái chờ duyệt và có link trang cá nhân.
-                  Hãy tạo nháp tư vấn trước.
+                  Cần bài viết đã crawl là lead và có link trang cá nhân. Hãy
+                  quét thêm nhóm ở tab Công cụ, hoặc đổi bộ lọc phía trên.
                 </p>
               </div>
             ) : (
@@ -406,6 +641,7 @@ function PitchPane() {
                   const active = a.postId === selectedId;
                   const name = a.authorName || "Ẩn danh";
                   const hasDraft = !!(drafts[a.postId] ?? "").trim();
+                  const meta = LEAD_META[a.leadLabel];
                   return (
                     <li key={a.postId}>
                       <button
@@ -429,8 +665,25 @@ function PitchPane() {
                               />
                             )}
                           </span>
-                          <span className="mt-0.5 block truncate text-xs text-ink-faint">
-                            {a.groupName || a.groupId || "—"}
+                          <span className="mt-0.5 flex items-center gap-1.5">
+                            <span
+                              className={cn(
+                                "shrink-0 rounded-sm px-1.5 py-px text-[10px] font-medium",
+                                meta.tone === "green" &&
+                                  "bg-green-soft/25 text-green",
+                                meta.tone === "accent" &&
+                                  "bg-accent-soft/25 text-accent-ink",
+                                meta.tone === "amber" &&
+                                  "bg-amber-soft/25 text-amber",
+                                meta.tone === "muted" &&
+                                  "bg-surface-2 text-ink-faint",
+                              )}
+                            >
+                              {meta.text}
+                            </span>
+                            <span className="truncate text-xs text-ink-faint">
+                              {a.groupName || a.groupId || "—"}
+                            </span>
                           </span>
                         </span>
                       </button>
@@ -464,8 +717,9 @@ function PitchPane() {
                   Chọn một khách để soạn tin
                 </p>
                 <p className="mt-1 text-xs leading-snug text-ink-faint">
-                  Bạn tự viết nội dung, hoặc để AI gợi ý rồi chỉnh lại. Duyệt
-                  xong tiện ích sẽ tự gửi inbox qua Messenger.
+                  Chọn mẫu tin có sẵn (tên khách tự điền), tự viết, hoặc để AI
+                  gợi ý rồi chỉnh lại. Duyệt xong tiện ích sẽ tự gửi inbox qua
+                  Messenger.
                 </p>
               </div>
             </div>
@@ -478,7 +732,7 @@ function PitchPane() {
                     <span className="truncate text-sm font-semibold text-ink">
                       {selected.authorName || "Ẩn danh"}
                     </span>
-                    <IntentBadge intent={selected.intent} />
+                    <IntentBadge intent={selected.leadLabel} />
                   </div>
                   <div className="mt-0.5 truncate text-xs text-ink-faint">
                     {selected.groupName || selected.groupId || "—"}
@@ -521,16 +775,178 @@ function PitchPane() {
                     </p>
                   </div>
                 )}
-                {selected.reply && (
-                  <div className="rounded-md border border-line-soft bg-bg/40 px-3.5 py-3">
-                    <div className="mb-1.5 text-xs font-medium uppercase tracking-wide text-ink-faint">
-                      Nháp tư vấn (bình luận)
-                    </div>
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink-soft">
-                      {selected.reply}
-                    </p>
+
+                {/* ── Quản lý mẫu tin (lưu trên server) ── */}
+                <div className="rounded-md border border-line-soft bg-bg/40 px-3.5 py-3">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-ink-faint">
+                      <FileText className="size-3.5" />
+                      Mẫu tin tái sử dụng
+                    </span>
+                    <button
+                      type="button"
+                      onClick={newTemplate}
+                      className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface-2 px-2 py-1 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink"
+                    >
+                      <Plus className="size-3.5" />
+                      Mẫu mới
+                    </button>
                   </div>
-                )}
+
+                  {editor ? (
+                    <div className="space-y-2 rounded-md border border-line bg-surface px-3 py-2.5">
+                      <input
+                        type="text"
+                        value={editor.name}
+                        onChange={(e) =>
+                          setEditor((ed) =>
+                            ed ? { ...ed, name: e.target.value } : ed,
+                          )
+                        }
+                        placeholder="Tên mẫu (VD: Chào hàng sản phẩm)"
+                        className="w-full rounded-sm border border-line bg-bg px-2.5 py-1.5 text-sm text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
+                      />
+                      <textarea
+                        value={editor.content}
+                        onChange={(e) =>
+                          setEditor((ed) =>
+                            ed ? { ...ed, content: e.target.value } : ed,
+                          )
+                        }
+                        rows={3}
+                        placeholder="Nội dung. Dùng {{ten}} để tự điền tên khách khi gửi."
+                        className="w-full resize-none rounded-sm border border-line bg-bg px-2.5 py-1.5 text-sm leading-relaxed text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
+                      />
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-medium text-ink-soft">
+                            Ảnh mẫu{" "}
+                            {(editor.images?.length ?? 0) > 0 &&
+                              `(${editor.images!.length})`}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => editorFileInput.current?.click()}
+                            className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink"
+                          >
+                            <ImagePlus className="size-3" />
+                            Thêm ảnh
+                          </button>
+                          <input
+                            ref={editorFileInput}
+                            type="file"
+                            accept="image/*"
+                            multiple
+                            hidden
+                            onChange={(e) => onPickEditorImages(e.target.files)}
+                          />
+                        </div>
+                        {(editor.images?.length ?? 0) > 0 && (
+                          <div className="flex flex-wrap gap-1.5">
+                            {editor.images!.map((src, i) => (
+                              <div
+                                key={i}
+                                className="group relative size-14 overflow-hidden rounded-sm border border-line"
+                              >
+                                <img
+                                  src={src}
+                                  alt=""
+                                  className="size-full object-cover"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeEditorImage(i)}
+                                  title="Bỏ ảnh"
+                                  className="absolute right-0.5 top-0.5 grid size-4 place-items-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                                >
+                                  <X className="size-2.5" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] text-ink-faint">
+                          Chèn <code className="text-accent-ink">{"{{ten}}"}</code>{" "}
+                          để tự điền tên khách.
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setEditor(null)}
+                            disabled={tplSaving}
+                            className="inline-flex items-center gap-1 rounded-sm px-2 py-1 text-xs font-medium text-ink-faint transition-colors hover:text-ink"
+                          >
+                            <X className="size-3.5" />
+                            Hủy
+                          </button>
+                          <button
+                            type="button"
+                            onClick={saveTemplate}
+                            disabled={tplSaving}
+                            className="inline-flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-xs font-semibold text-on-accent transition-colors hover:bg-accent-bright disabled:opacity-60"
+                          >
+                            {tplSaving ? (
+                              <Loader2 className="size-3.5 animate-spin" />
+                            ) : (
+                              <CheckCircle2 className="size-3.5" />
+                            )}
+                            Lưu mẫu
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={pickedTplId}
+                        onChange={(e) => applyPickedTemplate(e.target.value)}
+                        disabled={tplLoading}
+                        className="min-w-0 flex-1 rounded-sm border border-line bg-bg px-2.5 py-1.5 text-sm text-ink focus:border-accent/60 focus-visible:outline-none"
+                      >
+                        <option value="">
+                          {tplLoading
+                            ? "Đang tải mẫu…"
+                            : templates.length === 0
+                              ? "Chưa có mẫu — bấm “Mẫu mới”"
+                              : "— Chọn mẫu để điền vào ô soạn —"}
+                        </option>
+                        {templates.map((t) => (
+                          <option key={t.id} value={String(t.id)}>
+                            {t.name}
+                          </option>
+                        ))}
+                      </select>
+                      {pickedTplId && (
+                        <>
+                          <button
+                            type="button"
+                            title="Sửa mẫu"
+                            onClick={() => {
+                              const t = templates.find(
+                                (x) => String(x.id) === pickedTplId,
+                              );
+                              if (t) editTemplate(t);
+                            }}
+                            className="inline-flex size-7 shrink-0 items-center justify-center rounded-sm border border-line bg-surface-2 text-ink-faint transition-colors hover:border-accent/50 hover:text-ink"
+                          >
+                            <Pencil className="size-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            title="Xoá mẫu"
+                            onClick={() => deleteTemplate(pickedTplId)}
+                            disabled={tplSaving}
+                            className="inline-flex size-7 shrink-0 items-center justify-center rounded-sm border border-line bg-surface-2 text-ink-faint transition-colors hover:border-red/50 hover:text-red disabled:opacity-60"
+                          >
+                            <Trash2 className="size-3.5" />
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="border-t border-line-soft bg-surface px-4 py-3">
@@ -560,9 +976,58 @@ function PitchPane() {
                     setConfirming(false);
                   }}
                   rows={4}
-                  placeholder="Tự viết tin nhắn chào hàng, hoặc bấm “AI gợi ý” rồi chỉnh lại…"
+                  placeholder="Chọn mẫu tin phía trên, tự viết, hoặc bấm “AI gợi ý” rồi chỉnh lại…"
                   className="w-full resize-none rounded-md border border-line bg-bg px-3 py-2.5 text-sm leading-relaxed text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
                 />
+
+                <div className="mt-2 flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-medium text-ink-soft">
+                      Ảnh đính kèm{" "}
+                      {composeImages.length > 0 && `(${composeImages.length})`}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => composeFileInput.current?.click()}
+                      className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink"
+                    >
+                      <ImagePlus className="size-3" />
+                      Thêm ảnh
+                    </button>
+                    <input
+                      ref={composeFileInput}
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      hidden
+                      onChange={(e) => onPickComposeImages(e.target.files)}
+                    />
+                  </div>
+                  {composeImages.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {composeImages.map((src, i) => (
+                        <div
+                          key={i}
+                          className="group relative size-14 overflow-hidden rounded-sm border border-line"
+                        >
+                          <img
+                            src={src}
+                            alt=""
+                            className="size-full object-cover"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeComposeImage(i)}
+                            title="Bỏ ảnh"
+                            className="absolute right-0.5 top-0.5 grid size-4 place-items-center rounded-full bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                          >
+                            <X className="size-2.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
 
                 {confirming ? (
                   <div className="mt-2.5 flex items-center justify-between gap-3 rounded-md border border-amber-soft bg-amber-soft/20 px-3 py-2">
@@ -607,7 +1072,11 @@ function PitchPane() {
                     <button
                       type="button"
                       onClick={() => setConfirming(true)}
-                      disabled={sending || capReached || !composeText.trim()}
+                      disabled={
+                        sending ||
+                        capReached ||
+                        (!composeText.trim() && composeImages.length === 0)
+                      }
                       title={
                         capReached ? "Đã đạt trần tin nhắn hôm nay" : undefined
                       }
@@ -690,6 +1159,12 @@ function InboxPane() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [readingId, setReadingId] = useState<string | null>(null);
+  // Hàng đợi đọc hội thoại: mở & đọc Messenger PHẢI làm lần lượt từng cái một.
+  // Nếu mở nhiều tab cùng lúc (user bấm 3-4 hội thoại liền tay), Facebook chỉ
+  // kịp render + giải mã 1 luồng, các luồng còn lại đọc hụt (rỗng). Vì vậy ta
+  // xếp hàng và đọc tuần tự, đồng thời báo cho user còn bao nhiêu cái đang chờ.
+  const [readQueue, setReadQueue] = useState<string[]>([]);
+  const readingRef = useRef(false);
   // Dòng tiến độ realtime (do service worker broadcast INBOX_PROGRESS đẩy về):
   // giúp người dùng biết thao tác đang THỰC SỰ chạy thay vì chỉ thấy icon xoay
   // (mà khi tab bị nền, animation CSS có thể bị trình duyệt tạm dừng → "đứng đơ").
@@ -828,32 +1303,77 @@ function InboxPane() {
     }
   }
 
+  // Xếp một hội thoại vào hàng đợi đọc (nếu chưa có sẵn / chưa đang chờ).
+  // Bộ chạy hàng đợi (useEffect bên dưới) sẽ đọc TỪNG cái một để tránh mở
+  // nhiều tab Messenger cùng lúc — nguyên nhân khiến chỉ 1 luồng lấy được tin.
+  function enqueueRead(id: string) {
+    // Đã đang đọc chính nó hoặc đã nằm trong hàng đợi → bỏ qua (không nhân đôi).
+    if (readingId === id || readQueue.includes(id)) return;
+    // Nếu đang bận đọc/đã có cái xếp hàng → báo cho user là sẽ đọc lần lượt.
+    if (readingId !== null || readQueue.length > 0) {
+      flash(
+        "info",
+        `Đang đọc lần lượt từng hội thoại. Đã xếp thêm vào hàng đợi (còn ${readQueue.length + 1} cái chờ).`,
+      );
+    }
+    setReadQueue((q) => (q.includes(id) ? q : [...q, id]));
+  }
+
   async function pickThread(id: string) {
     setSelectedId(id);
     setConfirming(false);
     setConfirmDeleteId(null);
     const th = threads.find((t) => t.threadId === id);
-    // Deep-read on open if we haven't pulled messages yet.
+    // Deep-read on open if we haven't pulled messages yet — qua hàng đợi.
+    // enqueueRead sẽ tự báo cho user nếu đang bận (đọc lần lượt từng cái).
     if (th && (!th.messages || th.messages.length === 0) && !th.scannedAt) {
-      await openThread(id);
+      enqueueRead(id);
     }
   }
 
-  async function openThread(id: string) {
+  // Nút "Đọc lại" (kể cả hội thoại đã có tin) — cũng đi qua hàng đợi.
+  function openThread(id: string) {
+    enqueueRead(id);
+  }
+
+  // Đọc thực sự 1 hội thoại (gọi service worker mở tab nền, đọc DOM, đóng tab).
+  async function readOne(id: string) {
     setReadingId(id);
-    const res = await bg<OpenThreadResponse>("OPEN_INBOX_THREAD", {
-      threadId: id,
-    });
-    setReadingId(null);
-    if (res.ok && res.thread) {
-      const t = res.thread;
-      setThreads((list) =>
-        list.map((x) => (x.threadId === id ? { ...x, ...t } : x)),
-      );
-    } else {
-      flash("err", res.error || "Không đọc được hội thoại.", 5000);
+    try {
+      const res = await bg<OpenThreadResponse>("OPEN_INBOX_THREAD", {
+        threadId: id,
+      });
+      if (res.ok && res.thread) {
+        const t = res.thread;
+        setThreads((list) =>
+          list.map((x) => (x.threadId === id ? { ...x, ...t } : x)),
+        );
+      } else {
+        flash("err", res.error || "Không đọc được hội thoại.", 5000);
+      }
+    } finally {
+      setReadingId(null);
     }
   }
+
+  // Bộ chạy hàng đợi: mỗi lần chỉ đọc 1 hội thoại. Khi xong 1 cái, lấy cái kế
+  // tiếp trong hàng đợi. readingRef chặn chạy chồng (StrictMode gọi effect 2 lần).
+  useEffect(() => {
+    if (readingRef.current) return;
+    if (readingId) return;
+    if (readQueue.length === 0) return;
+    const next = readQueue[0];
+    readingRef.current = true;
+    (async () => {
+      try {
+        await readOne(next);
+      } finally {
+        setReadQueue((q) => q.filter((x) => x !== next));
+        readingRef.current = false;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [readQueue, readingId]);
 
   function setCompose(text: string) {
     if (!selectedId) return;
@@ -998,6 +1518,21 @@ function InboxPane() {
         </div>
       )}
 
+      {/* Báo cho user biết đang đọc lần lượt & còn bao nhiêu hội thoại đang chờ.
+          Đây là câu trả lời cho việc bấm nhiều hội thoại 1 lúc: không mở nhiều
+          tab song song (chỉ 1 luồng đọc được), mà xếp hàng đọc từng cái. */}
+      {(readingId !== null || readQueue.length > 0) && (
+        <div className="flex items-center gap-2 rounded-md border border-accent/30 bg-accent-soft/20 px-4 py-2 text-xs font-medium text-accent-ink">
+          <Loader2 className="size-3.5 shrink-0 animate-spin text-accent" />
+          <span className="truncate">
+            {readingId !== null ? "Đang đọc 1 hội thoại…" : "Chuẩn bị đọc…"}
+            {readQueue.length > 0 && (
+              <> · Còn {readQueue.length} hội thoại đang chờ trong hàng đợi</>
+            )}
+          </span>
+        </div>
+      )}
+
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(280px,340px)_1fr] gap-3">
         {/* ── Left: thread list ── */}
         <aside className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-surface">
@@ -1040,6 +1575,8 @@ function InboxPane() {
                   const active = t.threadId === selectedId;
                   const name = t.name || "Hội thoại";
                   const hasDraft = !!(drafts[t.threadId] ?? "").trim();
+                  const isReading = readingId === t.threadId;
+                  const isQueued = readQueue.includes(t.threadId);
                   const last =
                     (t.messages && t.messages[t.messages.length - 1]) || null;
                   const previewText = last
@@ -1072,10 +1609,24 @@ function InboxPane() {
                                 title="Chưa đọc"
                               />
                             )}
-                            {hasDraft && (
-                              <span className="ml-auto rounded-sm bg-accent-soft/40 px-1.5 py-0.5 text-[10px] font-medium text-accent-ink">
-                                nháp
+                            {isReading ? (
+                              <span className="ml-auto inline-flex items-center gap-1 rounded-sm bg-accent-soft/40 px-1.5 py-0.5 text-[10px] font-medium text-accent-ink">
+                                <Loader2 className="size-2.5 animate-spin" />
+                                đang đọc
                               </span>
+                            ) : isQueued ? (
+                              <span
+                                className="ml-auto rounded-sm bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-ink-faint"
+                                title="Đang chờ tới lượt đọc"
+                              >
+                                chờ đọc
+                              </span>
+                            ) : (
+                              hasDraft && (
+                                <span className="ml-auto rounded-sm bg-accent-soft/40 px-1.5 py-0.5 text-[10px] font-medium text-accent-ink">
+                                  nháp
+                                </span>
+                              )
                             )}
                           </span>
                           <span className="mt-0.5 block truncate text-xs text-ink-faint">

@@ -110,8 +110,8 @@ Mở trong tab mới, sidebar gom theo nhóm việc:
 | [`src/remote-commands.js`](src/remote-commands.js) | Poll + WebSocket, thực thi lệnh điều khiển từ web, khử trùng. |
 | [`src/db.js`](src/db.js) | Lớp truy cập dữ liệu qua API backend + job store cục bộ. |
 | [`src/popup.html`](src/popup.html) / [`src/popup.js`](src/popup.js) | Popup: đăng nhập, crawl nhanh, xuất dữ liệu, mở dashboard. |
-| [`src/dashboard.html`](src/dashboard.html) / [`src/dashboard.css`](src/dashboard.css) / [`src/dashboard.js`](src/dashboard.js) | Vỏ dashboard. |
-| [`src/dashboard/`](src/dashboard/) | Các view ESM (`nav.js`, `core.js`, `leadfilter.js`, `prefs.js`, `views/*`). |
+| [`ui/`](ui/) → [`dist/ui/`](dist/ui/) | Dashboard React (Vite). `background.js` mở `dist/ui/index.html`. Views: Feed, Tools, Keywords, Comments, Compose, Messenger, Prices. |
+| [`src/dashboard/`](src/dashboard/) | Logic dùng chung phía extension: `leadfilter.js` (phân loại lead), `core.js`, `views/groupprices.js` + `views/products.js` (dùng bởi `lead-classify.js` / `group-prices.js`). |
 
 ### Web (thư mục [`server/`](server/) — repo riêng)
 

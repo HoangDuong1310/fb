@@ -1284,10 +1284,11 @@ async function executeCommentJob(job) {
  * xuống dòng trong nội dung ta dùng execCommand insertLineBreak (không Enter).
  * Trả về { ok, error? } — best-effort theo DOM Messenger hiện hành.
  */
-async function runMessageInPage(text) {
+async function runMessageInPage(text, images) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const body = String(text == null ? "" : text).trim();
-  if (!body) return { ok: false, error: "Nội dung tin nhắn rỗng." };
+  const imgs = Array.isArray(images) ? images.filter(Boolean) : [];
+  if (!body && !imgs.length) return { ok: false, error: "Nội dung tin nhắn rỗng." };
 
   // Ô soạn tin của Messenger là contenteditable role=textbox. Chờ và cuộn nhẹ
   // để giao diện kịp render (tab nền có thể tải chậm).
@@ -1303,6 +1304,53 @@ async function runMessageInPage(text) {
 
   box.focus();
   await sleep(400);
+
+  // Chuyển dataURL -> File để gắn vào input[type=file] của Messenger.
+  const dataUrlToFile = (dataUrl, idx) => {
+    const m = /^data:([^;,]+)?(;base64)?,(.*)$/.exec(dataUrl || "");
+    if (!m) return null;
+    const mime = m[1] || "image/png";
+    const isB64 = !!m[2];
+    const raw = isB64 ? atob(m[3]) : decodeURIComponent(m[3]);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const ext = (mime.split("/")[1] || "png").split("+")[0];
+    return new File([bytes], "image_" + (idx + 1) + "." + ext, { type: mime });
+  };
+  // Gắn ảnh vào ô soạn tin Messenger: tìm input[type=file], nếu chưa có thì thử
+  // bấm nút "Đính kèm tệp"/"Attach a file" để Messenger render input, rồi set
+  // files + dispatch change. Chờ ảnh upload xong (hiện preview) trước khi gửi.
+  const attachImages = async () => {
+    if (!imgs.length) return;
+    const lower = (e) => (e.getAttribute("aria-label") || e.textContent || "").trim().toLowerCase();
+    let input = document.querySelector('input[type="file"][accept*="image"]') ||
+      document.querySelector('input[type="file"]');
+    if (!input) {
+      const attachBtn = [...document.querySelectorAll('div[role="button"], span[role="button"]')].find((e) => {
+        const t = lower(e);
+        return t.includes("đính kèm tệp") || t.includes("attach a file") ||
+          t.includes("đính kèm") || t.includes("attach") || t.includes("ảnh") || t.includes("photo");
+      });
+      if (attachBtn) {
+        try { attachBtn.click(); } catch (e) {}
+        await sleep(1200);
+        input = document.querySelector('input[type="file"][accept*="image"]') ||
+          document.querySelector('input[type="file"]');
+      }
+    }
+    if (!input) return;
+    const dt = new DataTransfer();
+    imgs.forEach((d, i) => {
+      const f = dataUrlToFile(d, i);
+      if (f) dt.items.add(f);
+    });
+    if (!dt.files.length) return;
+    input.files = dt.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    // Ảnh cần thời gian upload/hiện preview trong ô soạn trước khi Enter gửi.
+    await sleep(4500);
+    box.focus();
+  };
 
   // Dán qua ClipboardEvent (Lexical tôn trọng paste text/plain, không tự gửi).
   const pasteInto = (el, str) => {
@@ -1330,15 +1378,20 @@ async function runMessageInPage(text) {
     }
   };
 
-  pasteInto(box, body);
-  await sleep(500);
-  if (!((box.textContent || "").trim())) {
-    try { typeFallback(body); } catch (e) { try { box.textContent = body; } catch (_) {} }
+  if (body) {
+    pasteInto(box, body);
+    await sleep(500);
+    if (!((box.textContent || "").trim())) {
+      try { typeFallback(body); } catch (e) { try { box.textContent = body; } catch (_) {} }
+    }
+    await sleep(1000);
+    if (!((box.textContent || "").trim())) {
+      return { ok: false, error: "Không nhập được nội dung vào ô soạn tin." };
+    }
   }
-  await sleep(1000);
-  if (!((box.textContent || "").trim())) {
-    return { ok: false, error: "Không nhập được nội dung vào ô soạn tin." };
-  }
+
+  // Gắn ảnh (nếu có) SAU khi đã nhập text, TRƯỚC khi Enter gửi.
+  await attachImages();
 
   // GỬI bằng Enter (Messenger: Enter = gửi). Bắn đủ keydown/keypress/keyup.
   const fire = (type) =>
@@ -1369,7 +1422,7 @@ async function executeMessageJob(job) {
     res = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: runMessageInPage,
-      args: [job.content || ""],
+      args: [job.content || "", Array.isArray(job.images) ? job.images : []],
     });
     out = (res && res[0] && res[0].result) || out;
   } catch (e) {
@@ -2849,6 +2902,9 @@ async function scanInbox(options) {
   } catch (e) {}
 
   const listUrl = "https://www.facebook.com/messages/";
+  // Phát tiến độ THỜI GIAN THỰC cho dashboard: mở khung tiến trình ngay khi bắt
+  // đầu để người dùng biết đang chạy (không phải spinner "đứng đơ" vô định).
+  try { broadcast("INBOX_PROGRESS", { phase: "list", status: "scanning", text: "Đang mở hộp thư…" }); } catch (e) {}
   const tab = await new Promise((r) => chrome.tabs.create({ url: listUrl, active: false }, r));
   let listThreads = [];
   let via = "api";
@@ -2909,7 +2965,18 @@ async function scanInbox(options) {
   // Lưu danh sách (chưa có messages) — UPSERT giữ nháp/tin cũ.
   try { await DB.upsertInboxThreads(listThreads); } catch (e) {}
 
+  // Báo đã quét xong danh sách (kèm tổng số) để UI đổi từ "đang mở" sang có số.
+  try {
+    broadcast("INBOX_PROGRESS", {
+      phase: "list",
+      status: "done",
+      total: listThreads.length,
+      text: "Đã tìm thấy " + listThreads.length + " hội thoại.",
+    });
+  } catch (e) {}
+
   if (!deep || listThreads.length === 0) {
+    try { broadcast("INBOX_PROGRESS", { phase: "done", read: 0, failed: 0, text: "Xong." }); } catch (e) {}
     return { ok: true, threads: listThreads, deep: false, via };
   }
 
@@ -2928,9 +2995,20 @@ async function scanInbox(options) {
 
   const detailed = [];
   const startedAt = Date.now();
+  const total = plan.toRead.length;
   let read = 0;
   let failed = 0;
   let timedOut = false;
+  // Báo bắt đầu pha đọc chi tiết kèm tổng số thread sẽ đọc lượt này.
+  try {
+    broadcast("INBOX_PROGRESS", {
+      phase: "read",
+      status: "start",
+      done: 0,
+      total,
+      text: "Chuẩn bị đọc " + total + " hội thoại…",
+    });
+  } catch (e) {}
   for (const th of plan.toRead) {
     // Trần thời gian THỰC: chạm trần thì dừng, thread còn lại để lượt sau.
     if (Date.now() - startedAt > INBOX_READ_TIME_CAP_MS) {
@@ -2939,7 +3017,22 @@ async function scanInbox(options) {
     }
     const id = String(th.threadId);
     const prev = storedById.get(id) || {};
-    const one = await readInboxThread(id);
+    // Phát tiến độ TRƯỚC mỗi lần đọc: người dùng thấy "Đang đọc 3/12 — <tên>".
+    const doneSoFar = read + failed;
+    try {
+      broadcast("INBOX_PROGRESS", {
+        phase: "read",
+        status: "reading",
+        done: doneSoFar,
+        total,
+        threadId: id,
+        name: th.name || prev.name || "",
+        text:
+          "Đang đọc " + (doneSoFar + 1) + "/" + total +
+          (th.name || prev.name ? " — " + (th.name || prev.name) : "") + "…",
+      });
+    } catch (e) {}
+    const one = await readInboxThread(id, { silent: true });
     const gotMsgs =
       one &&
       one.ok &&
@@ -2984,8 +3077,29 @@ async function scanInbox(options) {
         ]);
       } catch (e) {}
     }
+    // Phát tiến độ SAU mỗi lần đọc (đếm đã hoàn tất) để thanh tiến trình nhích.
+    try {
+      broadcast("INBOX_PROGRESS", {
+        phase: "read",
+        status: "progress",
+        done: read + failed,
+        total,
+        threadId: id,
+      });
+    } catch (e) {}
     await sleep(3500);
   }
+
+  try {
+    broadcast("INBOX_PROGRESS", {
+      phase: "done",
+      read,
+      failed,
+      total,
+      timedOut,
+      text: "Xong: đọc " + read + ", hụt " + failed + (timedOut ? " (chạm trần thời gian)" : "") + ".",
+    });
+  } catch (e) {}
 
   const threads = await DB.getInboxThreads();
   return {
@@ -3007,16 +3121,28 @@ async function scanInbox(options) {
  * MỞ & ĐỌC một hội thoại theo threadId: mở tab /messages/t/<id> ở nền, đọc tin,
  * đóng tab, UPSERT vào store. Trả về { ok, thread } hoặc { ok:false, error }.
  */
-async function readInboxThread(threadId) {
+async function readInboxThread(threadId, readOpts) {
   const id = String(threadId || "").trim();
   if (!id) return { ok: false, error: "Thiếu mã hội thoại." };
+
+  // silent: khi được scanInbox gọi trong vòng lặp, KHÔNG tự phát tiến độ (vòng
+  // lặp đã phát nhịp "read N/total" rồi). Khi người dùng bấm mở 1 hội thoại,
+  // silent=false để phát open→reading→done cho spinner có phản hồi thực.
+  const silent = !!(readOpts && readOpts.silent);
+  const emit = (payload) => {
+    if (silent) return;
+    try { broadcast("INBOX_PROGRESS", { threadId: id, ...payload }); } catch (e) {}
+  };
 
   try {
     const blockState = await getCrawlBlockState();
     if (blockState && blockState.blocked) {
+      emit({ phase: "thread", status: "error", text: "Hệ thống đang tạm dừng (kill-switch)." });
       return { ok: false, error: "Hệ thống đang tạm dừng (kill-switch): " + (blockState.reason || "không rõ") + "." };
     }
   } catch (e) {}
+
+  emit({ phase: "thread", status: "opening", text: "Đang mở hội thoại…" });
 
   const url = "https://www.facebook.com/messages/t/" + encodeURIComponent(id);
   const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
@@ -3026,6 +3152,7 @@ async function readInboxThread(threadId) {
     await waitTabComplete(tab.id, 30000);
     // Chờ ngắn cho khung chat khởi tạo; runReadThreadInPage tự poll thêm
     // (8×1500ms) đến khi tin render, nên không cần chờ cố định lâu ở đây.
+    emit({ phase: "thread", status: "reading", text: "Đang giải mã & đọc tin…" });
     await sleep(1500);
 
     // DOM-FIRST (đã kiểm chứng bằng dữ liệu bắt thật): tin nhắn Messenger được
@@ -3041,13 +3168,17 @@ async function readInboxThread(threadId) {
         func: runReadThreadInPage,
       });
     } catch (e) {
+      emit({ phase: "thread", status: "error", text: "Lỗi chạy script đọc hội thoại." });
       return { ok: false, error: "Lỗi chạy script đọc hội thoại: " + String(e) };
     }
     out = (res && res[0] && res[0].result) || out;
   } finally {
     try { await chrome.tabs.remove(tab.id); } catch (e) {}
   }
-  if (!out.ok) return out;
+  if (!out.ok) {
+    emit({ phase: "thread", status: "error", text: String(out.error || "Đọc hụt.") });
+    return out;
+  }
 
   const messages = Array.isArray(out.messages) ? out.messages : [];
   name = out.name || "";
@@ -3061,6 +3192,12 @@ async function readInboxThread(threadId) {
     },
   ]);
   const thread = await DB.getInboxThread(id);
+  emit({
+    phase: "thread",
+    status: "done",
+    text: "Đã đọc " + messages.length + " tin.",
+    count: messages.length,
+  });
   return { ok: true, thread };
 }
 

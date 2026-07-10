@@ -374,6 +374,48 @@ async function deleteSetting(key) {
   return apiFetch("/api/settings/" + encodeURIComponent(key), { method: "DELETE" });
 }
 
+/* ====================== MESSAGE TEMPLATES ============================== *
+ * Mẫu tin chào hàng tái sử dụng — LƯU HOÀN TOÀN TRÊN SERVER theo TÀI KHOẢN
+ * (không dùng chrome.storage.local). `content` có thể chứa {{ten}} để tự
+ * điền tên khách khi gửi. `kind` phân loại 'pitch' | 'zalo' | ...
+ * ---------------------------------------------------------------------- */
+
+/** Lấy danh sách mẫu tin (tuỳ chọn lọc theo kind). Trả về MẢNG. */
+async function getMessageTemplates(kind) {
+  const body = await apiFetch("/api/message-templates" + qs({ kind }));
+  return Array.isArray(body?.templates) ? body.templates : [];
+}
+
+/**
+ * Lưu (tạo mới hoặc cập nhật) một mẫu tin. Nếu `tpl.id` có sẵn -> PATCH,
+ * ngược lại -> POST tạo mới. Trả về { ok, id? }.
+ */
+async function saveMessageTemplate(tpl) {
+  const t = tpl || {};
+  if (t.id != null && t.id !== "") {
+    const body = await apiFetch(
+      "/api/message-templates/" + encodeURIComponent(t.id),
+      {
+        method: "PATCH",
+        body: JSON.stringify({ name: t.name, content: t.content, images: t.images, kind: t.kind }),
+      }
+    );
+    return { ok: true, id: t.id, updated: body?.updated ?? 0 };
+  }
+  const body = await apiFetch("/api/message-templates", {
+    method: "POST",
+    body: JSON.stringify({ name: t.name, content: t.content ?? "", images: t.images, kind: t.kind ?? "pitch" }),
+  });
+  return { ok: true, id: body?.id };
+}
+
+/** Xoá một mẫu tin theo id. */
+async function deleteMessageTemplate(id) {
+  return apiFetch("/api/message-templates/" + encodeURIComponent(id), {
+    method: "DELETE",
+  });
+}
+
 /* ============================ PRODUCTS =================================== */
 
 /** Lưu (hoặc cập nhật) nhiều sản phẩm vào catalog chung. Trả về { added, updated }. */
@@ -768,6 +810,10 @@ export {
   getSetting,
   setSetting,
   deleteSetting,
+  // message templates (mẫu tin chào hàng — theo TÀI KHOẢN qua /api/message-templates)
+  getMessageTemplates,
+  saveMessageTemplate,
+  deleteMessageTemplate,
   // products
   saveProducts,
   getProducts,

@@ -157,13 +157,30 @@ export async function apiFetch(path, init = {}) {
     // Một 401 cho request KHÔNG kèm token nghĩa là "chưa đăng nhập" chứ không phải
     // token đã hỏng — xoá token đã lưu lúc này sẽ đá NHẦM người dùng ra (đúng triệu
     // chứng "đăng xuất sau vài phút" khi SW vừa thức dậy mà cache token còn rỗng).
-    if (res.status === 401 && sentToken && !init.skipAuthHandler) {
+    // Tài khoản bị admin KHÓA (hoặc chưa duyệt / đã xóa) sẽ khiến authRequired ở
+    // backend trả 403 kèm code "ACCOUNT_INACTIVE". Với client, đây tương đương
+    // "phiên không còn hiệu lực": phải xoá token và phát AUTH_REQUIRED giống 401,
+    // để user bị đá ra ngay thay vì lặp lỗi 403 vô nghĩa. Lưu ý 403 KHÔNG kèm
+    // code này (vd adminRequired "thiếu quyền") thì KHÔNG động vào token.
+    const accountInactive =
+      res.status === 403 && body && body.code === "ACCOUNT_INACTIVE";
+    const sessionInvalid = res.status === 401 || accountInactive;
+    if (sessionInvalid && sentToken && !init.skipAuthHandler) {
       setToken(null);
       if (unauthorizedHandler) {
         try {
-          unauthorizedHandler();
+          // Truyền lý do để UI hiển thị thông báo phù hợp: "locked" (bị khóa),
+          // "pending" (chờ duyệt), hoặc "expired" (phiên hết hạn/token hỏng).
+          const reason = accountInactive
+            ? body.status === "locked"
+              ? "locked"
+              : body.status === "pending"
+                ? "pending"
+                : "inactive"
+            : "expired";
+          unauthorizedHandler(reason);
         } catch (e) {
-          // Không để lỗi handler che lỗi 401 gốc.
+          // Không để lỗi handler che lỗi gốc.
         }
       }
     }
