@@ -25,25 +25,46 @@ router.post("/", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Thiếu postId." });
   }
   try {
+    // Nội dung nháp: extension gửi dưới khoá `reply`, còn nút "AI phân tích" cũ
+    // dùng `draft`. Chấp nhận cả hai để không mất nội dung.
+    const draftText =
+      adv.draft != null ? String(adv.draft)
+        : adv.reply != null ? String(adv.reply)
+          : null;
     await pool.execute(
       `INSERT INTO advisories
-         (post_id, user_id, status, draft, used_products, needs_human_check, check_note)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+         (post_id, user_id, status, draft, used_products, needs_human_check, check_note,
+          author_name, author_profile, post_text, group_id, group_name, permalink, intent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          status             = VALUES(status),
          draft              = VALUES(draft),
          used_products      = VALUES(used_products),
          needs_human_check  = VALUES(needs_human_check),
          check_note         = VALUES(check_note),
+         author_name        = VALUES(author_name),
+         author_profile     = VALUES(author_profile),
+         post_text          = VALUES(post_text),
+         group_id           = VALUES(group_id),
+         group_name         = VALUES(group_name),
+         permalink          = VALUES(permalink),
+         intent             = VALUES(intent),
          updated_at         = CURRENT_TIMESTAMP`,
       [
         String(postId),
         req.userId,
         String(adv.status || "draft"),
-        adv.draft != null ? String(adv.draft) : null,
+        draftText,
         adv.usedProducts != null ? JSON.stringify(adv.usedProducts) : null,
         adv.needsHumanCheck ? 1 : 0,
         adv.checkNote != null ? String(adv.checkNote) : null,
+        adv.authorName != null ? String(adv.authorName) : "",
+        adv.authorProfile != null ? String(adv.authorProfile) : "",
+        adv.postText != null ? String(adv.postText) : null,
+        adv.groupId != null ? String(adv.groupId) : "",
+        adv.groupName != null ? String(adv.groupName) : "",
+        adv.permalink != null ? String(adv.permalink) : "",
+        adv.intent != null ? String(adv.intent) : "",
       ]
     );
     // Fetch back the saved row
@@ -142,9 +163,18 @@ function mapAdvisory(r) {
     userId: r.user_id,
     status: r.status,
     draft: r.draft,
+    // Trả cả `reply` (alias của draft) để tab Chào hàng dùng đúng khoá cũ.
+    reply: r.draft,
     usedProducts: parseJson(r.used_products, []),
     needsHumanCheck: !!r.needs_human_check,
     checkNote: r.check_note,
+    authorName: r.author_name || "",
+    authorProfile: r.author_profile || "",
+    postText: r.post_text || "",
+    groupId: r.group_id || "",
+    groupName: r.group_name || "",
+    permalink: r.permalink || "",
+    intent: r.intent || "",
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };

@@ -116,6 +116,13 @@ export async function runMigrations() {
       used_products      JSON,
       needs_human_check  TINYINT(1)   NOT NULL DEFAULT 0,
       check_note         TEXT,
+      author_name        VARCHAR(255) NOT NULL DEFAULT '',
+      author_profile     VARCHAR(512) NOT NULL DEFAULT '',
+      post_text          MEDIUMTEXT,
+      group_id           VARCHAR(64)  NOT NULL DEFAULT '',
+      group_name         VARCHAR(255) NOT NULL DEFAULT '',
+      permalink          VARCHAR(512) NOT NULL DEFAULT '',
+      intent             VARCHAR(32)  NOT NULL DEFAULT '',
       created_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       UNIQUE KEY uq_post_user (post_id, user_id),
@@ -285,6 +292,20 @@ export async function runMigrations() {
   await ensureColumns(pool, "conversations", [
     { name: "my_author_id", ddl: "my_author_id VARCHAR(64) DEFAULT NULL" },
     { name: "my_author_name", ddl: "my_author_name VARCHAR(255) DEFAULT NULL" },
+  ]);
+
+  // Advisories: các cột ngữ cảnh khách hàng để tab "Chào hàng" có dữ liệu tương
+  // tác (tên/link trang cá nhân/nội dung bài/nhóm/permalink/ý định). DB cũ chỉ có
+  // draft + used_products nên phải ALTER thêm; nếu thiếu author_profile thì UI
+  // lọc rỗng -> "chẳng có gì để tương tác".
+  await ensureColumns(pool, "advisories", [
+    { name: "author_name", ddl: "author_name VARCHAR(255) NOT NULL DEFAULT ''" },
+    { name: "author_profile", ddl: "author_profile VARCHAR(512) NOT NULL DEFAULT ''" },
+    { name: "post_text", ddl: "post_text MEDIUMTEXT" },
+    { name: "group_id", ddl: "group_id VARCHAR(64) NOT NULL DEFAULT ''" },
+    { name: "group_name", ddl: "group_name VARCHAR(255) NOT NULL DEFAULT ''" },
+    { name: "permalink", ddl: "permalink VARCHAR(512) NOT NULL DEFAULT ''" },
+    { name: "intent", ddl: "intent VARCHAR(32) NOT NULL DEFAULT ''" },
   ]);
 
   console.log("[db] migrations complete");

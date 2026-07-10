@@ -690,6 +690,11 @@ function InboxPane() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [readingId, setReadingId] = useState<string | null>(null);
+  // Dòng tiến độ realtime (do service worker broadcast INBOX_PROGRESS đẩy về):
+  // giúp người dùng biết thao tác đang THỰC SỰ chạy thay vì chỉ thấy icon xoay
+  // (mà khi tab bị nền, animation CSS có thể bị trình duyệt tạm dừng → "đứng đơ").
+  // done=true -> đã xong, hiện dấu tick (không xoay) rồi tự ẩn.
+  const [progress, setProgress] = useState<{ text: string; done: boolean } | null>(null);
   const [genLoading, setGenLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -751,6 +756,47 @@ function InboxPane() {
 
   useEffect(() => {
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Realtime tiến độ quét/đọc hộp thư từ service worker (INBOX_PROGRESS).
+  useEffect(() => {
+    interface InboxProgressMsg {
+      type?: string;
+      phase?: string;
+      status?: string;
+      text?: string;
+      total?: number;
+      read?: number;
+      failed?: number;
+    }
+    const handler = (msg: InboxProgressMsg) => {
+      if (!msg || msg.type !== "INBOX_PROGRESS") return;
+      // Kết thúc = quét xong toàn bộ (phase "done") HOẶC đọc xong 1 hội thoại
+      // (phase "thread" + status "done"). Khi đó ngừng xoay và tự ẩn.
+      const finished = msg.phase === "done" || msg.status === "done" || msg.status === "error";
+      if (typeof msg.text === "string" && msg.text) {
+        setProgress({ text: msg.text, done: finished });
+      } else if (finished) {
+        setProgress((p) => (p ? { ...p, done: true } : p));
+      }
+      if (finished) {
+        // Giữ dòng tổng kết một lúc cho người dùng đọc rồi ẩn.
+        window.setTimeout(() => setProgress(null), 4000);
+      }
+    };
+    try {
+      chrome.runtime.onMessage.addListener(handler);
+    } catch {
+      /* not in extension context */
+    }
+    return () => {
+      try {
+        chrome.runtime.onMessage.removeListener(handler);
+      } catch {
+        /* noop */
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -928,6 +974,29 @@ function InboxPane() {
           </button>
         </div>
       </div>
+
+      {/* Dòng tiến độ realtime — text đổi liên tục để người dùng biết đang chạy
+          thật, kể cả khi icon xoay bị trình duyệt tạm dừng lúc tab ở nền.
+          Khi xong: đổi spinner → dấu tick và tự ẩn sau vài giây. */}
+      {progress && (
+        <div
+          className={cn(
+            "flex items-center gap-2 rounded-md border px-4 py-2 text-xs font-medium",
+            progress.done
+              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700"
+              : "border-accent/30 bg-accent-soft/20 text-accent-ink",
+          )}
+        >
+          {progress.done ? (
+            <CheckCircle2 className="size-3.5 shrink-0 text-emerald-600" />
+          ) : (
+            <Loader2 className="size-3.5 shrink-0 animate-spin text-accent" />
+          )}
+          <span className="truncate" title={progress.text}>
+            {progress.text}
+          </span>
+        </div>
+      )}
 
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(280px,340px)_1fr] gap-3">
         {/* ── Left: thread list ── */}
