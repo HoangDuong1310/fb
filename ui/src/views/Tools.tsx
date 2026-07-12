@@ -1142,6 +1142,11 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
   const [hasKey, setHasKey] = useState(false);
   const [keyMasked, setKeyMasked] = useState("");
   const [settings, setSettings] = useState<CrawlSettings>(CRAWL_DEFAULTS);
+  // Công tắc focus tab (bật/tắt) — lưu RIÊNG ở key "focusTabs" trong
+  // chrome.storage.local (KHÔNG lồng trong crawlSettings) vì service worker đọc
+  // đúng key này qua shouldFocusTabs() trong src/crawl.js. Mặc định false =>
+  // mọi tab nhiệm vụ mở ở NỀN, không nhảy tab.
+  const [focusTabs, setFocusTabs] = useState(false);
   const [stats, setStats] = useState<Stats>({});
   const [loading, setLoading] = useState(true);
   const [savingAi, setSavingAi] = useState(false);
@@ -1156,7 +1161,7 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
     // rời server. Server chỉ trả apiBase/model + hasKey/keyMasked, KHÔNG trả key
     // thô. aiModelList/crawlSettings chỉ dùng nội bộ tab này nên vẫn ở local.
     const [store, sres, aiRes] = await Promise.all([
-      storageGet(["aiModelList", "crawlSettings"]),
+      storageGet(["aiModelList", "crawlSettings", "focusTabs"]),
       bg<StatsResponse>("GET_STATS"),
       bg<AiConfigResponse>("GET_AI_CONFIG"),
     ]);
@@ -1172,6 +1177,7 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
     if (Array.isArray(cached) && cached.length) setModels(cached as string[]);
     const saved = store.crawlSettings as Partial<CrawlSettings> | undefined;
     if (saved) setSettings({ ...CRAWL_DEFAULTS, ...saved });
+    setFocusTabs(store.focusTabs === true);
     if (sres.ok && sres.stats) setStats(sres.stats);
     setLoading(false);
   }
@@ -1238,6 +1244,19 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
     await storageSet({ crawlSettings: settings });
     setSavingCrawl(false);
     flash("ok", "Đã lưu tùy chọn thu thập.");
+  }
+
+  // Bật/tắt lưu NGAY (không cần bấm "Lưu tùy chọn") để công tắc có hiệu lực tức
+  // thì cho nhiệm vụ chạy sau đó. Ghi thẳng key "focusTabs" ở chrome.storage.local.
+  async function toggleFocusTabs(value: boolean) {
+    setFocusTabs(value);
+    await storageSet({ focusTabs: value });
+    flash(
+      "ok",
+      value
+        ? "Đã bật: mở & focus tab khi chạy nhiệm vụ."
+        : "Đã tắt: tab nhiệm vụ chạy ẩn ở nền, không nhảy tab.",
+    );
   }
 
   async function clearPosts() {
@@ -1441,6 +1460,23 @@ function ConfigTab({ flash }: { flash: FlashFn }) {
             className="size-4 accent-[var(--accent)]"
           />
           Chế độ an toàn (chậm hơn, giảm rủi ro bị chặn)
+        </label>
+
+        <label className="flex cursor-pointer items-start gap-2 text-sm text-ink-soft">
+          <input
+            type="checkbox"
+            checked={focusTabs}
+            onChange={(e) => toggleFocusTabs(e.target.checked)}
+            className="mt-0.5 size-4 accent-[var(--accent)]"
+          />
+          <span className="flex flex-col gap-0.5">
+            <span>Focus tab khi chạy nhiệm vụ</span>
+            <span className="text-xs font-normal text-ink-faint">
+              Tắt (mặc định): tab nhiệm vụ mở ẩn ở nền, bạn ở nguyên tab công cụ.
+              Bật: trình duyệt nhảy sang & focus tab nhiệm vụ như trước. Lưu ngay
+              khi đổi.
+            </span>
+          </span>
         </label>
 
         <button

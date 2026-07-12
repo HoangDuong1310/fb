@@ -6,6 +6,7 @@ import {
   Megaphone,
   Tag,
   KeyRound,
+  FileSignature,
   Wrench,
   Sparkles,
   ShieldAlert,
@@ -17,6 +18,7 @@ import { Comments } from "@/views/Comments";
 import { Compose } from "@/views/Compose";
 import { Prices } from "@/views/Prices";
 import { Keywords } from "@/views/Keywords";
+import { Profiles } from "@/views/Profiles";
 import { Tools } from "@/views/Tools";
 
 /* -------------------------------------------------------------------------
@@ -34,6 +36,7 @@ type ViewId =
   | "compose"
   | "prices"
   | "keywords"
+  | "profiles"
   | "tools";
 
 interface NavItem {
@@ -81,6 +84,12 @@ const NAV: NavItem[] = [
     icon: KeyRound,
   },
   {
+    id: "profiles",
+    label: "Hồ sơ ngành",
+    hint: "Prompt AI theo ngành — phân loại, soạn tin, trích giá",
+    icon: FileSignature,
+  },
+  {
     id: "tools",
     label: "Công cụ",
     hint: "Thu thập, giá thị trường, cấu hình",
@@ -112,6 +121,10 @@ const VIEW_TITLE: Record<ViewId, { title: string; sub: string }> = {
   keywords: {
     title: "Từ khóa & Đề xuất",
     sub: "Bộ lọc lead tự học theo thời gian. Duyệt từ khóa do AI đề xuất để lần sau lọc chuẩn hơn.",
+  },
+  profiles: {
+    title: "Hồ sơ ngành",
+    sub: "Tạo và kích hoạt bộ prompt AI theo ngành — phân loại lead, soạn tin, trích giá từ bài rao.",
   },
   tools: {
     title: "Công cụ",
@@ -222,6 +235,8 @@ export function App() {
             <Prices />
           ) : view === "keywords" ? (
             <Keywords />
+          ) : view === "profiles" ? (
+            <Profiles />
           ) : (
             <Tools />
           )}

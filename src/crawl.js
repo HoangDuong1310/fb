@@ -50,6 +50,32 @@ async function removeCrawlTab(tabId) {
   return false;
 }
 
+/* ---------------------- CÔNG TẮC FOCUS TAB ----------------------------- */
+// Người dùng phàn nàn "tab cứ nhảy" khi chạy nhiệm vụ: chỗ mở nền, chỗ lại
+// focus khiến trình duyệt nhảy sang tab mới, không ở nguyên tab tool. Thêm 1
+// công tắc bật/tắt (focusTabs) lưu ở chrome.storage.local — đây là preference
+// theo THIẾT BỊ (cửa sổ trình duyệt cục bộ mà setting này điều khiển), đọc được
+// từ service worker, KHÔNG dùng DB.setSetting (route /api/settings server chưa
+// có nên sẽ nuốt lỗi & luôn rơi về mặc định — không đáng tin để lưu pref này).
+//
+// MẶC ĐỊNH = false  => MỌI tab nhiệm vụ mở ở NỀN (active:false), không chiếm
+//                      focus, người dùng ở nguyên tab tool.
+// Bật (true)        => tab nhiệm vụ mở & focus như trước.
+//
+// LƯU Ý QUAN TRỌNG: openHiddenCrawlTab (crawl API GQL) BẮT BUỘC foreground vì
+// Chrome throttle rAF/IntersectionObserver ở tab nền => KHÔNG áp công tắc cho
+// path đó (nó tự quản active:true + focusWindow riêng).
+const FOCUS_TABS_KEY = "focusTabs";
+
+async function shouldFocusTabs() {
+  try {
+    const r = await chrome.storage.local.get(FOCUS_TABS_KEY);
+    return r[FOCUS_TABS_KEY] === true;
+  } catch (e) {
+    return false;
+  }
+}
+
 /* ----------------------- SẮP XẾP FEED "BÀI VIẾT MỚI" -------------------- */
 // Crawl tăng dần CHỈ đúng khi feed nhóm sắp theo THỜI GIAN ĐĂNG (mới->cũ).
 // Mặc định FB trả "Phù hợp nhất" (thuật toán, KHÔNG theo thời gian) => bài mới &
@@ -141,8 +167,9 @@ async function crawlGroupInTab(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
   // Ép feed về "Bài viết mới" (CHRONOLOGICAL) để crawl tăng dần lấy đúng & đủ bài mới.
   const url = withNewestSort("https://www.facebook.com/groups/" + groupId + "/");
-  // Mở ở chế độ NỀN để người dùng ở lại dashboard; tiến trình phát qua broadcast.
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  // Mở tab theo công tắc focusTabs (mặc định NỀN để không nhảy tab); tiến trình phát qua broadcast.
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   // Ghi nhận tab này do background tự mở để CRAWL_DONE biết đường đóng lại sau khi xong.
   // Lưu vào chrome.storage.session để sống sót khi service worker bị tắt giữa chừng.
   await addCrawlTab(tab.id);
@@ -770,7 +797,8 @@ async function scanJoinedGroupsInPage() {
 /** Mở trang "Nhóm của bạn", quét rồi lưu danh sách nhóm vào IndexedDB. */
 async function scanJoinedGroups() {
   const url = "https://www.facebook.com/groups/joins/";
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active: true }, r));
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   await waitTabComplete(tab.id, 30000);
   await sleep(2500);
   let res;
@@ -1185,7 +1213,8 @@ async function executePostJob(job) {
     return { ok: false, error: "Thiếu nhóm để đăng bài." };
   }
   const images = Array.isArray(job.images) ? job.images : [];
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active: true }, r));
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   await waitTabComplete(tab.id, 30000);
   await sleep(3000);
   let res;
@@ -1213,7 +1242,8 @@ async function executeCommentJob(job) {
   // CHẠY NGẦM: mở tab ở NỀN (active:false) để KHÔNG chiếm màn hình người dùng;
   // waitTabComplete chỉ nghe tabs.onUpdated nên không cần tab active. Đóng tab
   // sau khi xong để không để lại tab rác.
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   await waitTabComplete(tab.id, 30000);
   await sleep(3500);
   let res;
@@ -1413,7 +1443,8 @@ async function executeMessageJob(job) {
   if (!url) return { ok: false, error: "Thiếu link hội thoại Messenger để gửi tin." };
   // Mở tab Messenger ở NỀN (active:false) để không chiếm màn hình; Messenger
   // cần thời gian tải lười nên chờ lâu hơn chút so với bình luận.
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   await waitTabComplete(tab.id, 30000);
   await sleep(4500);
   let res;
@@ -1727,7 +1758,8 @@ async function executeWatchReplies(conv) {
   }
   if (!url) return { ok: false, error: "Thiếu link để theo dõi reply." };
   const meta = conv.meta || {};
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   await waitTabComplete(tab.id, 30000);
   // NGẮT MẠCH (đồng bộ với feed/inbox): nếu FB đá tab sang trang
   // checkpoint/đăng nhập thì coi như tài khoản đang bị chặn -> đóng tab và báo
@@ -1884,7 +1916,8 @@ async function executeDeletePost(postUrl) {
   if (!postUrl) return { ok: false, error: "Không có link bài để xoá trên Facebook." };
   let tab;
   try {
-    tab = await new Promise((r) => chrome.tabs.create({ url: postUrl, active: true }, r));
+    const active = await shouldFocusTabs();
+    tab = await new Promise((r) => chrome.tabs.create({ url: postUrl, active }, r));
     await waitTabComplete(tab.id, 30000);
     await sleep(3500);
     const res = await chrome.scripting.executeScript({
@@ -2905,7 +2938,8 @@ async function scanInbox(options) {
   // Phát tiến độ THỜI GIAN THỰC cho dashboard: mở khung tiến trình ngay khi bắt
   // đầu để người dùng biết đang chạy (không phải spinner "đứng đơ" vô định).
   try { broadcast("INBOX_PROGRESS", { phase: "list", status: "scanning", text: "Đang mở hộp thư…" }); } catch (e) {}
-  const tab = await new Promise((r) => chrome.tabs.create({ url: listUrl, active: false }, r));
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url: listUrl, active }, r));
   let listThreads = [];
   let via = "api";
   try {
@@ -3145,7 +3179,8 @@ async function readInboxThread(threadId, readOpts) {
   emit({ phase: "thread", status: "opening", text: "Đang mở hội thoại…" });
 
   const url = "https://www.facebook.com/messages/t/" + encodeURIComponent(id);
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active: false }, r));
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   let out = { ok: false, error: "Không có kết quả." };
   let name = "";
   try {

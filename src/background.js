@@ -31,14 +31,8 @@ import {
   seedPriceSources,
 } from "./prices.js";
 import { listSheetTabs, previewSheet, importSheetTabs } from "./sheets.js";
-import { discoverSelectors, listModels, spinPostContent, generatePostContent, generateProfileFull, draftPitch, draftInboxReply } from "./ai.js";
+import { discoverSelectors, listModels, spinPostContent, generatePostContent } from "./ai.js";
 import { clearProfileCache } from "./prompts.js";
-import {
-  generateAdvisories,
-  analyzePost,
-  approveAdvisory,
-  draftConversationReply,
-} from "./advisory.js";
 import {
   startCrawlInActiveTab,
   stopCrawlInActiveTab,
@@ -223,9 +217,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "GEN_PROFILE_FULL": {
-      generateProfileFull(msg.payload || {})
-        .then((r) => sendResponse(r))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const result = await API.apiFetch("/api/ai/generate-profile", {
+          method: "POST",
+          body: JSON.stringify(msg.payload || {}),
+        });
+        sendResponse(result);
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -546,6 +548,114 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    // ---- Trợ lý AI (ChatAI) — proxy các endpoint /api/chat -----------------
+    // Extension dùng bản KHÔNG streaming (SSE không chạy qua message port MV3).
+    // Mọi endpoint đều nằm dưới authRequired, req.userId được set ở server.
+
+    // Danh sách hội thoại: GET /api/chat/conversations -> { conversations }
+    case "GET_CHAT_CONVERSATIONS": {
+      (async () => {
+        await readyPromise;
+        const result = await API.apiFetch("/api/chat/conversations");
+        sendResponse({ ok: true, ...result });
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
+      return true;
+    }
+
+    // Tạo hội thoại mới: POST /api/chat/conversations {title?, model?} -> { conversation }
+    case "CREATE_CHAT_CONVERSATION": {
+      (async () => {
+        await readyPromise;
+        const body = {};
+        if (msg.title != null) body.title = msg.title;
+        if (msg.model != null) body.model = msg.model;
+        const result = await API.apiFetch("/api/chat/conversations", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        sendResponse({ ok: true, ...result });
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
+      return true;
+    }
+
+    // Chi tiết hội thoại: GET /api/chat/conversations/:id -> { conversation, messages }
+    case "GET_CHAT_DETAIL": {
+      (async () => {
+        await readyPromise;
+        const result = await API.apiFetch(
+          "/api/chat/conversations/" + encodeURIComponent(msg.id)
+        );
+        sendResponse({ ok: true, ...result });
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
+      return true;
+    }
+
+    // Đổi tên hội thoại: PATCH /api/chat/conversations/:id {title} -> { ok }
+    case "RENAME_CHAT_CONVERSATION": {
+      (async () => {
+        await readyPromise;
+        await API.apiFetch(
+          "/api/chat/conversations/" + encodeURIComponent(msg.id),
+          {
+            method: "PATCH",
+            body: JSON.stringify({ title: msg.title }),
+          }
+        );
+        sendResponse({ ok: true });
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
+      return true;
+    }
+
+    // Xoá hội thoại: DELETE /api/chat/conversations/:id -> { ok }
+    case "DELETE_CHAT_CONVERSATION": {
+      (async () => {
+        await readyPromise;
+        await API.apiFetch(
+          "/api/chat/conversations/" + encodeURIComponent(msg.id),
+          { method: "DELETE" }
+        );
+        sendResponse({ ok: true });
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
+      return true;
+    }
+
+    // Gửi tin nhắn (KHÔNG streaming): POST /api/chat/conversations/:id/messages
+    // {text, model?} -> { waitingAsync, content, messages }
+    case "SEND_CHAT_MESSAGE": {
+      (async () => {
+        await readyPromise;
+        const body = { text: msg.text };
+        if (msg.model != null) body.model = msg.model;
+        const result = await API.apiFetch(
+          "/api/chat/conversations/" + encodeURIComponent(msg.id) + "/messages",
+          {
+            method: "POST",
+            body: JSON.stringify(body),
+          }
+        );
+        sendResponse({ ok: true, ...result });
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
+      return true;
+    }
+
     // ---- Nguồn dữ liệu giá/sản phẩm -------------------------------------
     case "GET_SOURCES": {
       DB.getSources()
@@ -618,9 +728,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     // ----------------------- TƯ VẤN AI (advisories) ----------------------
     case "GEN_ADVISORIES": {
-      generateAdvisories(msg.options || {})
-        .then((r) => sendResponse(r))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const result = await API.apiFetch("/api/ai/generate-advisories", {
+          method: "POST",
+          body: JSON.stringify(msg.options || {}),
+        });
+        sendResponse(result);
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -639,9 +757,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "APPROVE_ADVISORY": {
-      approveAdvisory(msg.postId)
-        .then((r) => sendResponse(r))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const result = await API.apiFetch("/api/ai/approve-advisory", {
+          method: "POST",
+          body: JSON.stringify({ postId: msg.postId }),
+        });
+        sendResponse(result);
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -752,11 +878,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Soạn NHÁP phản hồi cho 1 hội thoại -> lưu vào conv.draft (KHÔNG tự đăng).
     case "DRAFT_CONV_REPLY": {
       (async () => {
+        await readyPromise;
         const conv = await DB.getConversation(msg.id);
         if (!conv) return sendResponse({ ok: false, error: "Không tìm thấy hội thoại." });
         // targetReplyId (tuỳ chọn): khi NHIỀU người cùng trả lời dưới bình luận
         // của ta, UI gửi id của reply cần trả lời để AI soạn ĐÚNG người đó.
-        const draft = await draftConversationReply(conv, { targetReplyId: msg.targetReplyId });
+        // SERVER-SIDE: gọi /api/ai/draft-conversation-reply để key AI không rời
+        // server; DB.getConversation/updateConversation vẫn ở SW như cũ.
+        const draft = await API.apiFetch("/api/ai/draft-conversation-reply", {
+          method: "POST",
+          body: JSON.stringify({ conv, opts: { targetReplyId: msg.targetReplyId } }),
+        });
         if (!draft || !draft.allowReply) {
           return sendResponse({ ok: false, error: (draft && draft.error) || "AI không soạn được nháp." });
         }
@@ -776,7 +908,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           },
         });
         sendResponse({ ok: true, draft });
-      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -832,14 +967,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // (msg.userPitch) — đúng yêu cầu "gửi chào hàng theo nội dung user điền".
     case "GEN_PITCH": {
       (async () => {
-        const res = await draftPitch({
-          postText: msg.postText || "",
-          authorName: msg.authorName || "",
-          groupName: msg.groupName || "",
-          userPitch: msg.userPitch || "",
+        await readyPromise;
+        const res = await API.apiFetch("/api/ai/draft-pitch", {
+          method: "POST",
+          body: JSON.stringify({
+            postText: msg.postText || "",
+            authorName: msg.authorName || "",
+            groupName: msg.groupName || "",
+            userPitch: msg.userPitch || "",
+          }),
         });
         sendResponse(res);
-      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -996,13 +1138,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Soạn NHÁP trả lời (AI) cho một hội thoại có sẵn — KHÔNG tự gửi.
     case "GEN_INBOX_REPLY": {
       (async () => {
-        const res = await draftInboxReply({
-          contactName: msg.contactName || "",
-          messages: Array.isArray(msg.messages) ? msg.messages : [],
-          userHint: msg.userHint || "",
+        await readyPromise;
+        const res = await API.apiFetch("/api/ai/draft-inbox-reply", {
+          method: "POST",
+          body: JSON.stringify({
+            contactName: msg.contactName || "",
+            messages: Array.isArray(msg.messages) ? msg.messages : [],
+            userHint: msg.userHint || "",
+          }),
         });
         sendResponse(res);
-      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -1190,9 +1339,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "RUN_GROUP_PRICE_EXTRACTION": {
       (async () => {
         await readyPromise;
-        const result = await runGroupPriceExtraction();
+        // SERVER-SIDE AI: tiêm aiCall gọi /api/ai/extract-group-prices để key AI
+        // không rời server; phần nạp keyword/posts + lưu vẫn ở SW như cũ.
+        const result = await runGroupPriceExtraction({
+          aiCall: async (batch, sellKeywords) => {
+            const resp = await API.apiFetch("/api/ai/extract-group-prices", {
+              method: "POST",
+              body: JSON.stringify({ batch, sellKeywords }),
+            });
+            return (resp && resp.results) || [];
+          },
+        });
         sendResponse({ ok: true, ...result });
-      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
@@ -1202,9 +1364,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "RUN_LEAD_CLASSIFICATION": {
       (async () => {
         await readyPromise;
-        const result = await runLeadClassification();
+        // SERVER-SIDE AI: tiêm aiCall gọi /api/ai/classify-leads để key AI không
+        // rời server; phần chọn bài + rule + đào keyword vẫn ở SW như cũ.
+        const result = await runLeadClassification({
+          aiCall: async (batch) => {
+            const resp = await API.apiFetch("/api/ai/classify-leads", {
+              method: "POST",
+              body: JSON.stringify({ batch }),
+            });
+            return (resp && resp.results) || [];
+          },
+        });
         sendResponse({ ok: true, ...result });
-      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      })().catch((e) => {
+        const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        sendResponse({ ok: false, error: clean });
+      });
       return true;
     }
 
