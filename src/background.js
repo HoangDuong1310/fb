@@ -65,6 +65,13 @@ import {
   applyWatchConfig,
   processReplyWatch,
   initReplyWatch,
+  WARMING_ALARM,
+  getWarmingConfig,
+  applyWarmingConfig,
+  processWarming,
+  stopWarming,
+  scheduleNextWarming,
+  initWarming,
 } from "./crawl.js";
 import { runGroupPriceExtraction } from "./group-prices.js";
 import { runLeadClassification } from "./lead-classify.js";
@@ -1252,6 +1259,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    case "GET_WARMING_CONFIG": {
+      getWarmingConfig()
+        .then((config) => sendResponse({ ok: true, config }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "SET_WARMING_CONFIG": {
+      applyWarmingConfig(msg.config || {})
+        .then((config) => sendResponse({ ok: true, config }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Chạy NGAY một lượt nuôi tài khoản (nút bấm tay), bỏ qua cờ enabled.
+    case "WARMING_RUN_NOW": {
+      processWarming({ manual: true, actionsPerRun: msg.actionsPerRun })
+        .then((r) => sendResponse(r))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Người dùng bấm nút Dừng -> đặt cờ dừng để lượt đang chạy thoát sớm.
+    case "WARMING_STOP": {
+      sendResponse(stopWarming());
+      return true;
+    }
+
+    case "GET_WARMING_ACTIVITY": {
+      DB.getWarmingActivity({ limit: msg.limit })
+        .then((entries) => sendResponse({ ok: true, entries }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     // Phân tích MỘT bài theo yêu cầu (nút "AI phân tích") -> soạn nháp trả lời
     // ngay, KHÔNG lưu sẵn. Người dùng xem rồi tự copy / tạo việc bình luận.
     case "ANALYZE_POST": {
@@ -1719,10 +1761,16 @@ try {
     else if (a.name === AUTOCRAWL_ALARM) processAutoCrawl();
     else if (a.name === AUTOSYNC_ALARM) processAutoSync();
     else if (a.name === WATCH_ALARM) processReplyWatch();
+    else if (a.name === WARMING_ALARM) {
+      // Alarm một-lần: chạy lượt rồi TỰ lên lịch lượt kế tiếp (có dao động) để
+      // lịch trình không máy móc. Reschedule cả khi lượt lỗi/bị bỏ qua.
+      processWarming().finally(() => scheduleNextWarming());
+    }
   });
   initAutoCrawl();
   initAutoSync();
   initReplyWatch();
+  initWarming();
   // Dọn nguồn trùng "Linh kiện máy tính" đời cũ TRƯỚC khi seed lại 4 nguồn chuẩn.
   // PHẢI đợi readyPromise (token đã nạp vào cache) trước, nếu không các lệnh
   // getSources/saveSource bắn đi khi SW vừa thức dậy sẽ thiếu Authorization ->

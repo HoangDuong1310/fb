@@ -3,79 +3,54 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Group Radar — Crawler</title>
+    <title>Group Radar</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap"
       rel="stylesheet"
     />
     <style>
       /* =====================================================================
          Group Radar — popup, near-monochrome "Market Terminal" system.
-         Same restrained language as the dashboard (không màu mè), scaled to the
-         360px extension surface: graphite neutrals (chroma 0) carry the UI, one
-         quiet warm-sand accent (low chroma ~0.045) marks primary action (takes
-         DARK ink on solid fills), muted green/red only for price meaning,
-         JetBrains Mono on every figure, flat hairline borders — no puffy lifts.
-         OKLCH throughout.
+         Toàn bộ chức năng đã chuyển sang dashboard, nên popup rút gọn thành
+         một launcher tối giản: chỉ mở bảng quản lý. Vẫn giữ nguyên ngôn ngữ
+         thiết kế của dashboard (graphite neutrals + một accent warm-sand).
          ===================================================================== */
       :root {
         color-scheme: dark;
 
-        /* ---- Graphite surface ramp (neutral, chroma 0) ---- */
         --bg: oklch(0.155 0 0);
         --surface: oklch(0.19 0 0);
         --surface-2: oklch(0.225 0 0);
-        --surface-3: oklch(0.262 0 0);
         --ink: oklch(0.96 0 0);
         --ink-soft: oklch(0.765 0 0);
         --ink-faint: oklch(0.6 0 0);
         --line: oklch(0.3 0 0);
         --line-soft: oklch(0.255 0 0);
 
-        /* ---- Restrained accent — a quiet warm sand, used sparingly ---- */
         --accent: oklch(0.745 0.045 80);
         --accent-bright: oklch(0.8 0.05 82);
-        --accent-soft: oklch(0.285 0.014 80);
         --accent-ink: oklch(0.8 0.04 82);
         --on-accent: oklch(0.2 0.012 80);
         --accent-ring: oklch(0.745 0.045 80 / 0.4);
 
-        /* ---- Aliases kept so inline var(--primary)/var(--ring) still resolve ---- */
-        --primary: var(--accent);
-        --ring: var(--accent-ring);
-
-        /* ---- Semantic state — muted, functional only ---- */
-        --green: oklch(0.72 0.085 150);
-        --red: oklch(0.64 0.115 25);
-        --red-soft: oklch(0.285 0.05 25);
-        --danger: var(--red);
-        --danger-soft: var(--red-soft);
-        --ok: var(--green);
-
-        /* ---- Radius: tight, instrument-like ---- */
         --r-sm: 6px;
         --r-md: 9px;
-        --r-lg: 12px;
 
-        /* ---- Motion ---- */
         --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
         --t-fast: 0.12s;
         --t-mid: 0.18s;
 
-        /* ---- Type ---- */
         --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
           "Helvetica Neue", Arial, "Noto Sans", sans-serif;
         --font-display: "Space Grotesk", var(--font);
-        --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo,
-          Consolas, monospace;
       }
 
       * { box-sizing: border-box; }
 
       body {
-        width: 360px;
+        width: 300px;
         margin: 0;
         font-family: var(--font);
         background: var(--bg);
@@ -86,25 +61,16 @@
         text-rendering: optimizeLegibility;
       }
 
-      /* Quiet terminal scrollbar */
-      * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
-      *::-webkit-scrollbar { width: 8px; height: 8px; }
-      *::-webkit-scrollbar-thumb {
-        background: var(--line);
-        border-radius: 99px;
-        border: 2px solid transparent;
-        background-clip: content-box;
-      }
-      *::-webkit-scrollbar-track { background: transparent; }
+      ::selection { background: oklch(0.285 0.014 80); color: var(--ink); }
 
-      ::selection { background: var(--accent-soft); color: var(--ink); }
-
-      /* ---- Header: brand bar with an amber signal rail ---- */
+      /* ---- Brand header with amber signal rail ---- */
       header {
         position: relative;
+        display: flex;
+        align-items: center;
+        gap: 11px;
         background: var(--surface);
-        color: var(--ink);
-        padding: 14px 16px;
+        padding: 16px;
         border-bottom: 1px solid var(--line);
       }
       header::before {
@@ -116,195 +82,70 @@
         width: 3px;
         background: var(--accent);
       }
-      header h1 {
+      .logo {
+        display: grid;
+        place-items: center;
+        width: 34px;
+        height: 34px;
+        flex: none;
+        border-radius: var(--r-md);
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        color: var(--accent-ink);
+      }
+      .logo svg { width: 18px; height: 18px; }
+      .brand h1 {
         font-family: var(--font-display);
         font-size: 15px;
         margin: 0;
         font-weight: 600;
         letter-spacing: -0.015em;
       }
-      header p {
-        margin: 4px 0 0;
+      .brand p {
+        margin: 2px 0 0;
         font-size: 11px;
         color: var(--ink-soft);
       }
 
-      /* ---- Sections ---- */
-      .section {
-        padding: 13px 16px;
-        border-bottom: 1px solid var(--line-soft);
-      }
-      h2 {
-        font-family: var(--font);
-        font-size: 11px;
-        margin: 0 0 9px;
-        color: var(--ink-faint);
-        font-weight: 600;
-        letter-spacing: 0.02em;
-      }
-
-      .row { display: flex; gap: 8px; align-items: center; }
-      .row + .row { margin-top: 8px; }
-      label { color: var(--ink-soft); flex: 1; }
-
-      /* ---- Inputs ---- */
-      input[type="number"] {
-        width: 76px;
-        padding: 7px 9px;
-        border: 1px solid var(--line);
-        border-radius: var(--r-sm);
-        font-size: 13px;
-        font-family: var(--font-mono);
-        font-feature-settings: "tnum" 1, "zero" 1;
-        background: var(--surface-2);
-        color: var(--ink);
-        outline: none;
-        text-align: right;
-        transition: border-color var(--t-fast), box-shadow var(--t-fast);
-      }
-      input.full {
-        width: 100%;
-        padding: 8px 10px;
-        border: 1px solid var(--line);
-        border-radius: var(--r-sm);
+      /* ---- Body ---- */
+      .body { padding: 16px; }
+      .lede {
+        margin: 0 0 14px;
         font-size: 12px;
-        font-family: inherit;
-        background: var(--surface-2);
-        color: var(--ink);
-        outline: none;
-        transition: border-color var(--t-fast), box-shadow var(--t-fast);
+        color: var(--ink-soft);
       }
-      input::placeholder { color: var(--ink-faint); }
-      input:focus,
-      input:focus-visible {
-        border-color: var(--accent);
-        box-shadow: 0 0 0 3px var(--accent-ring);
-      }
-
-      /* ---- Buttons: flat, hairline; solid amber takes dark ink ---- */
-      button {
-        border: 1px solid transparent;
-        border-radius: var(--r-sm);
-        padding: 9px 12px;
-        font-size: 13px;
-        font-weight: 600;
-        font-family: inherit;
-        cursor: pointer;
-        transition: background var(--t-fast), border-color var(--t-fast),
-          color var(--t-fast);
-      }
-      button:focus-visible {
-        outline: none;
-        box-shadow: 0 0 0 3px var(--accent-ring);
-      }
-      button:disabled { opacity: 0.5; cursor: not-allowed; }
 
       .btn-primary {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        width: 100%;
+        padding: 12px 14px;
+        border: 1px solid transparent;
+        border-radius: var(--r-sm);
+        font-size: 13px;
+        font-weight: 600;
+        font-family: inherit;
+        cursor: pointer;
         background: var(--accent);
         color: var(--on-accent);
-        flex: 1;
+        transition: background var(--t-fast), transform var(--t-fast) var(--ease-out);
       }
-      .btn-primary:hover:not(:disabled) { background: var(--accent-bright); }
+      .btn-primary:hover { background: var(--accent-bright); }
+      .btn-primary:active { transform: translateY(1px); }
+      .btn-primary:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .btn-primary svg { width: 16px; height: 16px; }
 
-      .btn-soft {
-        background: var(--surface-2);
-        color: var(--ink);
-        border-color: var(--line);
+      .hint {
+        margin: 12px 0 0;
+        font-size: 11px;
+        color: var(--ink-faint);
+        text-align: center;
       }
-      .btn-soft:hover:not(:disabled) {
-        border-color: var(--accent);
-        color: var(--accent-ink);
-      }
-
-      .btn-danger {
-        background: transparent;
-        color: var(--red);
-        border-color: var(--red-soft);
-      }
-      .btn-danger:hover:not(:disabled) {
-        background: var(--red-soft);
-        border-color: var(--red);
-      }
-
-      .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-
-      /* ---- Status readout — reads like a terminal line ---- */
-      .status {
-        background: var(--surface);
-        border: 1px solid var(--line-soft);
-        border-left: 2px solid var(--line);
-        border-radius: var(--r-sm);
-        padding: 10px 11px;
-        font-size: 12px;
-        min-height: 38px;
-        white-space: pre-wrap;
-        color: var(--ink-soft);
-      }
-      .status.ok { color: var(--green); border-left-color: var(--green); }
-      .status.err { color: var(--red); border-left-color: var(--red); }
-
-      /* ---- Saved-data figures ---- */
-      .stat-line {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        padding: 4px 0;
-      }
-      .stat-line b {
-        font-weight: 600;
-        font-family: var(--font-mono);
-        font-feature-settings: "tnum" 1, "zero" 1;
-        color: var(--ink);
-      }
-      .muted { color: var(--ink-faint); font-size: 11px; }
-
-      .groups { max-height: 120px; overflow: auto; margin-top: 8px; }
-      .group-item {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        padding: 5px 0;
-        border-top: 1px solid var(--line-soft);
-      }
-      .group-item b {
-        font-family: var(--font-mono);
-        font-feature-settings: "tnum" 1, "zero" 1;
-        color: var(--accent-ink);
-      }
-
-      /* ---- Auth bar ---- */
-      .authbar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 9px 16px;
-        background: var(--surface-2);
-        border-bottom: 1px solid var(--line);
-      }
-      .authbar .name { font-weight: 600; }
-      .auth-actions { margin-top: 10px; }
-
-      /* ---- Remember-account row: align the native checkbox with its label ---- */
-      .remember-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex: none;
-        color: var(--ink-soft);
-        cursor: pointer;
-        user-select: none;
-      }
-      .remember-row input[type="checkbox"] {
-        width: 15px;
-        height: 15px;
-        margin: 0;
-        accent-color: var(--accent);
-        cursor: pointer;
-      }
-
-      /* ---- Inline links ---- */
-      a { color: var(--accent-ink); }
-      a:hover { color: var(--accent-bright); }
 
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after {
@@ -316,131 +157,34 @@
   </head>
   <body>
     <header>
-      <h1>Group Radar — Crawl bài viết mới</h1>
-      <p>Chỉ lấy bài MỚI từ nhóm đang mở • lưu IndexedDB</p>
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <circle cx="12" cy="12" r="4.5" />
+          <circle cx="12" cy="12" r="1" fill="currentColor" />
+        </svg>
+      </div>
+      <div class="brand">
+        <h1>Group Radar</h1>
+        <p>Trung tâm quản lý</p>
+      </div>
     </header>
 
-    <div id="authBar" class="authbar" hidden>
-      <span id="authName" class="name"></span>
-      <button id="btnLogout" class="btn-soft">Đăng xuất</button>
-    </div>
-
-    <div id="loginSection" class="section" hidden>
-      <h2>Đăng nhập</h2>
-      <input type="email" id="loginEmail" class="full" placeholder="Email" autocomplete="username" />
-      <input type="password" id="loginPassword" class="full" placeholder="Mật khẩu" autocomplete="current-password" style="margin-top: 8px;" />
-      <label class="remember-row" style="margin-top: 10px;">
-        <input type="checkbox" id="rememberMe" />
-        <span>Ghi nhớ tài khoản</span>
-      </label>
-      <div class="auth-actions row">
-        <button id="btnLogin" class="btn-primary">Đăng nhập</button>
-      </div>
-      <div id="loginError" class="status err" style="margin-top: 8px;" hidden></div>
-      <p class="muted" style="margin: 10px 0 0;">
-        Chưa có tài khoản?
-        <a href="#" id="linkShowRegister" style="color: var(--primary); font-weight: 600;">Đăng ký</a>
+    <div class="body">
+      <p class="lede">
+        Toàn bộ tính năng — nhóm, crawl, bài viết, đăng &amp; bình luận tự động —
+        đều nằm trong bảng quản lý.
       </p>
-    </div>
-
-    <div id="registerSection" class="section" hidden>
-      <h2>Đăng ký</h2>
-      <input type="text" id="registerName" class="full" placeholder="Tên hiển thị (tuỳ chọn)" autocomplete="name" />
-      <input type="email" id="registerEmail" class="full" placeholder="Email" autocomplete="username" style="margin-top: 8px;" />
-      <input type="password" id="registerPassword" class="full" placeholder="Mật khẩu (tối thiểu 6 ký tự)" autocomplete="new-password" style="margin-top: 8px;" />
-      <div class="auth-actions row">
-        <button id="btnRegister" class="btn-primary">Tạo tài khoản</button>
-      </div>
-      <div id="registerError" class="status err" style="margin-top: 8px;" hidden></div>
-      <p class="muted" style="margin: 10px 0 0;">
-        Đã có tài khoản?
-        <a href="#" id="linkShowLogin" style="color: var(--primary); font-weight: 600;">Đăng nhập</a>
-      </p>
-    </div>
-
-    <div id="appSection" hidden>
-    <div class="section">
-      <button id="btnDashboard" class="btn-primary" style="width: 100%; padding: 12px;">
-        📊 Mở bảng quản lý
+      <button id="btnDashboard" class="btn-primary" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="9" rx="1" />
+          <rect x="14" y="3" width="7" height="5" rx="1" />
+          <rect x="14" y="12" width="7" height="9" rx="1" />
+          <rect x="3" y="16" width="7" height="5" rx="1" />
+        </svg>
+        Mở bảng quản lý
       </button>
-      <p class="muted" style="margin: 8px 0 0;">
-        Quản lý nhóm, crawl theo nhóm, bài viết đã lưu, tự động đăng &amp; bình luận.
-      </p>
-    </div>
-
-    <div class="section">
-      <h2>Tuỳ chọn crawl</h2>
-      <div class="row">
-        <label for="maxNewPosts">Tối đa số bài mới</label>
-        <input type="number" id="maxNewPosts" value="100" min="1" max="2000" />
-      </div>
-      <div class="row">
-        <label for="stopAfterKnown">Dừng sau N bài cũ liên tiếp</label>
-        <input type="number" id="stopAfterKnown" value="8" min="1" max="100" />
-      </div>
-      <div class="row">
-        <label for="scrollDelay">Chờ sau mỗi lần cuộn (ms)</label>
-        <input type="number" id="scrollDelay" value="1500" min="400" max="8000" step="100" />
-      </div>
-      <div class="row" style="margin-top: 10px;">
-        <button id="btnStart" class="btn-primary">Bắt đầu crawl</button>
-        <button id="btnStop" class="btn-soft" disabled>Dừng</button>
-      </div>
-    </div>
-
-    <div class="section">
-      <h2>Trạng thái</h2>
-      <div id="status" class="status">Mở trang nhóm Facebook rồi bấm "Bắt đầu crawl".</div>
-    </div>
-
-    <div class="section">
-      <h2>Dữ liệu đã lưu</h2>
-      <div class="stat-line"><span>Tổng số bài</span><b id="totalCount">0</b></div>
-      <div id="groupList" class="groups"></div>
-    </div>
-
-    <div class="section">
-      <h2>Selector AI (crawl theo phần tử)</h2>
-      <div class="row">
-        <label for="aiApiBase">API Base URL</label>
-      </div>
-      <input type="text" id="aiApiBase" class="full" placeholder="https://danglamgiau.com/v1" />
-      <div class="row" style="margin-top: 8px;">
-        <label for="aiApiKey">API Key</label>
-      </div>
-      <input type="password" id="aiApiKey" class="full" placeholder="Bearer key của bạn" />
-      <div class="row" style="margin-top: 8px;">
-        <label for="aiModel">Model</label>
-      </div>
-      <input type="text" id="aiModel" class="full" placeholder="gpt-5.5" />
-      <div class="grid2" style="margin-top: 10px;">
-        <button id="btnSaveAI" class="btn-soft">Lưu cấu hình</button>
-        <button id="btnDiscover" class="btn-primary">Khám phá selector</button>
-      </div>
-      <div class="grid2" style="margin-top: 8px;">
-        <button id="btnViewSelectors" class="btn-soft">Xem selector</button>
-        <button id="btnClearSelectors" class="btn-danger">Xoá selector</button>
-      </div>
-      <div id="selectorBox" class="status" style="margin-top: 8px;">Chưa có selector. Mở 1 bài trong nhóm rồi bấm "Khám phá selector".</div>
-      <p class="muted" style="margin: 8px 0 0;">
-        AI chỉ gọi 1 lần để tạo selector. Khi Facebook đổi giao diện, bấm khám phá lại.
-      </p>
-    </div>
-
-    <div class="section">
-      <h2>Xuất & quản lý</h2>
-      <div class="grid2">
-        <button id="btnExportJson" class="btn-soft">Xuất JSON</button>
-        <button id="btnExportCsv" class="btn-soft">Xuất CSV</button>
-      </div>
-      <div class="grid2" style="margin-top: 8px;">
-        <button id="btnRefresh" class="btn-soft">Làm mới số liệu</button>
-        <button id="btnClear" class="btn-danger">Xoá toàn bộ</button>
-      </div>
-      <p class="muted" style="margin: 10px 0 0;">
-        Extension tự chuyển nhóm về chế độ "Bài viết mới" (chronological) trước khi crawl, nên bạn không cần đặt thủ công.
-      </p>
-    </div>
+      <p class="hint">Mở trong tab mới hoặc chuyển tới tab đang mở.</p>
     </div>
 
     <script src="popup.js"></script>

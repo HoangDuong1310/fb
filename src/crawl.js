@@ -210,20 +210,20 @@ async function crawlGroupInTab(groupId, options) {
  *    trả về undefined => phải bắt để không "nuốt" lỗi.
  *  - Có retry ngắn phòng khi tạo tab trượt.
  *
- * QUAN TRỌNG — TAB PHẢI ACTIVE + CỬA SỔ PHẢI FOCUSED:
- *  Gốc rễ đã xác nhận qua nhiều lần probe: tab/cửa sổ KHÔNG được foreground thì
- *  Chrome throttle requestAnimationFrame / IntersectionObserver-batching — đúng
- *  cơ chế mà Facebook Comet dùng để lazy-load feed khi cuộn. Hậu quả: seen đứng
- *  yên, scrollH thấp, KHÔNG có GroupsCometFeedRegularStoriesPaginationQuery.
- *  Vì vậy tab crawl phải là tab ACTIVE của một cửa sổ ĐANG FOCUS.
- *
- *  Đánh đổi (user đã đồng ý, chỉ xảy ra 1 LẦN cho tới khi khuôn hết hạn/bị FB
- *  đổi doc_id): tab crawl nhấp lên foreground vài giây để bắt khuôn. KHÔNG ép
- *  `state` cửa sổ (không resize/un-maximize cửa sổ của người dùng).
+ * THAM SỐ `active`:
+ *  - active=true  => tab foreground + cửa sổ được focus. BẮT BUỘC cho lần đầu
+ *    BẮT KHUÔN GQL: khi tab KHÔNG foreground, Chrome throttle
+ *    requestAnimationFrame / IntersectionObserver-batching — đúng cơ chế
+ *    Facebook Comet dùng để lazy-load feed khi cuộn => feed không tải thêm,
+ *    KHÔNG có GroupsCometFeedRegularStoriesPaginationQuery để bắt khuôn.
+ *  - active=false => tab mở NỀN, KHÔNG chiếm focus, KHÔNG giật tab người dùng.
+ *    Chỉ an toàn khi ĐÃ CÓ khuôn: lúc đó content.js replay bằng fetch (KHÔNG bị
+ *    throttle ở tab nền) nên crawl vẫn chạy đủ trang.
+ *  KHÔNG bao giờ ép `state` cửa sổ (không resize/un-maximize cửa sổ người dùng).
  *
  * Trả về { tab, windowId, kind:"tab" } khi thành công, hoặc { error } khi thất bại.
  */
-async function openHiddenCrawlTab(url) {
+async function openHiddenCrawlTab(url, active = true) {
   // Tìm cửa sổ trình duyệt "normal" đang/được focus gần nhất để đặt tab crawl
   // vào đó (thay vì bung một popup mới). Nếu không có, chrome.tabs.create sẽ tự
   // dùng cửa sổ hiện tại (hoặc tạo mới) — vẫn chấp nhận được.
@@ -267,8 +267,9 @@ async function openHiddenCrawlTab(url) {
     });
 
   const target = await getFocusedNormalWindow();
-  // active:true => tab thành tab foreground của cửa sổ => không bị throttle.
-  const tabOpts = { url, active: true };
+  // active=true => tab foreground (không bị throttle) — cho lần bắt khuôn.
+  // active=false => tab mở NỀN, không chiếm focus của người dùng.
+  const tabOpts = { url, active: active === true };
   if (target && target.id) tabOpts.windowId = target.id;
 
   let lastErr = "";
@@ -276,7 +277,9 @@ async function openHiddenCrawlTab(url) {
     const { tab, err } = await createTab(tabOpts);
     if (err) lastErr = err;
     if (tab) {
-      await focusWindow(tab.windowId);
+      // CHỈ ép cửa sổ lên foreground khi mở tab active. Mở nền => giữ nguyên
+      // cửa sổ/tab hiện tại của người dùng.
+      if (active === true) await focusWindow(tab.windowId);
       return { tab, windowId: tab.windowId, kind: "tab" };
     }
     await sleep(400); // nghỉ ngắn rồi thử lại
@@ -291,16 +294,22 @@ async function openHiddenCrawlTab(url) {
  * Mở tab nhóm rồi khởi động crawl QUA API (sniff + replay) trong tab đó.
  * Khác crawlGroupInTab ở chỗ gửi START_API_CRAWL thay vì START_CRAWL.
  * Tiến trình phát qua broadcast CRAWL_PROGRESS / CRAWL_DONE.
+ *
+ * `active` quyết định tab mở foreground hay NỀN:
+ *  - active=true  => tab foreground (bắt buộc cho lần bắt khuôn GQL đầu tiên vì
+ *    tab nền bị Chrome throttle rAF/IntersectionObserver => feed không lazy-load).
+ *  - active=false => tab mở NỀN, KHÔNG chiếm focus của người dùng. An toàn khi
+ *    ĐÃ CÓ khuôn: content.js replay bằng fetch (không bị throttle ở tab nền).
  */
-async function crawlGroupApiInTab(groupId, options) {
+async function crawlGroupApiInTab(groupId, options, active = true) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
   // Ép feed về "Bài viết mới" (CHRONOLOGICAL) để replay phân trang lấy đúng thứ tự.
   const url = withNewestSort("https://www.facebook.com/groups/" + groupId + "/");
-  // Mở 1 TAB ACTIVE trong cửa sổ hiện tại (không popup riêng). Tab foreground =>
-  // Chrome không throttle rAF/IntersectionObserver => FB lazy-load feed bình thường.
-  // IP/fingerprint THẬT của trình duyệt user => giảm rủi ro checkpoint.
-  // Vì crawl API chạy TUẦN TỰ nên chỉ 1 tab active tại một thời điểm.
-  const opened = await openHiddenCrawlTab(url);
+  // Mở 1 tab nhóm trong cửa sổ hiện tại (không popup riêng). content.js replay
+  // NGAY TRONG TRANG => request mang cookie/IP/header THẬT do trang FB phát ra
+  // (không giả mạo qua declarativeNetRequest) => ít bị nghi ngờ nhất.
+  // Vì crawl API chạy TUẦN TỰ nên chỉ 1 tab tại một thời điểm.
+  const opened = await openHiddenCrawlTab(url, active);
   const tab = opened && opened.tab;
   if (!tab) {
     return {
@@ -335,38 +344,61 @@ async function crawlGroupApiInTab(groupId, options) {
 }
 
 /**
- * BỘ ĐỊNH TUYẾN crawl API — quyết định mở tab hay chạy ẩn:
- *  - ĐÃ CÓ khuôn GQL trong storage => crawlGroupApiTabless: KHÔNG mở tab, KHÔNG
- *    đụng tới tab/cửa sổ của người dùng (không resize, không nhảy tab). Khuôn
- *    dùng chung cho MỌI nhóm nên chỉ cần bắt 1 lần.
- *  - CHƯA CÓ khuôn => phải mở 1 tab foreground 1 LẦN (crawlGroupApiInTab) để FB
- *    bắn feed query mà hook bắt lấy khuôn (content.js tự lưu vào storage). Các
- *    lần crawl sau sẽ tự động chuyển sang nhánh tabless ở trên.
+ * BỘ ĐỊNH TUYẾN crawl API — LUÔN dùng TIER-2 (replay-TRONG-TRANG) cho AN TOÀN
+ * TỐI ĐA. Chỉ khác nhau ở chỗ tab mở FOREGROUND hay NỀN:
  *
- * Nhờ vậy, trải nghiệm mặc định là "cào ngầm" — người dùng không bị giật tab
- * hay đổi kích thước cửa sổ ở mỗi lần crawl.
+ *  - Công tắc "Focus tab khi chạy nhiệm vụ" BẬT => mở tab foreground (nhảy lên
+ *    trước mặt người dùng như cũ).
+ *  - Công tắc TẮT (mặc định) + ĐÃ CÓ khuôn GQL => mở tab NỀN (active:false,
+ *    KHÔNG chiếm focus). MẤU CHỐT: ở tab nền Chrome ĐÓNG BĂNG
+ *    requestAnimationFrame/IntersectionObserver (cơ chế lazy-load của FB) nên
+ *    FB KHÔNG tự bắn feed request => KHÔNG thể sniff khuôn kiểu cũ (treo tới khi
+ *    bấm vào tab). Cách vá: content.js SEED lại khuôn đã lưu trong storage, chỉ
+ *    làm mới fb_dtsg/lsd từ HTML trang (DOM vẫn có sẵn dù lazy-load bị băng),
+ *    rồi replay TRANG 1 + các trang sau bằng MAIN-world fetch. fetch KHÔNG bị
+ *    Chrome throttle ở tab nền nên crawl chạy đủ. Người dùng chỉ thấy 1 tab mở
+ *    ngầm phía sau, không bị giật màn hình.
+ *  - Công tắc TẮT nhưng CHƯA CÓ khuôn (lần crawl đầu tiên, storage trống) =>
+ *    buộc mở 1 tab FOREGROUND DUY NHẤT 1 lần để FB lazy-load feed mà hook bắt
+ *    khuôn (tab nền bị throttle rAF/IntersectionObserver nên KHÔNG lazy-load
+ *    được). Sau khi có khuôn, các lần/nhóm sau tự chuyển sang tab nền (seed).
+ *
+ * TIER-3 = crawlGroupApiTabless (service worker fetch + DNR ghi đè header) CHỈ
+ * chạy khi người gọi CHỦ ĐỘNG bật cờ preferTabless. Nhẹ hơn nhưng rủi ro hơn vì
+ * header do extension dựng lại, không phải do trang FB phát ra => KHÔNG dùng mặc
+ * định nữa.
+ *
+ * LƯU Ý về crawl hàng loạt (Tools.tsx: advanceQueue): tab nền giữ nguyên
+ * dashboard ở foreground nên setTimeout hàng đợi KHÔNG bị throttle => crawl
+ * chạy hết mọi nhóm thay vì dừng sau nhóm đầu.
  */
 async function crawlGroupApiSmart(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
   const opts = options || {};
 
-  // AN TOÀN TUYỆT ĐỐI (mặc định): ưu tiên TIER-2 = replay-TRONG-TRANG.
-  // Mở 1 tab nhóm (credential/cookie/header THẬT của trình duyệt user, KHÔNG
-  // giả mạo header qua declarativeNetRequest), rồi content.js replay ngay
-  // trong ngữ cảnh trang => request giống hệt lúc user tự cuộn feed. Đây là
-  // đường ít bị FB nghi ngờ nhất.
-  //
-  // TIER-3 = crawlGroupApiTabless (service worker fetch + DNR ghi đè header)
-  // chỉ dùng khi người gọi CHỦ ĐỘNG bật cờ preferTabless. Nhanh/nhẹ hơn nhưng
-  // rủi ro hơn vì header do extension dựng lại, không phải do trang FB phát ra.
+  // Người gọi CHỦ ĐỘNG chọn tabless (TIER-3) => tôn trọng.
   if (opts.preferTabless === true) {
-    const tpl = await getStoredGqlTemplate();
-    if (tpl && tpl.doc_id) {
-      return crawlGroupApiTabless(groupId, options);
-    }
-    // Chưa có khuôn để chạy tabless => vẫn phải mở tab bắt khuôn trước.
+    return crawlGroupApiTabless(groupId, options);
   }
-  return crawlGroupApiInTab(groupId, options);
+
+  let focusOn = false;
+  try {
+    focusOn = (await shouldFocusTabs()) === true;
+  } catch (_) {
+    focusOn = false; // đọc setting lỗi => coi như focus TẮT (mặc định)
+  }
+
+  // Focus BẬT => tab foreground như cũ.
+  if (focusOn) {
+    return crawlGroupApiInTab(groupId, options, true);
+  }
+
+  // Focus TẮT: nếu ĐÃ CÓ khuôn => mở tab NỀN (không chiếm focus). Chưa có khuôn
+  // => buộc mở foreground 1 lần để bắt khuôn (tab nền bị throttle không lazy-load
+  // được feed).
+  const tpl = await getStoredGqlTemplate();
+  const active = !(tpl && tpl.doc_id);
+  return crawlGroupApiInTab(groupId, options, active);
 }
 
 /* ----------------------- CRAWL KHÔNG-TAB (Mức B) ------------------------- */
@@ -2641,6 +2673,1060 @@ async function initReplyWatch() {
   } catch (e) {}
 }
 
+/* -------------------- NUÔI TÀI KHOẢN (WARMING, alarms) ---------------- */
+//
+// AN TOÀN TÀI KHOẢN — "nuôi" = mô phỏng hành vi người dùng thật một cách THỤ
+// ĐỘNG để giữ tài khoản "ấm" (đáng tin) trước/xen kẽ các tác vụ đăng bài & nhắn
+// tin. TẤT CẢ hành động đều READ-ONLY (cuộn feed, xem video vài giây, mở thông
+// báo) — KHÔNG like/comment/share/gửi để tránh bị gắn cờ spam.
+//
+//  - Chỉ mở 1 tab nền/lần, làm xong ĐÓNG ngay (như watch/inbox).
+//  - Dùng chung NGẮT MẠCH: đang bị FB chặn thì bỏ qua CẢ lượt, không mở tab nào.
+//  - Giãn cách ngẫu nhiên giữa các hành động để không đều như máy.
+//  - Mỗi hành động ghi NHẬT KÝ lên SERVER theo tài khoản qua
+//    DB.recordWarmingActivity (KHÔNG dùng chrome.storage.local).
+
+const WARMING_KEY = "warmingConfig";
+const WARMING_ALARM = "warming";
+// Các loại hành động hợp lệ. 3 loại đầu + scrollGroups là THỤ ĐỘNG (READ-ONLY).
+// reactPost là hành động GHI (thả cảm xúc) — chỉ chạy xác suất thấp, xem
+// WARMING_REACT_CHANCE bên dưới.
+const WARMING_ACTIONS = [
+  "scrollFeed",
+  "watchVideo",
+  "openNotifications",
+  "scrollGroups",
+  "scrollReels",
+  "reactPost",
+  "reactReels",
+];
+
+// Các hành động GHI (tương tác thật). Chúng KHÔNG được tính vào việc bốc read-only
+// và mỗi loại chỉ chạy theo xác suất thấp, tối đa 1 tương tác/lượt. reactReels =
+// thả cảm xúc cho Reels (thước phim). Rất dễ dính checkpoint nếu lạm dụng.
+const WARMING_WRITE_ACTIONS = ["reactPost", "reactReels"];
+
+// reactPost/reactReels RẤT dễ khiến tài khoản mới dính checkpoint nếu thả cảm xúc
+// liên tục. Vì vậy dù người dùng có bật, mỗi lượt CHỈ ~30% khả năng thực sự thả,
+// và tối đa 1 tương tác/loại. Đây là điểm mấu chốt để "giống người".
+const WARMING_REACT_CHANCE = 0.3;
+
+// Biên độ dao động thời gian giữa các lượt (±40%). Người thật không vào FB đúng
+// mỗi X phút như máy -> mỗi lần lệch ngẫu nhiên trong khoảng này.
+const WARMING_JITTER = 0.4;
+
+// Khung "giờ ngủ" (giờ địa phương): bỏ qua/lùi lượt rơi vào khoảng này cho giống
+// nhịp sinh hoạt người thật. [0h, 6h).
+const WARMING_QUIET_START = 0;
+const WARMING_QUIET_END = 6;
+
+// Mặc định TẮT; chu kỳ tính bằng phút (kẹp 15..1440 = 24 giờ). `actionsPerRun`
+// KHÔNG còn là "làm đúng N việc" mà là SỐ VIỆC TỐI ĐA mỗi lượt — mỗi lượt bốc
+// ngẫu nhiên từ 1..N việc trong số các loại đã bật (mỗi loại nhiều nhất 1 lần).
+// Mặc định chỉ bật các hành động READ-ONLY; reactPost để người dùng tự chọn.
+const WARMING_DEFAULT = {
+  enabled: false,
+  intervalMinutes: 90,
+  actionsPerRun: 3,
+  actions: ["scrollFeed", "watchVideo", "openNotifications", "scrollGroups", "scrollReels"],
+};
+
+/** Lọc danh sách hành động về các loại hợp lệ; luôn còn tối thiểu 1 loại. */
+function normalizeWarmingActions(list) {
+  const arr = Array.isArray(list) ? list.filter((a) => WARMING_ACTIONS.includes(a)) : [];
+  const uniq = Array.from(new Set(arr));
+  return uniq.length ? uniq : WARMING_DEFAULT.actions.slice();
+}
+
+/** Đọc cấu hình nuôi tài khoản từ server theo tài khoản, trộn với mặc định. */
+async function getWarmingConfig() {
+  const saved = (await DB.getSetting(WARMING_KEY)) || {};
+  return {
+    enabled: !!saved.enabled,
+    intervalMinutes: Math.max(
+      15,
+      Math.min(1440, parseInt(saved.intervalMinutes, 10) || WARMING_DEFAULT.intervalMinutes)
+    ),
+    actionsPerRun: Math.max(
+      1,
+      Math.min(8, parseInt(saved.actionsPerRun, 10) || WARMING_DEFAULT.actionsPerRun)
+    ),
+    actions: normalizeWarmingActions(saved.actions),
+  };
+}
+
+/**
+ * Tính độ trễ (phút) cho LƯỢT KẾ TIẾP theo kiểu người thật:
+ *  - Lệch ngẫu nhiên quanh chu kỳ gốc ±WARMING_JITTER (vd 90' -> 54'..126').
+ *  - Nếu thời điểm bắn rơi vào "giờ ngủ" [0h,6h) -> lùi tới ~7-8h sáng.
+ * Trả về số phút (>= 15) để dùng với chrome.alarms { delayInMinutes }.
+ */
+function warmingNextDelayMinutes(baseMinutes, now = new Date()) {
+  const base = Math.max(15, Math.min(1440, baseMinutes || WARMING_DEFAULT.intervalMinutes));
+  const factor = 1 + (Math.random() * 2 - 1) * WARMING_JITTER; // 0.6..1.4
+  let delay = Math.max(15, Math.round(base * factor));
+  // Kiểm tra giờ bắn dự kiến; nếu rơi vào khung ngủ thì lùi tới sáng.
+  const fireAt = new Date(now.getTime() + delay * 60000);
+  const h = fireAt.getHours();
+  const inQuiet =
+    WARMING_QUIET_START <= WARMING_QUIET_END
+      ? h >= WARMING_QUIET_START && h < WARMING_QUIET_END
+      : h >= WARMING_QUIET_START || h < WARMING_QUIET_END;
+  if (inQuiet) {
+    // Lùi tới WARMING_QUIET_END giờ sáng + 0..90' ngẫu nhiên (tránh mọi máy bật
+    // cùng lúc). Cộng dồn từ thời điểm bắn dự kiến.
+    const wake = new Date(fireAt);
+    wake.setHours(WARMING_QUIET_END, 0, 0, 0);
+    if (wake.getTime() <= fireAt.getTime()) wake.setDate(wake.getDate() + 1);
+    wake.setTime(wake.getTime() + Math.floor(Math.random() * 90) * 60000);
+    delay = Math.max(15, Math.round((wake.getTime() - now.getTime()) / 60000));
+  }
+  return delay;
+}
+
+/**
+ * Đặt lịch cho LƯỢT KẾ TIẾP bằng alarm MỘT-LẦN (delayInMinutes) thay vì
+ * periodInMinutes cố định. Sau mỗi lần bắn, caller phải gọi lại hàm này để tự
+ * lên lịch lượt sau -> lịch trình dao động, không máy móc. Nếu đã tắt -> xóa
+ * alarm.
+ */
+async function scheduleNextWarming() {
+  const cfg = await getWarmingConfig();
+  try {
+    await chrome.alarms.clear(WARMING_ALARM);
+    if (cfg.enabled) {
+      const delay = warmingNextDelayMinutes(cfg.intervalMinutes);
+      chrome.alarms.create(WARMING_ALARM, { delayInMinutes: delay });
+    }
+  } catch (e) {}
+}
+
+/** Lưu cấu hình + đặt lại lịch (một-lần, có dao động) theo trạng thái bật/tắt. */
+async function applyWarmingConfig(input) {
+  const current = await getWarmingConfig();
+  const next = {
+    enabled: input.enabled != null ? !!input.enabled : current.enabled,
+    intervalMinutes:
+      input.intervalMinutes != null
+        ? Math.max(
+            15,
+            Math.min(1440, parseInt(input.intervalMinutes, 10) || current.intervalMinutes)
+          )
+        : current.intervalMinutes,
+    actionsPerRun:
+      input.actionsPerRun != null
+        ? Math.max(1, Math.min(8, parseInt(input.actionsPerRun, 10) || current.actionsPerRun))
+        : current.actionsPerRun,
+    actions: input.actions != null ? normalizeWarmingActions(input.actions) : current.actions,
+  };
+  await writeSetting(WARMING_KEY, next);
+  await scheduleNextWarming();
+  return next;
+}
+
+/**
+ * IN-PAGE: cuộn feed như người thật đang lướt — cuộn xuống nhiều nhịp có nghỉ,
+ * thỉnh thoảng cuộn ngược lên chút. READ-ONLY, không bấm gì. Chạy trong ngữ
+ * cảnh trang qua chrome.scripting.executeScript nên PHẢI tự chứa (định nghĩa
+ * sleep/rnd cục bộ, không dùng import).
+ */
+async function runScrollFeedInPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rnd = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+  // Rê "chuột" ảo tới vài toạ độ ngẫu nhiên -> phát mousemove/mouseover như
+  // người thật. READ-ONLY: không click vào nội dung.
+  const moveMouse = (n) => {
+    for (let i = 0; i < n; i++) {
+      const x = rnd(0, Math.max(1, window.innerWidth - 1));
+      const y = rnd(0, Math.max(1, window.innerHeight - 1));
+      const el = document.elementFromPoint(x, y) || document.body;
+      for (const type of ["mousemove", "mouseover"]) {
+        try {
+          el.dispatchEvent(
+            new MouseEvent(type, { bubbles: true, clientX: x, clientY: y })
+          );
+        } catch (e) {}
+      }
+    }
+  };
+  let scrolls = 0;
+  const rounds = rnd(5, 10);
+  for (let i = 0; i < rounds; i++) {
+    const before = window.scrollY;
+    window.scrollBy({ top: rnd(400, 900), left: 0, behavior: "smooth" });
+    scrolls += 1;
+    moveMouse(rnd(1, 3));
+    await sleep(rnd(1200, 3600));
+    // Thỉnh thoảng dừng "đọc" một bài lâu hơn.
+    if (Math.random() < 0.3) await sleep(rnd(1500, 4000));
+    // Thỉnh thoảng cuộn ngược lên một chút như người đọc lại.
+    if (Math.random() < 0.25) {
+      window.scrollBy({ top: -rnd(150, 350), left: 0, behavior: "smooth" });
+      await sleep(rnd(800, 1800));
+    }
+    // Chạm đáy nội dung đã tải (không cuộn thêm được) -> dừng sớm.
+    if (window.scrollY <= before + 5 && i > 1) break;
+  }
+  return { ok: true, scrolls };
+}
+
+/**
+ * IN-PAGE: xem 1 video trong khung nhìn vài giây (tắt tiếng). READ-ONLY: chỉ
+ * play/pause phần tử <video> + rê chuột/hover, không bấm like/theo dõi. Tự chứa.
+ */
+async function runWatchVideoInPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rnd = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+  // Cuộn nhẹ cho trang tải video rồi tìm 1 video đang trong khung nhìn.
+  window.scrollBy({ top: rnd(200, 500), left: 0, behavior: "smooth" });
+  await sleep(rnd(1200, 2400));
+  const vids = Array.from(document.querySelectorAll("video"));
+  let target = null;
+  for (const v of vids) {
+    const r = v.getBoundingClientRect();
+    if (r.width > 100 && r.height > 100 && r.top < window.innerHeight && r.bottom > 0) {
+      target = v;
+      break;
+    }
+  }
+  if (!target && vids.length) target = vids[0];
+  if (!target) return { ok: true, watchedMs: 0, note: "no-video" };
+  try {
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    await sleep(rnd(800, 1600));
+    const r = target.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    for (const type of ["mousemove", "mouseover"]) {
+      try {
+        target.dispatchEvent(
+          new MouseEvent(type, { bubbles: true, clientX: cx, clientY: cy })
+        );
+      } catch (e) {}
+    }
+    target.muted = true; // giữ im lặng, tránh phát tiếng bất ngờ
+    const p = target.play();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  } catch (e) {}
+  const watchedMs = rnd(5000, 15000);
+  await sleep(watchedMs);
+  try {
+    target.pause();
+  } catch (e) {}
+  return { ok: true, watchedMs };
+}
+
+/**
+ * IN-PAGE: đọc thông báo thật — cuộn danh sách thông báo và hover vào từng mục
+ * vài giây như người đang xem. READ-ONLY: chỉ hover/scroll, KHÔNG click mở thông
+ * báo. Tự chứa (không import).
+ */
+async function runNotificationsInPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rnd = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+  const hover = (el) => {
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const cx = r.left + Math.min(Math.max(1, r.width - 1), rnd(5, 40));
+    const cy = r.top + Math.min(Math.max(1, r.height - 1), rnd(5, 20));
+    for (const type of ["mousemove", "mouseover"]) {
+      try {
+        el.dispatchEvent(
+          new MouseEvent(type, { bubbles: true, clientX: cx, clientY: cy })
+        );
+      } catch (e) {}
+    }
+  };
+  const collect = () =>
+    Array.from(
+      document.querySelectorAll('[role="main"] a[role="link"], [role="listitem"]')
+    ).filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 120 && r.height > 30;
+    });
+  let items = collect();
+  let hovered = 0;
+  const rounds = rnd(3, 6);
+  for (let i = 0; i < rounds; i++) {
+    const el = items[i];
+    if (el) {
+      try {
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+      } catch (e) {}
+      await sleep(rnd(500, 1200));
+      hover(el);
+      hovered += 1;
+      await sleep(rnd(900, 2200));
+    } else {
+      window.scrollBy({ top: rnd(300, 600), left: 0, behavior: "smooth" });
+      await sleep(rnd(900, 1800));
+      items = collect(); // nạp thêm mục sau khi cuộn
+    }
+  }
+  return { ok: true, hovered };
+}
+
+/**
+ * IN-PAGE: lướt bảng tin của các NHÓM (groups feed) như người thật — cùng nhịp
+ * cuộn/rê chuột/nghỉ như lướt feed chính. READ-ONLY, không bấm gì. Tự chứa.
+ */
+async function runScrollGroupsInPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rnd = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+  const moveMouse = (n) => {
+    for (let i = 0; i < n; i++) {
+      const x = rnd(0, Math.max(1, window.innerWidth - 1));
+      const y = rnd(0, Math.max(1, window.innerHeight - 1));
+      const el = document.elementFromPoint(x, y) || document.body;
+      for (const type of ["mousemove", "mouseover"]) {
+        try {
+          el.dispatchEvent(
+            new MouseEvent(type, { bubbles: true, clientX: x, clientY: y })
+          );
+        } catch (e) {}
+      }
+    }
+  };
+  let scrolls = 0;
+  const rounds = rnd(5, 10);
+  for (let i = 0; i < rounds; i++) {
+    const before = window.scrollY;
+    window.scrollBy({ top: rnd(400, 900), left: 0, behavior: "smooth" });
+    scrolls += 1;
+    moveMouse(rnd(1, 3));
+    await sleep(rnd(1200, 3600));
+    if (Math.random() < 0.3) await sleep(rnd(1500, 4000));
+    if (Math.random() < 0.25) {
+      window.scrollBy({ top: -rnd(150, 350), left: 0, behavior: "smooth" });
+      await sleep(rnd(800, 1800));
+    }
+    if (window.scrollY <= before + 5 && i > 1) break;
+  }
+  return { ok: true, scrolls };
+}
+
+/**
+ * IN-PAGE: THẢ CẢM XÚC cho 1 bài viết (hành động GHI — dễ dính checkpoint nếu
+ * lạm dụng). Vì vậy hàm này RẤT thận trọng:
+ *  - Chỉ thao tác tối đa 1 bài / lần gọi.
+ *  - Cuộn nhẹ như đang đọc, tìm 1 nút "Thích/Like" đang TRONG khung nhìn và
+ *    CHƯA được thả (aria-pressed != true) để tránh gỡ react cũ.
+ *  - Rê chuột/hover vào nút trước rồi mới bấm (giống người), chỉ bấm 1 lần
+ *    (react mặc định = Thích), KHÔNG mở thanh chọn cảm xúc để hạn chế rủi ro.
+ *  - Việc CÓ chạy hàm này hay không do caller quyết định theo xác suất ~30%.
+ * Tự chứa (không import). Trả { ok, reacted }.
+ */
+async function runReactPostInPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rnd = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+  const LIKE_MARKERS = ["thích", "like"];
+  const isLikeBtn = (el) => {
+    const l = (el.getAttribute("aria-label") || "").toLowerCase().trim();
+    if (!l) return false;
+    // Khớp CHÍNH XÁC nhãn "Thích"/"Like" để tránh trúng "Đã thích", "Lượt
+    // thích", "Bạn và N người khác"... (những nhãn đó thường là trạng thái/mô
+    // tả, không phải nút bấm thả cảm xúc mới).
+    return LIKE_MARKERS.includes(l);
+  };
+  const inView = (el) => {
+    const r = el.getBoundingClientRect();
+    return (
+      r.width > 30 &&
+      r.height > 15 &&
+      r.top >= 0 &&
+      r.bottom <= (window.innerHeight || document.documentElement.clientHeight)
+    );
+  };
+  const findLike = () =>
+    Array.from(document.querySelectorAll('div[role="button"], [aria-label]')).find(
+      (el) =>
+        isLikeBtn(el) &&
+        el.getAttribute("aria-pressed") !== "true" &&
+        inView(el)
+    ) || null;
+  // Cuộn tối đa vài nhịp để đưa một nút Thích chưa react vào khung nhìn.
+  let btn = findLike();
+  let tries = 0;
+  while (!btn && tries < 4) {
+    window.scrollBy({ top: rnd(350, 700), left: 0, behavior: "smooth" });
+    await sleep(rnd(1200, 2600));
+    btn = findLike();
+    tries += 1;
+  }
+  if (!btn) return { ok: true, reacted: false, note: "no-like-button" };
+  try {
+    btn.scrollIntoView({ block: "center", behavior: "smooth" });
+    await sleep(rnd(800, 1800));
+    const r = btn.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    // Hover trước như người đang rê tới nút.
+    for (const type of ["mousemove", "mouseover", "mouseenter"]) {
+      try {
+        btn.dispatchEvent(
+          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy })
+        );
+      } catch (e) {}
+    }
+    await sleep(rnd(600, 1500));
+    // Bấm 1 lần (Thích mặc định). KHÔNG giữ để mở thanh cảm xúc.
+    for (const type of ["mousedown", "mouseup", "click"]) {
+      try {
+        btn.dispatchEvent(
+          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy })
+        );
+      } catch (e) {}
+    }
+    await sleep(rnd(700, 1600));
+  } catch (e) {
+    return { ok: false, reacted: false, error: String(e) };
+  }
+  return { ok: true, reacted: true };
+}
+
+/**
+ * IN-PAGE: LƯỚT REELS (thước phim) — hành động THỤ ĐỘNG (READ-ONLY). Reels là
+ * video dọc, chuyển reel bằng cuộn/phím mũi tên. Hàm tự tắt tiếng video đang
+ * phát rồi xem + chuyển vài reel như người xem lướt. Tự chứa (không import).
+ * Trả { ok, scrolls }.
+ */
+async function runScrollReelsInPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rnd = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+  const muteVideos = () => {
+    for (const v of Array.from(document.querySelectorAll("video"))) {
+      try {
+        v.muted = true;
+      } catch (e) {}
+    }
+  };
+  const nextReel = () => {
+    // Ưu tiên phím mũi tên xuống (điều hướng Reels chuẩn của FB); đồng thời cuộn
+    // một khoảng lớn để phòng khi phím không ăn.
+    try {
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "ArrowDown",
+          code: "ArrowDown",
+          keyCode: 40,
+          which: 40,
+          bubbles: true,
+        })
+      );
+    } catch (e) {}
+    window.scrollBy({
+      top: rnd(500, Math.max(600, window.innerHeight)),
+      left: 0,
+      behavior: "smooth",
+    });
+  };
+  let scrolls = 0;
+  const rounds = rnd(4, 8);
+  for (let i = 0; i < rounds; i++) {
+    muteVideos();
+    // Xem mỗi reel một lúc như người thật rồi mới lướt tiếp.
+    await sleep(rnd(2500, 6000));
+    nextReel();
+    scrolls += 1;
+    await sleep(rnd(800, 1800));
+    if (Math.random() < 0.25) await sleep(rnd(1500, 3500));
+  }
+  muteVideos();
+  return { ok: true, scrolls };
+}
+
+/**
+ * IN-PAGE: THẢ CẢM XÚC cho 1 Reel (thước phim) — hành động GHI, RẤT thận trọng
+ * y như runReactPostInPage:
+ *  - Chỉ thao tác tối đa 1 Reel/lần gọi.
+ *  - Tìm nút "Thích/Like" đang TRONG khung nhìn và CHƯA thả (aria-pressed !=
+ *    true) để không gỡ react cũ.
+ *  - Hover trước rồi bấm 1 lần (Thích mặc định), KHÔNG mở thanh chọn cảm xúc.
+ *  - Việc CÓ chạy hàm này hay không do caller quyết định theo xác suất ~30%.
+ * Tự chứa (không import). Trả { ok, reacted }.
+ */
+async function runReactReelsInPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rnd = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+  const LIKE_MARKERS = ["thích", "like"];
+  const isLikeBtn = (el) => {
+    const l = (el.getAttribute("aria-label") || "").toLowerCase().trim();
+    if (!l) return false;
+    return LIKE_MARKERS.includes(l);
+  };
+  const inView = (el) => {
+    const r = el.getBoundingClientRect();
+    return (
+      r.width > 20 &&
+      r.height > 15 &&
+      r.top >= 0 &&
+      r.bottom <= (window.innerHeight || document.documentElement.clientHeight)
+    );
+  };
+  const findLike = () =>
+    Array.from(document.querySelectorAll('div[role="button"], [aria-label]')).find(
+      (el) =>
+        isLikeBtn(el) &&
+        el.getAttribute("aria-pressed") !== "true" &&
+        inView(el)
+    ) || null;
+  let btn = findLike();
+  let tries = 0;
+  while (!btn && tries < 3) {
+    // Reels: thử chuyển reel để nút Thích của reel hiện tại vào khung nhìn.
+    try {
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "ArrowDown",
+          code: "ArrowDown",
+          keyCode: 40,
+          which: 40,
+          bubbles: true,
+        })
+      );
+    } catch (e) {}
+    await sleep(rnd(1500, 3000));
+    btn = findLike();
+    tries += 1;
+  }
+  if (!btn) return { ok: true, reacted: false, note: "no-like-button" };
+  try {
+    btn.scrollIntoView({ block: "center", behavior: "smooth" });
+    await sleep(rnd(800, 1800));
+    const r = btn.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    // Hover trước như người đang rê tới nút.
+    for (const type of ["mousemove", "mouseover", "mouseenter"]) {
+      try {
+        btn.dispatchEvent(
+          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy })
+        );
+      } catch (e) {}
+    }
+    await sleep(rnd(600, 1500));
+    // Bấm 1 lần (Thích mặc định). KHÔNG giữ để mở thanh cảm xúc.
+    for (const type of ["mousedown", "mouseup", "click"]) {
+      try {
+        btn.dispatchEvent(
+          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy })
+        );
+      } catch (e) {}
+    }
+    await sleep(rnd(700, 1600));
+  } catch (e) {
+    return { ok: false, reacted: false, error: String(e) };
+  }
+  return { ok: true, reacted: true };
+}
+
+/**
+ * IN-PAGE: ĐIỀU HƯỚNG MỀM trong SPA của Facebook — tìm & click link điều hướng
+ * (Trang chủ / Watch / Nhóm) hoặc nút chuông Thông báo, thay vì đổi URL cứng.
+ * Giống người thật bấm chuyển mục, giữ nguyên phiên. Trả { navigated } để caller
+ * biết có cần fallback hay không. `target` ∈ {home, watch, notifications, groups}.
+ */
+async function warmingSoftNavigateInPage(target) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rnd = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+  const lowerLabel = (el) => (el.getAttribute("aria-label") || "").toLowerCase();
+  const clickEl = (el) => {
+    if (!el) return false;
+    try {
+      el.scrollIntoView({ block: "center" });
+    } catch (e) {}
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    for (const type of ["mousemove", "mouseover", "mousedown", "mouseup", "click"]) {
+      try {
+        el.dispatchEvent(
+          new MouseEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+          })
+        );
+      } catch (e) {}
+    }
+    return true;
+  };
+  const pick = (selList) => {
+    for (const sel of selList) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  };
+  let el = null;
+  if (target === "home") {
+    el = pick([
+      'a[href="/"]',
+      'a[href="https://www.facebook.com/"]',
+      'a[aria-label="Facebook"]',
+    ]);
+  } else if (target === "watch") {
+    el = pick(['a[href^="/watch"]', 'a[href*="/watch/"]']);
+    if (!el) {
+      el =
+        Array.from(document.querySelectorAll('a[role="link"]')).find((a) => {
+          const l = lowerLabel(a);
+          return l.includes("watch") || l.includes("video");
+        }) || null;
+    }
+  } else if (target === "notifications") {
+    // Nút chuông mở panel jewel — người thật hay bấm vào đây hơn là mở nguyên
+    // trang /notifications.
+    el =
+      Array.from(document.querySelectorAll('[role="link"],[role="button"]')).find(
+        (a) => {
+          const l = lowerLabel(a);
+          return l.includes("notification") || l.includes("thông báo");
+        }
+      ) || null;
+    if (!el) el = pick(['a[href^="/notifications"]']);
+  } else if (target === "groups") {
+    el = pick(['a[href^="/groups/feed"]', 'a[href="/groups/"]', 'a[href^="/groups"]']);
+    if (!el) {
+      el =
+        Array.from(document.querySelectorAll('a[role="link"]')).find((a) => {
+          const l = lowerLabel(a);
+          return l.includes("group") || l.includes("nhóm");
+        }) || null;
+    }
+  } else if (target === "reels") {
+    el = pick(['a[href^="/reel"]', 'a[href*="/reels/"]', 'a[href*="/reel/"]']);
+    if (!el) {
+      el =
+        Array.from(document.querySelectorAll('a[role="link"]')).find((a) => {
+          const l = lowerLabel(a);
+          return l.includes("reel") || l.includes("thước phim");
+        }) || null;
+    }
+  }
+  if (!el) return { ok: false, navigated: false, note: "no-nav-link" };
+  await sleep(rnd(300, 900));
+  clickEl(el);
+  await sleep(rnd(1500, 3200)); // chờ SPA render nội dung mới
+  return { ok: true, navigated: true, target, url: location.href };
+}
+
+// URL mở cho từng loại hành động nuôi tài khoản. Chỉ dùng khi CHƯA có tab FB
+// nào đang mở (phải tự mở 1 tab nền) hoặc khi điều hướng mềm trong SPA thất bại
+// và buộc phải đổi URL cứng để hành động vẫn có ý nghĩa.
+const WARMING_ACTION_URLS = {
+  scrollFeed: "https://www.facebook.com/",
+  watchVideo: "https://www.facebook.com/watch/",
+  openNotifications: "https://www.facebook.com/notifications",
+  scrollGroups: "https://www.facebook.com/groups/feed/",
+  scrollReels: "https://www.facebook.com/reel/",
+  reactPost: "https://www.facebook.com/",
+  reactReels: "https://www.facebook.com/reel/",
+};
+
+// Mỗi loại hành động ứng với 1 mục điều hướng mềm trong SPA (bấm link/nút thay vì
+// đổi URL). Dùng cho warmingSoftNavigateInPage.
+const WARMING_NAV_TARGET = {
+  scrollFeed: "home",
+  watchVideo: "watch",
+  openNotifications: "notifications",
+  scrollGroups: "groups",
+  scrollReels: "reels",
+  reactPost: "home",
+  reactReels: "reels",
+};
+
+// Mỗi loại hành động ứng với 1 hàm chạy-trong-trang. Đa số THỤ ĐỘNG (READ-ONLY);
+// reactPost/reactReels là hành động GHI (chỉ chạy theo xác suất thấp).
+const WARMING_IN_PAGE_FN = {
+  scrollFeed: runScrollFeedInPage,
+  watchVideo: runWatchVideoInPage,
+  openNotifications: runNotificationsInPage,
+  scrollGroups: runScrollGroupsInPage,
+  scrollReels: runScrollReelsInPage,
+  reactPost: runReactPostInPage,
+  reactReels: runReactReelsInPage,
+};
+
+// Chuỗi dấu hiệu FB đá sang checkpoint/đăng nhập lại.
+function warmingUrlIsBlocked(rawUrl) {
+  const u = String(rawUrl || "").toLowerCase();
+  return (
+    u.includes("/checkpoint") ||
+    u.includes("/login/") ||
+    u.includes("/login.php") ||
+    u.includes("login_required")
+  );
+}
+
+const WARMING_BLOCK_REASON =
+  "FB yêu cầu xác minh/đăng nhập lại (checkpoint). Đã dừng để tránh rủi ro khoá tài khoản.";
+
+// Đọc URL hiện tại của tab (an toàn với lastError).
+async function getTabUrl(tabId) {
+  try {
+    const cur = await new Promise((r) =>
+      chrome.tabs.get(tabId, (t) => {
+        void chrome.runtime.lastError;
+        r(t);
+      })
+    );
+    return String((cur && (cur.url || cur.pendingUrl)) || "");
+  } catch (e) {
+    return "";
+  }
+}
+
+/**
+ * HƯỚNG B+A — Lấy 1 tab Facebook để nuôi tài khoản:
+ *  1) Ưu tiên BÁM vào tab facebook.com người dùng đang mở (owned=false -> KHÔNG
+ *     đóng sau khi xong, giữ nguyên phiên làm việc của họ).
+ *  2) Nếu không có -> tự mở 1 tab NỀN sống lâu (owned=true -> đóng khi kết thúc
+ *     lượt), dùng lại cho MỌI hành động trong lượt thay vì mở tab mỗi hành động.
+ * Trả { tabId, owned } hoặc { blocked, blockReason } nếu tab đã ở checkpoint,
+ * hoặc { error } nếu không mở được.
+ */
+async function acquireWarmingTab() {
+  // (1) Tìm tab facebook.com đang mở sẵn.
+  try {
+    const tabs = await new Promise((r) =>
+      chrome.tabs.query({ url: ["*://*.facebook.com/*"] }, (list) => {
+        void chrome.runtime.lastError;
+        r(Array.isArray(list) ? list : []);
+      })
+    );
+    // Bỏ qua tab đang ở checkpoint/login — không an toàn để thao tác.
+    const usable = tabs.find((t) => t && t.id != null && !warmingUrlIsBlocked(t.url));
+    const blockedTab = tabs.find((t) => t && warmingUrlIsBlocked(t.url));
+    if (!usable && blockedTab) {
+      return { blocked: true, blockReason: WARMING_BLOCK_REASON };
+    }
+    if (usable) return { tabId: usable.id, owned: false };
+  } catch (e) {}
+  // (2) Chưa có tab FB -> tự mở 1 tab nền sống lâu (theo công tắc focusTabs).
+  const active = await shouldFocusTabs();
+  let tab;
+  try {
+    tab = await new Promise((r) =>
+      chrome.tabs.create({ url: WARMING_ACTION_URLS.scrollFeed, active }, (t) => {
+        void chrome.runtime.lastError;
+        r(t);
+      })
+    );
+  } catch (e) {
+    return { error: "Không mở được tab nuôi tài khoản: " + String(e) };
+  }
+  if (!tab || tab.id == null) return { error: "Không mở được tab nuôi tài khoản." };
+  await addCrawlTab(tab.id); // đánh dấu tab do extension mở để dọn đúng tab
+  await waitTabComplete(tab.id, 30000);
+  if (warmingUrlIsBlocked(await getTabUrl(tab.id))) {
+    try {
+      await chrome.tabs.remove(tab.id);
+    } catch (e) {}
+    await removeCrawlTab(tab.id);
+    return { blocked: true, blockReason: WARMING_BLOCK_REASON };
+  }
+  return { tabId: tab.id, owned: true };
+}
+
+// Đóng tab nuôi nếu (và chỉ nếu) chính extension đã mở nó (owned=true). Tab của
+// người dùng (owned=false) được giữ nguyên.
+async function releaseWarmingTab(tabId, owned) {
+  if (!owned || tabId == null) return;
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch (e) {}
+  await removeCrawlTab(tabId);
+}
+
+/**
+ * Thực hiện 1 hành động nuôi trên tab ĐÃ CÓ (dùng lại, không mở/đóng tab):
+ *  - Điều hướng MỀM trong SPA tới mục tương ứng (bấm link/nút). Nếu không tìm
+ *    thấy link -> đổi URL cứng làm phương án dự phòng để hành động vẫn có ý nghĩa.
+ *  - Phát hiện checkpoint/login sau điều hướng -> báo blockReason.
+ *  - Chạy hàm THỤ ĐỘNG (scroll/watch/notifications) đúng loại.
+ * Trả { ok, action, detail } hoặc { blocked, blockReason }.
+ */
+async function executeWarmingAction(action, tabId) {
+  const inPageFn = WARMING_IN_PAGE_FN[action];
+  if (!inPageFn) return { ok: false, error: "Hành động nuôi không hợp lệ: " + action };
+  const navTarget = WARMING_NAV_TARGET[action] || "home";
+  // (a) Điều hướng mềm: bấm link/nút trong SPA, giữ nguyên phiên.
+  let navigated = false;
+  try {
+    const navRes = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: warmingSoftNavigateInPage,
+      args: [navTarget],
+    });
+    navigated = !!(navRes && navRes[0] && navRes[0].result && navRes[0].result.navigated);
+  } catch (e) {}
+  // (b) Dự phòng: không thấy link điều hướng -> đổi URL cứng rồi chờ tải xong.
+  if (!navigated) {
+    const url = WARMING_ACTION_URLS[action] || WARMING_ACTION_URLS.scrollFeed;
+    try {
+      await new Promise((r) =>
+        chrome.tabs.update(tabId, { url }, () => {
+          void chrome.runtime.lastError;
+          r();
+        })
+      );
+      await waitTabComplete(tabId, 30000);
+    } catch (e) {}
+  }
+  // (c) NGẮT MẠCH: sau điều hướng mà rơi vào checkpoint/login -> báo block.
+  if (warmingUrlIsBlocked(await getTabUrl(tabId))) {
+    return { ok: false, blocked: true, blockReason: WARMING_BLOCK_REASON };
+  }
+  await sleep(randInt(2000, 4500)); // chờ nội dung ổn định, nhịp như người
+  // (d) Chạy hành động thụ động đúng loại trong trang.
+  let res;
+  try {
+    res = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: inPageFn,
+    });
+  } catch (e) {
+    return { ok: false, action, error: "Lỗi chạy script nuôi tài khoản: " + String(e) };
+  }
+  const out = (res && res[0] && res[0].result) || { ok: false };
+  return { ok: out.ok !== false, action, detail: out };
+}
+
+let _warming = false;
+// Cờ YÊU CẦU DỪNG: khi người dùng bấm nút Dừng, background gọi stopWarming()
+// đặt cờ này lên true. Vòng lặp trong processWarming kiểm tra cờ trước mỗi
+// hành động và trong warmingSleep để thoát ngay giữa chừng.
+let _warmingStop = false;
+
+/** Yêu cầu dừng lượt nuôi tài khoản đang chạy (nếu có). An toàn khi gọi lúc rảnh. */
+function stopWarming() {
+  if (_warming) _warmingStop = true;
+  return { ok: true, running: _warming };
+}
+
+/**
+ * Ngủ `ms` mili-giây nhưng CÓ THỂ NGẮT: chia nhỏ thành lát ~500ms, sau mỗi lát
+ * kiểm tra cờ _warmingStop. Trả về true nếu ngủ trọn vẹn, false nếu bị ngắt.
+ */
+async function warmingSleep(ms) {
+  const step = 500;
+  let left = Math.max(0, ms);
+  while (left > 0) {
+    if (_warmingStop) return false;
+    const slice = Math.min(step, left);
+    await sleep(slice);
+    left -= slice;
+  }
+  return !_warmingStop;
+}
+
+/**
+ * Chạy 1 lượt nuôi tài khoản theo kiểu NGƯỜI THẬT:
+ *  - `actionsPerRun` là SỐ VIỆC TỐI ĐA; mỗi lượt bốc ngẫu nhiên 1..N việc trong
+ *    số các loại READ-ONLY đã bật (mỗi loại nhiều nhất 1 lần — KHÔNG lặp).
+ *  - reactPost (thả cảm xúc, hành động GHI) chỉ được thêm với xác suất
+ *    ~WARMING_REACT_CHANCE (30%) và tối đa 1 bài/lượt, đặt ở CUỐI kế hoạch.
+ *  - Trộn thứ tự nhóm READ-ONLY, giãn cách 20–75s giữa các việc (ngắt được).
+ * Chống chạy chồng bằng cờ _warming; tôn trọng NGẮT MẠCH chung và cờ DỪNG;
+ * ghi nhật ký MỖI hành động lên server. Gọi thủ công truyền { manual:true }.
+ */
+async function processWarming(opts = {}) {
+  if (_warming) return { ok: false, error: "Đang nuôi tài khoản, bỏ qua lượt này." };
+  const cfg = await getWarmingConfig();
+  // Khi gọi thủ công (manual=true) thì chạy kể cả khi alarm tắt.
+  if (!cfg.enabled && !opts.manual) return { ok: false, error: "Nuôi tài khoản đang tắt." };
+  // NGẮT MẠCH CHUNG (feed/inbox/comment/watch): đang nghỉ vì FB chặn thì bỏ qua
+  // CẢ lượt để bảo vệ tài khoản.
+  const blockState = await getCrawlBlockState();
+  if (blockState && blockState.blocked) {
+    return {
+      ok: false,
+      blocked: true,
+      error: blockState.reason || "Đang tạm nghỉ vì FB chặn.",
+      blockedUntil: blockState.blockedUntil,
+    };
+  }
+  _warming = true;
+  _warmingStop = false;
+  let done = 0;
+  let blocked = false;
+  let stopped = false;
+  // Tab dùng CHUNG cho cả lượt (Hướng B+A): bám tab FB đang mở hoặc mở 1 tab
+  // nền sống lâu. `owned` = true nếu chính extension mở (phải tự đóng khi xong).
+  let warmTabId = null;
+  let ownedTab = false;
+  try {
+    // Lấy tab MỘT LẦN cho cả lượt thay vì mở/đóng tab mỗi hành động.
+    const acq = await acquireWarmingTab();
+    if (acq && acq.blocked && acq.blockReason) {
+      // Tab người dùng đang ở checkpoint (hoặc tab nền vừa mở bị đá) -> arm ngắt
+      // mạch chung, ghi log rồi dừng lượt (không có hành động nào chạy).
+      await setCrawlBlock(acq.blockReason);
+      blocked = true;
+      try {
+        await DB.recordWarmingActivity({
+          type: "session",
+          status: "blocked",
+          data: { reason: acq.blockReason },
+        });
+      } catch (e) {}
+      broadcast("WARMING_PROGRESS", {
+        action: "session",
+        status: "blocked",
+        done: 0,
+        total: 0,
+      });
+      return { ok: true, done: 0, blocked: true };
+    }
+    if (!acq || acq.tabId == null) {
+      // Không mở được tab -> bỏ lượt, chờ chu kỳ sau (không đụng ngắt mạch).
+      return { ok: false, error: (acq && acq.error) || "Không lấy được tab nuôi tài khoản." };
+    }
+    warmTabId = acq.tabId;
+    ownedTab = !!acq.owned;
+
+    const enabled = normalizeWarmingActions(cfg.actions);
+    const perRun = Math.max(
+      1,
+      Math.min(8, parseInt(opts.actionsPerRun, 10) || cfg.actionsPerRun)
+    );
+    // Tách nhóm GHI (reactPost/reactReels) khỏi nhóm READ-ONLY. Nhóm GHI chỉ
+    // được thêm theo xác suất thấp, KHÔNG tính vào phần chạy của read-only.
+    const readonlyPool = enabled.filter((a) => !WARMING_WRITE_ACTIONS.includes(a));
+    const writeEnabled = enabled.filter((a) => WARMING_WRITE_ACTIONS.includes(a));
+    // Trộn nhóm read-only rồi CHẠY HẾT các việc đã tích (đúng ý "tích 4 thì làm
+    // cả 4", KHÔNG bốc ngẫu nhiên 1 việc rồi bỏ phần còn lại), mỗi loại nhiều
+    // nhất 1 lần. Lượt TỰ ĐỘNG: kẹp theo perRun để không dồn quá nhiều. Lượt
+    // CHẠY THỬ thủ công (manual): chạy HẾT để người dùng quan sát từng việc.
+    shuffleInPlace(readonlyPool);
+    const plan = [];
+    const readCap = opts.manual
+      ? readonlyPool.length
+      : Math.min(perRun, readonlyPool.length);
+    for (let i = 0; i < readCap; i++) plan.push(readonlyPool[i]);
+    // Nhóm GHI (reactPost/reactReels): mỗi loại ~30% khả năng mỗi lượt, tối đa 1
+    // tương tác/loại, luôn ở CUỐI (sau khi đã "khởi động" bằng vài hành động thụ
+    // động cho giống người thật). Khi CHẠY THỬ thủ công thì BUỘC chạy để người
+    // dùng kiểm chứng được hành động ghi.
+    for (const wa of writeEnabled) {
+      if (opts.manual || Math.random() < WARMING_REACT_CHANCE) plan.push(wa);
+    }
+    // Trường hợp hiếm: chỉ bật mỗi hành động GHI và lần này không trúng 30% ->
+    // lượt rỗng. Vẫn coi là lượt sạch (không làm gì cũng là "giống người").
+    for (let i = 0; i < plan.length; i++) {
+      // Người dùng bấm Dừng -> thoát ngay, KHÔNG chạy thêm hành động nào.
+      if (_warmingStop) {
+        stopped = true;
+        break;
+      }
+      // Kiểm tra ngắt mạch TRƯỚC mỗi hành động (block có thể tới bất đồng bộ).
+      const blk = await getCrawlBlockState();
+      if (blk && blk.blocked) {
+        blocked = true;
+        break;
+      }
+      const action = plan[i];
+      let res;
+      try {
+        res = await executeWarmingAction(action, warmTabId);
+      } catch (e) {
+        res = { ok: false, error: String(e) };
+      }
+      // FB chặn giữa chừng -> arm ngắt mạch chung, ghi log rồi dừng lượt.
+      if (res && res.blocked && res.blockReason) {
+        await setCrawlBlock(res.blockReason);
+        blocked = true;
+        try {
+          await DB.recordWarmingActivity({
+            type: action,
+            status: "blocked",
+            data: { reason: res.blockReason },
+          });
+        } catch (e) {}
+        broadcast("WARMING_PROGRESS", {
+          action,
+          status: "blocked",
+          done,
+          total: plan.length,
+        });
+        break;
+      }
+      done += 1;
+      // Ghi nhật ký lên SERVER cho từng hành động (BE, không dùng storage local).
+      try {
+        await DB.recordWarmingActivity({
+          type: action,
+          status: res && res.ok ? "done" : "error",
+          data: (res && res.detail) || {},
+        });
+      } catch (e) {}
+      broadcast("WARMING_PROGRESS", {
+        action,
+        status: res && res.ok ? "done" : "error",
+        done,
+        total: plan.length,
+      });
+      // Giãn cách 20–75s GIỮA các hành động (không chờ sau hành động cuối). Ngủ
+      // NGẮT ĐƯỢC: nếu người dùng bấm Dừng giữa lúc chờ thì thoát ngay.
+      if (i < plan.length - 1) {
+        const full = await warmingSleep(randInt(20000, 75000));
+        if (!full) {
+          stopped = true;
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    // bỏ qua, chờ chu kỳ sau
+  } finally {
+    // Chỉ đóng tab nếu chính extension đã mở nó; tab của người dùng giữ nguyên.
+    await releaseWarmingTab(warmTabId, ownedTab);
+    _warming = false;
+    _warmingStop = false;
+  }
+  // Người dùng chủ động dừng -> ghi log 1 dòng "stopped" để UI hiển thị rõ.
+  if (stopped) {
+    try {
+      await DB.recordWarmingActivity({
+        type: "session",
+        status: "stopped",
+        data: { done },
+      });
+    } catch (e) {}
+    broadcast("WARMING_PROGRESS", {
+      action: "session",
+      status: "stopped",
+      done,
+      total: done,
+    });
+  }
+  // Lượt sạch (không bị chặn, làm ít nhất 1 hành động) -> reset ngắt mạch, đồng
+  // bộ với feed/inbox/watch.
+  if (!blocked && !stopped && done > 0) {
+    try {
+      await clearCrawlBlock();
+    } catch (e) {}
+  }
+  return { ok: true, done, blocked, stopped };
+}
+
+/** Khôi phục alarm nuôi tài khoản khi service worker khởi động lại. */
+async function initWarming() {
+  const cfg = await getWarmingConfig();
+  try {
+    const existing = await chrome.alarms.get(WARMING_ALARM);
+    if (cfg.enabled && !existing) {
+      // Dùng alarm MỘT-LẦN có dao động thay vì periodInMinutes cố định.
+      await scheduleNextWarming();
+    } else if (!cfg.enabled && existing) {
+      await chrome.alarms.clear(WARMING_ALARM);
+    }
+  } catch (e) {}
+}
+
 /* ================= HỘP THƯ MESSENGER (đọc hội thoại có sẵn) ============== */
 //
 // AN TOÀN TÀI KHOẢN — nguyên tắc:
@@ -3333,4 +4419,11 @@ export {
   applyWatchConfig,
   processReplyWatch,
   initReplyWatch,
+  WARMING_ALARM,
+  getWarmingConfig,
+  applyWarmingConfig,
+  processWarming,
+  stopWarming,
+  scheduleNextWarming,
+  initWarming,
 };

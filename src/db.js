@@ -351,6 +351,40 @@ async function getPostedGroups(userId, opts = {}) {
   );
 }
 
+/* ====================== WARMING ACTIVITY LOG =========================== *
+ * Nhật ký hoạt động "nuôi tài khoản" (cuộn feed, xem video, mở thông báo...),
+ * LƯU HOÀN TOÀN TRÊN SERVER theo TÀI KHOẢN (không dùng chrome.storage.local).
+ *   POST /api/warming/log body { type, status, data } -> { id, createdAt }
+ *   GET  /api/warming/log?limit -> { entries:[...] } (mới nhất trước)
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Ghi một mục nhật ký nuôi tài khoản. `entry` = { type, status, data }.
+ * Trả về { id, createdAt }.
+ */
+async function recordWarmingActivity(entry = {}) {
+  return apiFetch("/api/warming/log", {
+    method: "POST",
+    body: JSON.stringify({
+      type: entry.type != null ? String(entry.type) : "action",
+      status: entry.status != null ? String(entry.status) : "done",
+      data: entry.data ?? {},
+    }),
+  });
+}
+
+/**
+ * Lấy nhật ký nuôi tài khoản (mới nhất trước). Trả về { entries: [...] }.
+ */
+async function getWarmingActivity(opts = {}) {
+  return apiFetch(
+    "/api/warming/log" +
+      qs({
+        limit: typeof opts.limit === "number" && opts.limit > 0 ? opts.limit : undefined,
+      })
+  );
+}
+
 /* ============================ SETTINGS ================================== */
 //
 // Cấu hình nhỏ theo TÀI KHOẢN (key/value JSON) — thay cho các khoá trước đây ở
@@ -820,6 +854,9 @@ export {
   // posted groups (lịch sử đăng — theo TÀI KHOẢN qua /api/posted-groups)
   recordPostedGroups,
   getPostedGroups,
+  // warming activity log (nhật ký nuôi tài khoản — theo TÀI KHOẢN qua /api/warming/log)
+  recordWarmingActivity,
+  getWarmingActivity,
   // settings (cấu hình nhỏ theo TÀI KHOẢN qua /api/settings)
   getSetting,
   setSetting,

@@ -1335,50 +1335,139 @@
 
       apiReport({ status: "started", newCount: 0, pages: 0 });
 
-      // Kéo lại các gói feed hook đã đệm TRƯỚC khi content.js gắn listener
-      // (hook chạy document_start, content.js chạy document_idle => dễ lỡ gói
-      // feed đầu tiên). Đây là mấu chốt để tab ẩn/nền vẫn có template mà crawl.
+      // ==== NẠP KHUÔN (TEMPLATE) — 3 nguồn theo thứ tự ưu tiên ====
+      // (a) Kéo lại gói feed hook đã ĐỆM (hook chạy document_start, content.js
+      //     chạy document_idle => dễ lỡ gói feed đầu tiên). Nguồn TỐT NHẤT vì
+      //     kèm luôn lastChunks (trang 1 khỏi gọi mạng) + token tươi.
+      // (b) SEED từ chrome.storage.local (fbcGqlTemplate) — MẤU CHỐT CHO TAB
+      //     NỀN: Chrome ĐÓNG BĂNG requestAnimationFrame/IntersectionObserver
+      //     (cơ chế lazy-load của FB) ở tab KHÔNG focus => FB không tự bắn feed
+      //     request => sniff kiểu (a)/(c) treo mãi tới khi bấm vào tab. Ta dùng
+      //     lại KHUÔN đã lưu từ lần crawl trước, chỉ LÀM MỚI fb_dtsg/lsd từ HTML
+      //     trang hiện tại (DOM vẫn có sẵn dù tab nền, chỉ lazy-load bị băng).
+      //     Replay sau đó chạy qua MAIN world fetch (replayViaPage) — KHÔNG bị
+      //     throttle, header do trình duyệt tự đặt => TIER-2 an toàn, KHÔNG
+      //     spoof Origin/Referer, KHÔNG dùng DNR.
+      // (c) Sniff trực tiếp (cuộn + nhấn "Mới nhất") — CHỈ chạy được khi tab
+      //     focus; dùng làm phương án CHÓT cho lần crawl ĐẦU TIÊN khi storage
+      //     còn trống (chưa từng bắt được khuôn).
       pullBufferedGql();
 
-      // Cần mẫu request đã sniff để replay. Nếu chưa có, chờ FB tự bắn feed request.
-      // FB thường mất 3-8s sau khi load trang nhóm mới gọi feed request đầu tiên
-      // (đặc biệt với nhóm lớn hoặc mạng chậm). Ta chờ tối đa ~15s, mỗi 1.5s
-      // cuộn nhẹ 1 lần để kích hoạt lazy load. Nếu vẫn không có thì thử click
-      // nút "Mới nhất" để ép FB gọi lại feed request. Cuối cùng mới báo lỗi.
-      const TEMPLATE_WAIT_MS = 15000;
-      const TEMPLATE_POLL_MS = 1500;
-      const tplStart = Date.now();
-      let tplScrolls = 0;
-      let tplTriedSort = false;
+      // (a) Chờ NGẮN để gói đệm từ pull kịp về (KHÔNG cuộn — pull tự phát lại,
+      //     không phụ thuộc lazy-load nên tab nền vẫn nhận được).
+      const PULL_WAIT_MS = 3000;
+      const PULL_POLL_MS = 400;
+      const pullStart = Date.now();
       while (
         (!apiSniff.template || !apiSniff.template.doc_id) &&
-        Date.now() - tplStart < TEMPLATE_WAIT_MS
+        Date.now() - pullStart < PULL_WAIT_MS
       ) {
-        if (tplScrolls < 6) {
-          window.scrollBy(0, Math.round((window.innerHeight || 800) * 0.6));
-          tplScrolls += 1;
-        }
-        // Sau ~6s không có template, thử click "Mới nhất" để ép FB gọi feed request.
-        if (
-          !tplTriedSort &&
-          Date.now() - tplStart > 6000 &&
-          typeof ensureNewestSort === "function"
-        ) {
-          tplTriedSort = true;
-          try {
-            await ensureNewestSort();
-          } catch (_) {}
-        }
-        await sleep(TEMPLATE_POLL_MS);
+        await sleep(PULL_POLL_MS);
       }
+
+      // Cờ: khuôn đến từ SEED storage => KHÔNG có lastChunks tươi => trang 1
+      // phải replay như các trang sau (thay vì đọc chunk sniff).
+      let seededFromStorage = false;
+
+      // (b) SEED từ storage nếu vẫn chưa có khuôn (điển hình: tab nền băng lazy-load).
+      if (!apiSniff.template || !apiSniff.template.doc_id) {
+        try {
+          const stored = await new Promise((resolve) => {
+            try {
+              chrome.storage.local.get("fbcGqlTemplate", (r) =>
+                resolve(r && r.fbcGqlTemplate ? r.fbcGqlTemplate : null)
+              );
+            } catch (_) {
+              resolve(null);
+            }
+          });
+          if (stored && stored.doc_id && stored.raw) {
+            // Làm mới fb_dtsg/lsd từ HTML trang hiện tại (regex giống
+            // crawl.js extractTokensFromHtml). DOM có sẵn dù tab nền.
+            let freshDtsg = stored.fb_dtsg;
+            let freshLsd = stored.lsd;
+            try {
+              const html = document.documentElement
+                ? document.documentElement.outerHTML
+                : "";
+              const dtsg =
+                html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/) ||
+                html.match(/name="fb_dtsg"\s+value="([^"]+)"/) ||
+                html.match(/"dtsg":\{"token":"([^"]+)"/);
+              if (dtsg && dtsg[1]) freshDtsg = dtsg[1];
+              const lsd =
+                html.match(/"LSD",\[\],\{"token":"([^"]+)"/) ||
+                html.match(/"lsd":\{"token":"([^"]+)"/);
+              if (lsd && lsd[1]) freshLsd = lsd[1];
+            } catch (_) {}
+
+            // Ghi token tươi vào body thô (raw) để replay dùng token mới nhất.
+            let freshRaw = stored.raw;
+            try {
+              const p = new URLSearchParams(stored.raw || "");
+              if (freshDtsg) p.set("fb_dtsg", freshDtsg);
+              if (freshLsd) p.set("lsd", freshLsd);
+              freshRaw = p.toString();
+            } catch (_) {}
+
+            apiSniff.template = {
+              url: stored.url,
+              raw: freshRaw,
+              friendly: stored.friendly,
+              fb_dtsg: freshDtsg,
+              doc_id: stored.doc_id,
+              lsd: freshLsd,
+              variables: stored.variables,
+            };
+            seededFromStorage = true;
+            dlog(
+              `[API] SEED khuôn từ storage (tab nền) | doc_id=${stored.doc_id}` +
+                ` dtsg=${freshDtsg ? "tươi" : "cũ"} lsd=${freshLsd ? "tươi" : "cũ"}`
+            );
+          }
+        } catch (e) {}
+      }
+
+      // (c) Phương án CHÓT: sniff trực tiếp — chỉ hiệu quả khi tab được focus.
+      //     Dùng cho lần crawl ĐẦU TIÊN khi storage trống. Cuộn nhẹ + click
+      //     "Mới nhất" để ép FB bắn feed request. (Ở tab nền vòng này sẽ treo
+      //     tới hết thời gian do lazy-load bị Chrome đóng băng — nhưng chỉ chạm
+      //     tới đây khi CHƯA có khuôn nào trong storage.)
+      if (!apiSniff.template || !apiSniff.template.doc_id) {
+        const TEMPLATE_WAIT_MS = 15000;
+        const TEMPLATE_POLL_MS = 1500;
+        const tplStart = Date.now();
+        let tplScrolls = 0;
+        let tplTriedSort = false;
+        while (
+          (!apiSniff.template || !apiSniff.template.doc_id) &&
+          Date.now() - tplStart < TEMPLATE_WAIT_MS
+        ) {
+          if (tplScrolls < 6) {
+            window.scrollBy(0, Math.round((window.innerHeight || 800) * 0.6));
+            tplScrolls += 1;
+          }
+          if (
+            !tplTriedSort &&
+            Date.now() - tplStart > 6000 &&
+            typeof ensureNewestSort === "function"
+          ) {
+            tplTriedSort = true;
+            try {
+              await ensureNewestSort();
+            } catch (_) {}
+          }
+          await sleep(TEMPLATE_POLL_MS);
+        }
+      }
+
       if (!apiSniff.template || !apiSniff.template.doc_id) {
         apiSniff.apiRunning = false;
         apiReport({
           status: "error",
           error:
-            "Chưa bắt được request feed nhóm sau " +
-            Math.round(TEMPLATE_WAIT_MS / 1000) +
-            "s. Hãy cuộn feed 1-2 nhịp rồi chạy lại.",
+            "Chưa bắt được request feed nhóm. Lần crawl ĐẦU cần mở nhóm ở tab" +
+            " focus 1 lần để lấy khuôn; sau đó tab nền sẽ tự dùng lại khuôn đã lưu.",
         });
         send("CRAWL_DONE", {
           result: { newCount: 0, reason: "Chưa có mẫu request API." },
@@ -1425,35 +1514,12 @@
         return pageInfo;
       };
 
-      // TRANG 1: dùng luôn chunks bắt được gần nhất (khỏi gọi lại mạng).
-      let cursor = null;
-      if (apiSniff.lastChunks && apiSniff.lastChunks.length) {
-        const pi = ingestChunks(apiSniff.lastChunks);
-        cursor = pi.endCursor;
-        pages += 1;
-        await flush();
-        apiReport({ status: "page", newCount, pages, hasNext: pi.hasNext });
-      }
-
-      // CÁC TRANG SAU: replay với cursor tăng dần.
+      // Khuôn để replay (đặt sớm vì TRANG 1 khi SEED cũng cần replay).
       const tpl = apiSniff.template;
-      // Nhịp nghỉ giữa các trang CÓ JITTER (70%–160% nhịp cơ bản) + thỉnh thoảng
-      // nghỉ dài như người thật => pattern bớt máy móc, giảm rủi ro checkpoint.
-      const rint = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
-      let sincePageRest = 0;
-      let nextRestGap = rint(5, 8);
-      const nextPageDelay = () => {
-        sincePageRest += 1;
-        if (sincePageRest >= nextRestGap) {
-          sincePageRest = 0;
-          nextRestGap = rint(5, 8);
-          return rint(opts.pageDelay * 3, opts.pageDelay * 6);
-        }
-        return Math.round(opts.pageDelay * (0.7 + Math.random() * 0.9));
-      };
+
       // Lý do FB chặn (checkpoint/đăng nhập lại/giới hạn tần suất) => DỪNG SỚM
       // thay vì gõ dồn dập, để bảo vệ tài khoản. Cùng logic với nhánh API
-      // không-tab trong crawl.js.
+      // không-tab trong crawl.js. ĐẶT SỚM vì TRANG 1 khi SEED cũng gọi detectBlock.
       let blockedReason = null;
       const detectBlock = (status, txt) => {
         if (status === 429)
@@ -1472,6 +1538,62 @@
         )
           return "FB yêu cầu xác minh/đăng nhập lại (checkpoint). Đã dừng crawl để tránh rủi ro khoá tài khoản.";
         return null;
+      };
+
+      // TRANG 1:
+      //  - Nếu có chunks vừa sniff (tab được focus / lần đầu) => dùng luôn,
+      //    khỏi gọi lại mạng.
+      //  - Nếu KHÔNG (SEED khuôn từ storage cho tab nền => không có chunk tươi)
+      //    => replay TRANG 1 với cursor=null (body gốc giữ nguyên) để lấy trang
+      //    đầu qua MAIN world fetch (không bị throttle ở tab nền).
+      let cursor = null;
+      if (apiSniff.lastChunks && apiSniff.lastChunks.length) {
+        const pi = ingestChunks(apiSniff.lastChunks);
+        cursor = pi.endCursor;
+        pages += 1;
+        await flush();
+        apiReport({ status: "page", newCount, pages, hasNext: pi.hasNext });
+      } else {
+        // SEED path: gọi trang đầu bằng body gốc (không gắn cursor).
+        const res0 = await replayViaPage({
+          url: tpl.url,
+          body: tpl.raw,
+          friendly: tpl.friendly,
+        });
+        if (!res0.ok) {
+          apiSniff.apiRunning = false;
+          apiReport({ status: "error", error: "Replay TRANG 1 lỗi: " + res0.error });
+          send("CRAWL_DONE", {
+            result: { newCount: 0, reason: "Replay trang đầu thất bại." },
+          });
+          return { ok: false, error: res0.error || "replay page1 failed" };
+        }
+        const blk0 = detectBlock(res0.status, res0.blockText);
+        if (blk0) {
+          apiSniff.apiRunning = false;
+          apiReport({ status: "error", error: blk0 });
+          send("CRAWL_DONE", { result: { newCount: 0, reason: blk0 } });
+          return { ok: false, error: blk0 };
+        }
+        const pi = ingestChunks(res0.chunks);
+        cursor = pi.endCursor;
+        pages += 1;
+        await flush();
+        apiReport({ status: "page", newCount, pages, hasNext: pi.hasNext });
+      }
+      // Nhịp nghỉ giữa các trang CÓ JITTER (70%–160% nhịp cơ bản) + thỉnh thoảng
+      // nghỉ dài như người thật => pattern bớt máy móc, giảm rủi ro checkpoint.
+      const rint = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
+      let sincePageRest = 0;
+      let nextRestGap = rint(5, 8);
+      const nextPageDelay = () => {
+        sincePageRest += 1;
+        if (sincePageRest >= nextRestGap) {
+          sincePageRest = 0;
+          nextRestGap = rint(5, 8);
+          return rint(opts.pageDelay * 3, opts.pageDelay * 6);
+        }
+        return Math.round(opts.pageDelay * (0.7 + Math.random() * 0.9));
       };
       while (
         !state.stopRequested &&

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   MessagesSquare,
   Newspaper,
@@ -11,8 +11,12 @@ import {
   Bot,
   Sparkles,
   ShieldAlert,
+  LogOut,
+  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { bg, type BgResponse } from "@/lib/bg";
+import { Auth } from "@/views/Auth";
 import { Messenger } from "@/views/Messenger";
 import { Feed } from "@/views/Feed";
 import { Comments } from "@/views/Comments";
@@ -29,6 +33,11 @@ import { ChatAI } from "@/views/ChatAI";
    Feed (group posts + inline comment), Comments (reply-watch queue). Tools
    holds crawl / market / config. AI is an optional assist layer per view,
    never the driver. Views are stubbed here and built out per-todo.
+
+   XÁC THỰC: dashboard chỉ render khi ĐÃ đăng nhập. Lúc mở, App hỏi background
+   AUTH_STATE; nếu chưa đăng nhập -> render <Auth/>. App cũng nghe broadcast
+   AUTH_REQUIRED (do background phát khi token hết hạn / tài khoản bị khóa...)
+   để đá người dùng về màn hình đăng nhập kèm thông báo lý do.
    ------------------------------------------------------------------------- */
 
 type ViewId =
@@ -47,6 +56,28 @@ interface NavItem {
   label: string;
   hint: string;
   icon: typeof MessagesSquare;
+}
+
+interface AuthStateResponse extends BgResponse {
+  loggedIn?: boolean;
+  display_name?: string;
+}
+
+// Trạng thái cổng xác thực: đang kiểm tra / đã vào / chưa đăng nhập.
+type AuthGate = "checking" | "in" | "out";
+
+// reason từ background -> thông báo tiếng Việt (khớp popup.js).
+function authRequiredNote(reason: unknown): string {
+  switch (reason) {
+    case "locked":
+      return "Tài khoản của bạn đã bị khóa. Vui lòng liên hệ quản trị viên để được hỗ trợ.";
+    case "pending":
+      return "Tài khoản của bạn đang chờ được duyệt. Vui lòng thử lại sau khi được phê duyệt.";
+    case "inactive":
+      return "Tài khoản của bạn hiện không hoạt động. Vui lòng liên hệ quản trị viên.";
+    default:
+      return "Phiên đăng nhập hết hạn, vui lòng đăng nhập lại.";
+  }
 }
 
 const NAV: NavItem[] = [
@@ -149,6 +180,83 @@ export function App() {
   const [view, setView] = useState<ViewId>("messenger");
   const head = VIEW_TITLE[view];
 
+  // ---- Cổng xác thực ----
+  const [gate, setGate] = useState<AuthGate>("checking");
+  const [displayName, setDisplayName] = useState("");
+  const [notice, setNotice] = useState("");
+
+  // Hỏi background xem đã đăng nhập chưa (lúc mở dashboard).
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await bg<AuthStateResponse>("AUTH_STATE");
+        if (!alive) return;
+        if (res && res.ok && res.loggedIn) {
+          setDisplayName(res.display_name || "");
+          setGate("in");
+        } else {
+          setGate("out");
+        }
+      } catch {
+        if (alive) setGate("out");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Nghe broadcast AUTH_REQUIRED để đá về màn hình đăng nhập kèm lý do.
+  useEffect(() => {
+    interface AuthRequiredMsg {
+      type?: string;
+      reason?: string;
+    }
+    const handler = (msg: AuthRequiredMsg) => {
+      if (msg && msg.type === "AUTH_REQUIRED") {
+        setNotice(authRequiredNote(msg.reason));
+        setDisplayName("");
+        setGate("out");
+      }
+    };
+    chrome.runtime.onMessage.addListener(handler);
+    return () => {
+      chrome.runtime.onMessage.removeListener(handler);
+    };
+  }, []);
+
+  function onAuthed(name: string) {
+    setDisplayName(name);
+    setNotice("");
+    setView("messenger");
+    setGate("in");
+  }
+
+  async function doLogout() {
+    try {
+      await bg("AUTH_LOGOUT");
+    } finally {
+      setDisplayName("");
+      setNotice("");
+      setGate("out");
+    }
+  }
+
+  // Trạng thái đang kiểm tra phiên: tránh nháy dashboard trước khi biết.
+  if (gate === "checking") {
+    return (
+      <div className="flex h-screen items-center justify-center bg-bg">
+        <Loader2 className="size-6 animate-spin text-ink-faint" />
+      </div>
+    );
+  }
+
+  // Chưa đăng nhập -> chặn toàn bộ dashboard, chỉ hiển thị cổng đăng nhập.
+  if (gate === "out") {
+    return <Auth onAuthed={onAuthed} notice={notice} />;
+  }
+
   return (
     <div className="flex h-screen overflow-hidden">
       {/* ---- Sidebar: deepest instrument shelf ---- */}
@@ -202,7 +310,22 @@ export function App() {
           })}
         </nav>
 
-        <div className="px-3 py-3">
+        {/* ---- Tài khoản + đăng xuất ---- */}
+        <div className="border-t border-sb-line px-3 py-3">
+          <div className="mb-2 flex items-center justify-between gap-2 px-1">
+            <span className="min-w-0 truncate text-xs text-sb-text-dim">
+              {displayName || "Đã đăng nhập"}
+            </span>
+            <button
+              type="button"
+              onClick={() => void doLogout()}
+              title="Đăng xuất"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-sm px-2 py-1 text-xs font-medium text-sb-text transition-colors hover:bg-sb-2/60 hover:text-ink"
+            >
+              <LogOut className="size-3.5" />
+              Đăng xuất
+            </button>
+          </div>
           <div className="flex items-start gap-2 rounded-md border border-amber-soft bg-amber-soft/25 px-3 py-2.5">
             <ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber" />
             <p className="text-xs leading-snug text-ink-soft">

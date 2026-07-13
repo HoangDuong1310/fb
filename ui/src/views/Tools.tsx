@@ -12,11 +12,13 @@ import {
   Inbox,
   AlertCircle,
   PlayCircle,
+  StopCircle,
   Radar,
   Database,
   KeyRound,
   Zap,
   ExternalLink,
+  Flame,
 } from "lucide-react";
 import { bg, type BgResponse } from "@/lib/bg";
 import { colorFor, initials } from "@/lib/avatar";
@@ -36,7 +38,7 @@ import { useIncremental } from "@/lib/useIncremental";
 
 type Toast = { kind: "ok" | "err" | "info"; text: string } | null;
 type FlashFn = (kind: NonNullable<Toast>["kind"], text: string, ms?: number) => void;
-type TabId = "queue" | "crawl" | "config";
+type TabId = "queue" | "crawl" | "warming" | "config";
 
 interface Job {
   id: string;
@@ -119,6 +121,7 @@ interface AiConfigResponse extends BgResponse {
 const TABS: { id: TabId; label: string; icon: typeof ListChecks }[] = [
   { id: "queue", label: "Hàng đợi", icon: ListChecks },
   { id: "crawl", label: "Thu thập", icon: Download },
+  { id: "warming", label: "Nuôi tài khoản", icon: Flame },
   { id: "config", label: "Cấu hình", icon: Settings2 },
 ];
 
@@ -292,6 +295,8 @@ export function Tools() {
         <QueueTab flash={flash} />
       ) : tab === "crawl" ? (
         <CrawlTab flash={flash} />
+      ) : tab === "warming" ? (
+        <WarmingTab flash={flash} />
       ) : (
         <ConfigTab flash={flash} />
       )}
@@ -726,6 +731,41 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
   const [newGroupId, setNewGroupId] = useState("");
   const [newGroupName, setNewGroupName] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  // Bulk crawl state. The queue lives in a ref so the CRAWL_DONE broadcast
+  // listener (registered once) can advance it without stale closures.
+  const [bulk, setBulk] = useState<{ total: number; done: number } | null>(null);
+  const queueRef = useRef<Group[]>([]);
+  const bulkActiveRef = useRef(false);
+  const bulkTotalRef = useRef(0);
+  const bulkDoneRef = useRef(0);
+  // advanceRef always points to the freshest advanceQueue so the once-registered
+  // CRAWL_DONE listener can drive the queue without a stale closure.
+  const advanceRef = useRef<(() => void) | null>(null);
+  // Latest settings, readable from inside the queue advance loop.
+  const settingsRef = useRef(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  function randInt(min: number, max: number) {
+    return Math.floor(min + Math.random() * (max - min + 1));
+  }
+  // Heuristic: does a CRAWL_DONE reason indicate Facebook blocked us? If so we
+  // must halt the whole bulk run instead of hammering the next group.
+  function looksBlocked(reason?: string) {
+    if (!reason) return false;
+    const s = reason.toLowerCase();
+    return [
+      "block",
+      "checkpoint",
+      "429",
+      "chặn",
+      "tạm khóa",
+      "đăng nhập",
+      "login",
+    ].some((k) => s.includes(k));
+  }
 
   async function load() {
     setLoading(true);
@@ -783,12 +823,34 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
         else setProgress(`${name}: +${p.newCount || 0} bài (cuộn ${p.scrolls || 0})`);
       } else if (msg.type === "CRAWL_DONE") {
         const r = msg.result || {};
-        setProgress(
-          `Xong: +${r.newCount || 0} bài${r.reason ? ` (${r.reason})` : ""}`,
-        );
         setCrawlingId(null);
-        load();
-        window.setTimeout(() => setProgress(null), 6000);
+        // During a bulk run, hand control to the queue driver: it updates the
+        // progress text, refreshes data, applies anti-block jitter, and starts
+        // the next group (strictly one at a time). Outside a bulk run, behave
+        // exactly as before: show a one-off "done" line and reload.
+        if (bulkActiveRef.current) {
+          bulkDoneRef.current += 1;
+          setBulk({ total: bulkTotalRef.current, done: bulkDoneRef.current });
+          if (looksBlocked(r.reason)) {
+            // Facebook pushed back — abort the rest of the run to stay safe.
+            queueRef.current = [];
+            bulkActiveRef.current = false;
+            setBulk(null);
+            setProgress(
+              `Đã dừng crawl hàng loạt: có dấu hiệu bị chặn${r.reason ? ` (${r.reason})` : ""}.`,
+            );
+            load();
+            window.setTimeout(() => setProgress(null), 8000);
+          } else {
+            advanceRef.current?.();
+          }
+        } else {
+          setProgress(
+            `Xong: +${r.newCount || 0} bài${r.reason ? ` (${r.reason})` : ""}`,
+          );
+          load();
+          window.setTimeout(() => setProgress(null), 6000);
+        }
       }
     };
     try {
@@ -879,6 +941,101 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
     // Success: live updates arrive via CRAWL_PROGRESS / CRAWL_DONE.
   }
 
+  // ── Bulk crawl ──────────────────────────────────────────────────────────
+  // Facebook virtualizes the group feed and treats foreground focus as a
+  // singleton resource, so crawling MUST run one group at a time. We enforce
+  // that by draining a queue: fire one group, wait for its CRAWL_DONE, apply a
+  // randomized human-like gap, then fire the next. This mirrors the proven
+  // auto-crawl worker but is driven on demand from the dashboard.
+  async function crawlOne(g: Group) {
+    const opts = buildCrawlOptions(settingsRef.current);
+    const handler = opts.method === "dom" ? "CRAWL_GROUP" : "CRAWL_GROUP_API";
+    setCrawlingId(g.groupId);
+    const idx = bulkDoneRef.current + 1;
+    setProgress(`(${idx}/${bulkTotalRef.current}) Đang crawl ${g.groupName || g.groupId}…`);
+    const res = await bg<BgResponse & { tabId?: number }>(handler, {
+      groupId: g.groupId,
+      options: opts,
+    });
+    if (!res.ok) {
+      // Treat a failed dispatch like a finished group so the queue keeps moving
+      // instead of stalling forever waiting for a CRAWL_DONE that never comes.
+      flash("err", `${g.groupName || g.groupId}: ${res.error || "không crawl được"}.`);
+      setCrawlingId(null);
+      bulkDoneRef.current += 1;
+      setBulk({ total: bulkTotalRef.current, done: bulkDoneRef.current });
+      advanceQueue();
+    }
+    // On success, CRAWL_DONE drives the next step via advanceRef.
+  }
+
+  function advanceQueue() {
+    const next = queueRef.current.shift();
+    if (!next) {
+      // Drained — refresh data once and report the final tally.
+      const done = bulkDoneRef.current;
+      const total = bulkTotalRef.current;
+      bulkActiveRef.current = false;
+      setBulk(null);
+      setCrawlingId(null);
+      setProgress(`Đã crawl xong ${done}/${total} nhóm.`);
+      load();
+      window.setTimeout(() => setProgress(null), 8000);
+      return;
+    }
+    // Human-like gap between groups to avoid tripping rate limits.
+    const gap = randInt(20000, 90000);
+    setProgress(
+      `Nghỉ ${Math.round(gap / 1000)}s trước nhóm kế tiếp… (${bulkDoneRef.current}/${bulkTotalRef.current})`,
+    );
+    window.setTimeout(() => {
+      if (!bulkActiveRef.current) return;
+      void crawlOne(next);
+    }, gap);
+  }
+  // Keep the once-registered CRAWL_DONE listener pointing at the latest driver.
+  advanceRef.current = advanceQueue;
+
+  function startBulk(list: Group[]) {
+    if (bulkActiveRef.current) return;
+    const queue = list.filter((g) => g && g.groupId);
+    if (queue.length === 0) {
+      flash("err", "Không có nhóm nào để crawl.");
+      return;
+    }
+    if (crawlingId) {
+      flash("err", "Đang có một nhóm đang crawl, hãy đợi xong đã.");
+      return;
+    }
+    queueRef.current = queue.slice();
+    bulkTotalRef.current = queue.length;
+    bulkDoneRef.current = 0;
+    bulkActiveRef.current = true;
+    setBulk({ total: queue.length, done: 0 });
+    flash("info", `Bắt đầu crawl ${queue.length} nhóm (tuần tự).`, 4000);
+    const first = queueRef.current.shift();
+    if (first) void crawlOne(first);
+  }
+
+  function stopBulk() {
+    queueRef.current = [];
+    bulkActiveRef.current = false;
+    setBulk(null);
+    setProgress(
+      `Đã yêu cầu dừng sau nhóm hiện tại (${bulkDoneRef.current}/${bulkTotalRef.current}).`,
+    );
+    window.setTimeout(() => setProgress(null), 6000);
+  }
+
+  function toggleSelect(groupId: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }
+
   async function deleteGroup(groupId: string) {
     const res = await bg("DELETE_GROUP", { groupId });
     setConfirmDeleteId(null);
@@ -939,6 +1096,52 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
               Quét nhóm đã tham gia
             </button>
           </div>
+        </div>
+
+        {/* Bulk crawl actions */}
+        <div className="flex flex-wrap items-center gap-2 border-t border-line-soft pt-3">
+          <button
+            onClick={() => startBulk(groups)}
+            disabled={!!bulk || !!crawlingId || groups.length === 0}
+            className="inline-flex items-center gap-1.5 rounded-sm bg-accent px-2.5 py-1 text-xs font-semibold text-on-accent transition-colors hover:bg-accent-bright disabled:opacity-50"
+          >
+            <Download className="size-3.5" />
+            Crawl tất cả ({groups.length})
+          </button>
+          <button
+            onClick={() =>
+              startBulk(groups.filter((g) => selected.has(g.groupId)))
+            }
+            disabled={!!bulk || !!crawlingId || selected.size === 0}
+            className="inline-flex items-center gap-1.5 rounded-sm border border-line bg-surface-2 px-2.5 py-1 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-50"
+          >
+            <ListChecks className="size-3.5" />
+            Crawl nhóm đã chọn ({selected.size})
+          </button>
+          {selected.size > 0 && !bulk && (
+            <button
+              onClick={() => setSelected(new Set())}
+              className="inline-flex items-center gap-1 rounded-sm px-2 py-1 text-xs text-ink-faint transition-colors hover:text-ink"
+            >
+              <X className="size-3.5" />
+              Bỏ chọn
+            </button>
+          )}
+          {bulk && (
+            <div className="ml-auto flex items-center gap-2 text-xs text-ink-soft">
+              <Loader2 className="size-3.5 animate-spin text-accent" />
+              <span>
+                Đang crawl {bulk.done}/{bulk.total} nhóm…
+              </span>
+              <button
+                onClick={stopBulk}
+                className="inline-flex items-center gap-1 rounded-sm border border-red-soft bg-red-soft/15 px-2 py-1 text-xs font-medium text-red transition-colors hover:bg-red-soft/30"
+              >
+                <X className="size-3.5" />
+                Dừng
+              </button>
+            </div>
+          )}
         </div>
 
         {addOpen && (
@@ -1042,6 +1245,14 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
                 className="flex flex-col gap-3 rounded-lg border border-line bg-surface p-3"
               >
                 <div className="flex items-center gap-2.5">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(g.groupId)}
+                    onChange={() => toggleSelect(g.groupId)}
+                    disabled={!!bulk}
+                    className="size-4 shrink-0 accent-[var(--accent)] disabled:opacity-50"
+                    title="Chọn để crawl hàng loạt"
+                  />
                   <Avatar name={g.groupName || g.groupId} />
                   <div className="min-w-0">
                     <div
@@ -1078,7 +1289,7 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => crawl(g)}
-                      disabled={busy || !!crawlingId}
+                      disabled={busy || !!crawlingId || !!bulk}
                       className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-sm bg-accent px-2.5 py-1.5 text-xs font-semibold text-on-accent transition-colors hover:bg-accent-bright disabled:opacity-50"
                     >
                       {busy ? (
@@ -1127,7 +1338,441 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
   );
 }
 
-/* ============================ TAB 3 — CẤU HÌNH =========================== */
+/* ========================= TAB 3 — NUÔI TÀI KHOẢN ======================== */
+// Giữ tài khoản "còn sống" bằng các hành động ĐỌC thụ động (cuộn bảng tin, xem
+// video, mở thông báo) chạy theo lịch. TẤT CẢ cấu hình + nhật ký đều lưu ở
+// SERVER (BE) qua các message WARMING_* -> crawl.js -> DB, không dùng
+// chrome.storage.local. Không có hành động ghi (đăng/bình luận) để tránh cờ spam.
+
+interface WarmingConfig {
+  enabled: boolean;
+  intervalMinutes: number;
+  actionsPerRun: number;
+  actions: string[];
+}
+
+interface WarmingConfigResponse extends BgResponse {
+  config?: WarmingConfig;
+}
+
+interface WarmingActivityEntry {
+  id: number;
+  type: string;
+  status: string;
+  createdAt?: number | null;
+  data?: unknown;
+}
+
+interface WarmingActivityResponse extends BgResponse {
+  entries?: WarmingActivityEntry[];
+}
+
+interface WarmingRunResponse extends BgResponse {
+  done?: number;
+  blocked?: boolean;
+  stopped?: boolean;
+}
+
+// Các hành động hợp lệ, khớp WARMING_ACTIONS trong src/crawl.js.
+// Nhóm GHI (tương tác thật): reactPost, reactReels — khớp WARMING_WRITE_ACTIONS.
+const WARMING_WRITE_ACTION_IDS = ["reactPost", "reactReels"];
+const WARMING_ACTION_LABELS: { id: string; label: string; hint: string }[] = [
+  { id: "scrollFeed", label: "Cuộn bảng tin", hint: "Lướt News Feed vài nhịp." },
+  { id: "watchVideo", label: "Xem video", hint: "Mở Watch, xem ngắn một video." },
+  {
+    id: "openNotifications",
+    label: "Mở thông báo",
+    hint: "Ghé trang thông báo một lượt.",
+  },
+  {
+    id: "scrollGroups",
+    label: "Lướt feed nhóm",
+    hint: "Mở feed các nhóm đã tham gia, cuộn xem vài nhịp.",
+  },
+  {
+    id: "scrollReels",
+    label: "Lướt Reels",
+    hint: "Mở Reels (thước phim), xem và lướt vài video như người xem thật.",
+  },
+  {
+    id: "reactPost",
+    label: "Thả cảm xúc bài viết",
+    hint: "Tương tác thật (bấm Thích). Rất dễ dính checkpoint với tài khoản mới nên chỉ thực hiện ngẫu nhiên ~30% số lượt, tối đa 1 bài.",
+  },
+  {
+    id: "reactReels",
+    label: "Thả cảm xúc Reels",
+    hint: "Tương tác thật với Reels (thước phim). Rất dễ dính checkpoint với tài khoản mới nên chỉ thực hiện ngẫu nhiên ~30% số lượt, tối đa 1 Reel.",
+  },
+];
+
+// Chu kỳ nuôi (phút). Rộng hơn INTERVALS của crawl vì hành vi này nên thưa.
+const WARMING_INTERVALS = [15, 30, 60, 90, 120, 240, 480, 720, 1440];
+
+function warmingIntervalLabel(n: number): string {
+  if (n < 60) return `${n} phút`;
+  const h = n / 60;
+  return Number.isInteger(h) ? `${h} giờ` : `${(n / 60).toFixed(1)} giờ`;
+}
+
+const WARMING_STATUS_LABELS: Record<string, string> = {
+  done: "Xong",
+  error: "Lỗi",
+  blocked: "Bị chặn",
+  stopped: "Đã dừng",
+};
+
+function warmingActionLabel(type: string): string {
+  return WARMING_ACTION_LABELS.find((a) => a.id === type)?.label || type;
+}
+
+function WarmingTab({ flash }: { flash: FlashFn }) {
+  const [config, setConfig] = useState<WarmingConfig>({
+    enabled: false,
+    intervalMinutes: 90,
+    actionsPerRun: 3,
+    // Các hành động GHI (reactPost/reactReels) là tương tác thật nên KHÔNG bật
+    // sẵn; người dùng phải chủ động tích. Khớp mặc định phía backend
+    // (WARMING_DEFAULT chỉ bật các loại read-only).
+    actions: WARMING_ACTION_LABELS.filter(
+      (a) => !WARMING_WRITE_ACTION_IDS.includes(a.id),
+    ).map((a) => a.id),
+  });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [entries, setEntries] = useState<WarmingActivityEntry[]>([]);
+  const [logLoading, setLogLoading] = useState(true);
+
+  async function loadConfig() {
+    setLoading(true);
+    const res = await bg<WarmingConfigResponse>("GET_WARMING_CONFIG", {});
+    if (res.ok && res.config) setConfig(res.config);
+    setLoading(false);
+  }
+
+  async function loadLog() {
+    setLogLoading(true);
+    const res = await bg<WarmingActivityResponse>("GET_WARMING_ACTIVITY", {
+      limit: 30,
+    });
+    if (res.ok && Array.isArray(res.entries)) setEntries(res.entries);
+    setLogLoading(false);
+  }
+
+  useEffect(() => {
+    void loadConfig();
+    void loadLog();
+  }, []);
+
+  // Lắng nghe tiến trình realtime WARMING_PROGRESS từ service worker (giống
+  // cách CrawlTab nghe CRAWL_PROGRESS). Mỗi hành động xong sẽ đẩy một nhịp.
+  useEffect(() => {
+    interface WarmingProgressMsg {
+      type?: string;
+      action?: string;
+      status?: string;
+      done?: number;
+      total?: number;
+    }
+    const handler = (msg: WarmingProgressMsg) => {
+      if (!msg || msg.type !== "WARMING_PROGRESS") return;
+      const label = warmingActionLabel(msg.action || "");
+      const done = msg.done || 0;
+      const total = msg.total || 0;
+      if (msg.status === "blocked") {
+        setProgress(`Dừng vì có dấu hiệu bị chặn (${label}).`);
+      } else if (msg.status === "error") {
+        setProgress(`${label}: lỗi (${done}/${total}).`);
+      } else {
+        setProgress(`${label}: xong (${done}/${total}).`);
+      }
+      // Làm mới nhật ký khi vừa có hành động mới ghi lên server.
+      void loadLog();
+    };
+    try {
+      chrome.runtime.onMessage.addListener(handler);
+    } catch {
+      /* not in extension context */
+    }
+    return () => {
+      try {
+        chrome.runtime.onMessage.removeListener(handler);
+      } catch {
+        /* noop */
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function toggleAction(id: string) {
+    setConfig((c) => {
+      const has = c.actions.includes(id);
+      const next = has
+        ? c.actions.filter((a) => a !== id)
+        : [...c.actions, id];
+      // Luôn giữ ít nhất một hành động để mỗi lượt có việc để làm.
+      return { ...c, actions: next.length ? next : c.actions };
+    });
+  }
+
+  async function save(patch: Partial<WarmingConfig>) {
+    const next = { ...config, ...patch };
+    setConfig(next);
+    setSaving(true);
+    const res = await bg<WarmingConfigResponse>("SET_WARMING_CONFIG", {
+      config: next,
+    });
+    setSaving(false);
+    if (!res.ok) {
+      flash("err", res.error || "Không lưu được cấu hình.");
+      return;
+    }
+    if (res.config) setConfig(res.config);
+    flash("ok", "Đã lưu cấu hình nuôi tài khoản.");
+  }
+
+  async function runNow() {
+    setRunning(true);
+    setProgress("Đang chạy một lượt nuôi tài khoản…");
+    const res = await bg<WarmingRunResponse>("WARMING_RUN_NOW", {
+      actionsPerRun: config.actionsPerRun,
+    });
+    setRunning(false);
+    if (!res.ok) {
+      setProgress(null);
+      flash("err", res.error || "Không chạy được lượt nuôi tài khoản.");
+      return;
+    }
+    if (res.blocked) {
+      setProgress("Lượt chạy dừng sớm: có dấu hiệu bị chặn.");
+      flash("info", "Đã dừng vì FB có dấu hiệu chặn.");
+    } else if (res.stopped) {
+      setProgress(`Đã dừng theo yêu cầu (xong ${res.done || 0} hành động).`);
+      flash("info", "Đã dừng lượt nuôi tài khoản.");
+    } else {
+      setProgress(`Xong ${res.done || 0} hành động.`);
+      flash("ok", `Đã nuôi ${res.done || 0} hành động.`);
+    }
+    window.setTimeout(() => setProgress(null), 6000);
+    void loadLog();
+  }
+
+  async function stopNow() {
+    setProgress("Đang dừng lượt nuôi tài khoản…");
+    await bg("WARMING_STOP", {});
+    // processWarming sẽ thoát ở lần kiểm tra kế tiếp; nhật ký tự làm mới qua
+    // WARMING_PROGRESS. Không tắt cờ running ở đây để tránh nhấp Chạy chồng.
+  }
+
+  if (loading) {
+    return (
+      <div className="flex flex-col gap-3">
+        <ListSkeleton />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Bảng điều khiển chính: bật/tắt, chu kỳ, số hành động, chạy ngay. */}
+      <section className="flex flex-col gap-4 rounded-lg border border-line bg-surface p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-accent/10 text-accent">
+              <Flame size={18} />
+            </div>
+            <div>
+              <h2 className="text-sm font-semibold text-ink">Nuôi tài khoản</h2>
+              <p className="mt-0.5 max-w-md text-xs text-ink-faint">
+                Chạy các hành động đọc thụ động theo lịch để tài khoản trông tự
+                nhiên. Không đăng bài, không bình luận.
+              </p>
+            </div>
+          </div>
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-ink-soft">
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-accent"
+              checked={config.enabled}
+              disabled={saving}
+              onChange={(e) => void save({ enabled: e.target.checked })}
+            />
+            <span>{config.enabled ? "Đang bật" : "Đang tắt"}</span>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Chu kỳ chạy
+            <select
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.intervalMinutes}
+              disabled={saving}
+              onChange={(e) =>
+                void save({ intervalMinutes: parseInt(e.target.value, 10) })
+              }
+            >
+              {WARMING_INTERVALS.map((n) => (
+                <option key={n} value={n}>
+                  Mỗi {warmingIntervalLabel(n)}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Số việc tối đa mỗi lượt
+            <input
+              type="number"
+              min={1}
+              max={8}
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.actionsPerRun}
+              disabled={saving}
+              onChange={(e) =>
+                setConfig((c) => ({
+                  ...c,
+                  actionsPerRun: clamp(
+                    parseInt(e.target.value, 10),
+                    1,
+                    8,
+                    c.actionsPerRun,
+                  ),
+                }))
+              }
+              onBlur={() => void save({ actionsPerRun: config.actionsPerRun })}
+            />
+          </label>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <span className="text-xs font-medium text-ink-soft">
+            Hành động cho phép
+          </span>
+          <div className="flex flex-col gap-2">
+            {WARMING_ACTION_LABELS.map((a) => (
+              <label
+                key={a.id}
+                className="flex cursor-pointer items-start gap-2.5 rounded-md border border-line-soft bg-surface-2/40 px-3 py-2.5 text-sm text-ink-soft"
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 accent-accent"
+                  checked={config.actions.includes(a.id)}
+                  disabled={saving}
+                  onChange={() => {
+                    toggleAction(a.id);
+                  }}
+                  onBlur={() => void save({ actions: config.actions })}
+                />
+                <span className="flex flex-col">
+                  <span className="text-ink">{a.label}</span>
+                  <span className="text-xs text-ink-faint">{a.hint}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 border-t border-line-soft pt-3">
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-md bg-accent px-3.5 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            onClick={() => void runNow()}
+            disabled={running || saving}
+          >
+            {running ? (
+              <Loader2 size={15} className="animate-spin" />
+            ) : (
+              <PlayCircle size={15} />
+            )}
+            Chạy ngay một lượt
+          </button>
+          {running ? (
+            <button
+              type="button"
+              className="inline-flex items-center gap-2 rounded-md border border-line px-3.5 py-2 text-sm font-medium text-ink-soft transition-colors hover:border-red-soft hover:text-red disabled:opacity-50"
+              onClick={() => void stopNow()}
+            >
+              <StopCircle size={15} />
+              Dừng
+            </button>
+          ) : null}
+          {progress ? (
+            <span className="text-xs text-ink-faint">{progress}</span>
+          ) : null}
+        </div>
+      </section>
+
+      {/* Nhật ký hành động (lưu trên SERVER, tải qua GET_WARMING_ACTIVITY). */}
+      <section className="flex flex-col gap-3 rounded-lg border border-line bg-surface p-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-ink">Nhật ký gần đây</h3>
+          <button
+            type="button"
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-xs text-ink-soft transition-colors hover:border-accent/40 disabled:opacity-50"
+            onClick={() => void loadLog()}
+            disabled={logLoading}
+          >
+            <RefreshCw
+              size={13}
+              className={logLoading ? "animate-spin" : ""}
+            />
+            Làm mới
+          </button>
+        </div>
+        {logLoading ? (
+          <ListSkeleton />
+        ) : entries.length === 0 ? (
+          <p className="py-6 text-center text-sm text-ink-faint">
+            Chưa có hành động nào được ghi.
+          </p>
+        ) : (
+          <ul className="flex flex-col divide-y divide-line-soft">
+            {entries.map((e) => (
+              <li
+                key={e.id}
+                className="flex items-center justify-between gap-3 py-2.5 text-sm"
+              >
+                <div className="flex items-center gap-2.5">
+                  <span
+                    className={cn(
+                      "inline-flex h-6 w-6 items-center justify-center rounded-full",
+                      e.status === "done"
+                        ? "bg-emerald-500/10 text-emerald-500"
+                        : e.status === "blocked"
+                          ? "bg-amber-500/10 text-amber-500"
+                          : "bg-rose-500/10 text-rose-500",
+                    )}
+                  >
+                    {e.status === "done" ? (
+                      <CheckCircle2 size={14} />
+                    ) : (
+                      <AlertCircle size={14} />
+                    )}
+                  </span>
+                  <span className="text-ink">
+                    {warmingActionLabel(e.type)}
+                  </span>
+                  <span className="text-xs text-ink-faint">
+                    {WARMING_STATUS_LABELS[e.status] || e.status}
+                  </span>
+                </div>
+                <span className="text-xs text-ink-faint">
+                  {timeAgo(e.createdAt ?? undefined)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/* ============================ TAB 4 — CẤU HÌNH =========================== */
 function ConfigTab({ flash }: { flash: FlashFn }) {
   const [ai, setAi] = useState<AiConfig>({
     apiBase: "",
