@@ -473,12 +473,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case "APPROVE_ALL_JOBS": {
       // Duyệt tất cả việc đang chờ (tuỳ chọn lọc theo type): paused -> pending.
+      // MỘT lượt gọi server (một câu UPDATE) thay cho N vòng PATCH tuần tự — tránh
+      // service worker MV3 quá hạn phản hồi khi hàng đợi nhiều job ảnh base64
+      // (lỗi "The message port closed before a response was received.").
       (async () => {
-        const jobs = await DB.getJobs(msg.jobType);
-        const paused = jobs.filter((j) => j.status === "paused");
-        for (const j of paused) await DB.updateJob(j.id, { status: "pending" });
-        if (paused.length) scheduleTickSoon();
-        sendResponse({ ok: true, approved: paused.length });
+        const approved = await DB.approveAllJobs(msg.jobType);
+        if (approved) scheduleTickSoon();
+        sendResponse({ ok: true, approved });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }

@@ -30,6 +30,7 @@ import {
   type LeadLabel,
   type LeadMode,
 } from "@/lib/leadfilter";
+import { compressImageFiles } from "@/lib/image";
 
 /* -------------------------------------------------------------------------
    Messenger view — two surfaces behind a tab switch:
@@ -279,19 +280,9 @@ function fillTemplate(content: string, name: string): string {
 }
 
 // Chuyển FileList -> mảng data URL để đính kèm ảnh (giống Compose).
+// Nén ảnh trước khi vào hàng đợi để tránh phình cột jobs.data (xem ui/src/lib/image.ts).
 function readFiles(fileList: FileList): Promise<string[]> {
-  return Promise.all(
-    [...fileList].map(
-      (f) =>
-        new Promise<string | null>((resolve) => {
-          const fr = new FileReader();
-          fr.onload = () =>
-            resolve(typeof fr.result === "string" ? fr.result : null);
-          fr.onerror = () => resolve(null);
-          fr.readAsDataURL(f);
-        }),
-    ),
-  ).then((arr) => arr.filter((x): x is string => !!x));
+  return compressImageFiles(fileList);
 }
 
 const PITCH_LEAD_FILTERS: { id: LeadMode; label: string }[] = [

@@ -408,7 +408,7 @@ function QueueTab({ flash }: { flash: FlashFn }) {
   }
 
   async function approveAll() {
-    const res = await bg<BgResponse & { approved?: number }>("APROVE_ALL_JOBS", {});
+    const res = await bg<BgResponse & { approved?: number }>("APPROVE_ALL_JOBS", {});
     if (!res.ok) {
       flash("err", res.error || "Không duyệt được.");
       return;

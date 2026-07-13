@@ -215,6 +215,19 @@ async function clearAllJobs() {
   return (r && r.deleted) || 0;
 }
 
+/**
+ * Duyệt HÀNG LOẠT: mọi job đang CHỜ DUYỆT (paused) chuyển sang pending trong MỘT
+ * lượt gọi (server chạy một câu UPDATE). Tránh N vòng PATCH tuần tự làm service
+ * worker MV3 quá hạn phản hồi (lỗi "message port closed"). Trả về số job đã duyệt.
+ */
+async function approveAllJobs(type) {
+  const r = await apiFetch("/api/jobs/approve-all", {
+    method: "POST",
+    body: JSON.stringify(type ? { type } : {}),
+  });
+  return (r && r.approved) || 0;
+}
+
 /* ============ GIỚI HẠN AN TOÀN CHO JOB CHÀO HÀNG (message) ============== */
 //
 // Gửi tin nhắn chào hàng qua inbox rủi ro cao hơn đăng bài / bình luận, nên áp
@@ -793,6 +806,7 @@ export {
   deleteJob,
   clearFinishedJobs,
   clearAllJobs,
+  approveAllJobs,
   // giới hạn an toàn cho job chào hàng (message)
   countMessageJobsToday,
   findLiveMessageJobByProfile,

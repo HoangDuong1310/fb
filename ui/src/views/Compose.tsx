@@ -20,6 +20,7 @@ import {
 import { bg, type BgResponse } from "@/lib/bg";
 import { cn } from "@/lib/utils";
 import { useIncremental } from "@/lib/useIncremental";
+import { compressImageFiles } from "@/lib/image";
 
 /* -------------------------------------------------------------------------
    Compose — Đăng bài lên nhiều nhóm (và/hoặc trang cá nhân).
@@ -93,18 +94,9 @@ function fmtPrice(v?: number | string): string {
   return n.toLocaleString("vi-VN") + "₫";
 }
 
+// Nén ảnh trước khi vào hàng đợi để tránh phình cột jobs.data (xem ui/src/lib/image.ts).
 function readFiles(fileList: FileList): Promise<string[]> {
-  return Promise.all(
-    [...fileList].map(
-      (f) =>
-        new Promise<string | null>((resolve) => {
-          const fr = new FileReader();
-          fr.onload = () => resolve(typeof fr.result === "string" ? fr.result : null);
-          fr.onerror = () => resolve(null);
-          fr.readAsDataURL(f);
-        }),
-    ),
-  ).then((arr) => arr.filter((x): x is string => !!x));
+  return compressImageFiles(fileList);
 }
 
 export function Compose() {
