@@ -35,11 +35,22 @@ import { getAIConfig, fetchWithTimeout, parseSelectorJson } from "./util.js";
 /**
  * Phiên bản logic phân loại lead. TĂNG khi đổi luật/keyword gốc để bài cũ được
  * phân loại lại (bài có lead_ver < LEAD_VER sẽ vào hàng chờ needLead).
+ *
+ * v1 -> v2: kỷ nguyên "silent bug" trước đây có thể đã đóng dấu nhãn SAI ở
+ * lead_ver=1 (gán 'other' khi AI hỏng mà không báo lỗi). Tăng lên 2 để MỌI bài
+ * cũ tự xếp lại hàng phân loại ĐÚNG MỘT LẦN (chữa dữ liệu sai), sau đó thôi.
+ * Nhờ vậy nút "Phân loại lại" chạy INCREMENTAL (không force) vẫn xử được bài cũ
+ * mà không đốt token lặp lại ở những lần bấm sau.
  */
-export const LEAD_VER = 1;
+export const LEAD_VER = 2;
 
 // Số bài tối đa gửi AI trong MỘT lần gọi (chỉ áp cho ca mơ hồ).
 const BATCH_SIZE = 12;
+
+// Số lô AI chạy SONG SONG cùng lúc. Trước đây chạy 1 lô/lần rất chậm với ~1000
+// bài; chạy vài luồng song song rút ngắn thời gian đáng kể mà không dội quá
+// nhiều request lên API cùng lúc.
+const AI_CONCURRENCY = 4;
 
 // Ngưỡng "chắc chắn" của RULE: nhãn thắng phải có điểm >= CONF_MIN và vượt nhãn
 // nhì tối thiểu CONF_MARGIN. Dưới ngưỡng -> coi là MƠ HỒ, nhường cho AI.
@@ -77,15 +88,20 @@ export function classifyRule(text) {
 /* =========================== TẦNG 2: CHỌN BÀI ============================= */
 
 /**
- * selectForClassify(posts, leadVer) — chọn bài CẦN phân loại.
+ * selectForClassify(posts, leadVer, opts) — chọn bài CẦN phân loại.
  * Lấy bài: (a) chưa có nhãn (leadLabel rỗng) HOẶC (b) nhãn cũ hơn leadVer;
  * NHƯNG bỏ qua bài người dùng sửa tay (leadSource='manual') — đã chốt, không đụng.
+ *
+ * opts.force=true: người dùng bấm "Phân loại lại" -> chạy lại TẤT CẢ bài không
+ * phải manual bất kể đã có nhãn/đúng phiên bản hay chưa (vẫn tôn trọng manual).
  */
-export function selectForClassify(posts, leadVer = LEAD_VER) {
+export function selectForClassify(posts, leadVer = LEAD_VER, opts = {}) {
   if (!Array.isArray(posts)) return [];
+  const force = !!(opts && opts.force);
   return posts.filter((p) => {
     if (!p) return false;
     if (p.leadSource === "manual") return false;
+    if (force) return true;
     if (!p.leadLabel) return true;
     const v = Number.isFinite(Number(p.leadVer)) ? Number(p.leadVer) : 0;
     return v < leadVer;
@@ -118,20 +134,78 @@ function chunk(arr, size) {
 }
 
 /**
- * classifyBatch(posts, aiCall) — gọi `aiCall(batch)` cho mỗi lô ~12 bài chỉ với
- * các bài MƠ HỒ. `aiCall` trả mảng per-post { postId, label, phrases }. Gộp mọi
- * lô lại. `aiCall` được TIÊM VÀO để test mock.
+ * classifyBatch(posts, aiCall, onProgress) — gọi `aiCall(batch)` cho mỗi lô ~12
+ * bài chỉ với các bài MƠ HỒ. `aiCall` trả mảng per-post { postId, label,
+ * phrases }. Gộp mọi lô lại. `aiCall` được TIÊM VÀO để test mock.
+ *
+ * SONG SONG + CÁCH LY LỖI: các lô chạy qua một "hồ" tối đa AI_CONCURRENCY luồng
+ * cùng lúc (nhanh hơn nhiều so với 1 lô/lần). MỖI lô được bọc try/catch: nếu 1
+ * lô hỏng (timeout/rate-limit/JSON lỗi) thì chỉ các bài trong lô đó rơi về
+ * 'other', TOÀN BỘ tiến trình VẪN CHẠY TIẾP — không còn cảnh "chạy tới 400/1000
+ * rồi đứng" do một lô ném lỗi kéo sập cả vòng lặp.
+ *
+ * onProgress(info) (tuỳ chọn): gọi SAU MỖI LÔ với { done, total } (số bài mơ hồ
+ * đã xử lý / tổng) để UI hiện tiến độ thực thay vì spinner đứng im.
  */
-export async function classifyBatch(posts, aiCall) {
+export async function classifyBatch(posts, aiCall, onProgress) {
   if (!Array.isArray(posts) || posts.length === 0) return [];
   if (typeof aiCall !== "function") {
     throw new Error("classifyBatch: aiCall phải là một hàm.");
   }
-  const results = [];
-  for (const batch of chunk(posts, BATCH_SIZE)) {
-    const out = await aiCall(batch);
+
+  const batches = chunk(posts, BATCH_SIZE);
+  const perBatch = new Array(batches.length); // kết quả từng lô, giữ đúng thứ tự
+  const total = posts.length;
+  let done = 0;
+
+  const report = () => {
+    if (typeof onProgress !== "function") return;
+    try {
+      onProgress({ phase: "ai", done, total });
+    } catch (_) {
+      /* progress là best-effort, không được làm hỏng luồng chính */
+    }
+  };
+
+  // Xử một lô: gọi AI, lỗi thì rơi về 'other' cho riêng lô đó (không ném ra
+  // ngoài để khỏi kéo sập cả hồ luồng).
+  const runOne = async (idx) => {
+    const batch = batches[idx];
+    let out;
+    try {
+      out = await aiCall(batch);
+    } catch (_) {
+      out = null; // lô hỏng -> fallback 'other' bên dưới
+    }
     if (Array.isArray(out)) {
-      for (const entry of out) results.push(entry);
+      perBatch[idx] = out;
+    } else {
+      perBatch[idx] = batch.map((p) => ({
+        postId: p.postId,
+        label: "other",
+        phrases: [],
+      }));
+    }
+    done += batch.length;
+    report();
+  };
+
+  // Hồ luồng: tối đa AI_CONCURRENCY worker cùng rút lô kế tiếp theo thứ tự index.
+  let next = 0;
+  const worker = async () => {
+    while (next < batches.length) {
+      const idx = next++;
+      await runOne(idx);
+    }
+  };
+  const poolSize = Math.min(AI_CONCURRENCY, batches.length);
+  await Promise.all(Array.from({ length: poolSize }, () => worker()));
+
+  // Gộp theo đúng thứ tự lô.
+  const results = [];
+  for (const part of perBatch) {
+    if (Array.isArray(part)) {
+      for (const entry of part) results.push(entry);
     }
   }
   return results;
@@ -278,13 +352,26 @@ export async function runLeadClassification(deps = {}) {
   const aiCall = deps.aiCall || defaultAiCall;
   const leadVer = Number.isFinite(Number(deps.leadVer)) ? Number(deps.leadVer) : LEAD_VER;
   const savePost = deps.savePost || defaultSavePost(apiFetch, leadVer);
+  // onProgress(info): best-effort, để UI hiện tiến độ THỰC (không phải spinner
+  // đứng im). Các phase: "select" | "ai" | "save" | "done".
+  const emit = (info) => {
+    if (typeof deps.onProgress !== "function") return;
+    try {
+      deps.onProgress(info);
+    } catch (_) {
+      /* progress không được làm hỏng luồng chính */
+    }
+  };
 
-  // 1) Chọn bài cần phân loại.
+  // 1) Chọn bài cần phân loại. force=true (bấm "Phân loại lại") -> chạy lại mọi
+  //    bài không phải manual, kể cả bài đã có nhãn đúng phiên bản.
   const posts = (await getAllPosts()) || [];
-  const todo = selectForClassify(posts, leadVer);
+  const todo = selectForClassify(posts, leadVer, { force: !!deps.force });
   if (todo.length === 0) {
+    emit({ phase: "done", processed: 0, total: 0 });
     return { processed: 0, ruleCount: 0, aiCount: 0, promoted: 0, queued: 0 };
   }
+  emit({ phase: "select", total: todo.length });
 
   // 2) Rule chốt ca rõ; gom ca mơ hồ.
   const { confident, ambiguous } = splitByConfidence(todo);
@@ -296,10 +383,12 @@ export async function runLeadClassification(deps = {}) {
     labeled.push({ post: c.post, label: c.label, source: "rule" });
   }
 
-  // 3) AI cho ca mơ hồ.
+  // 3) AI cho ca mơ hồ. Phát tiến độ theo từng lô để UI không thấy spinner đơ.
   const aiPhrases = { buy: new Map(), support: new Map(), seller: new Map() };
   if (ambiguous.length > 0) {
-    const aiResults = await classifyBatch(ambiguous, aiCall);
+    const aiResults = await classifyBatch(ambiguous, aiCall, (p) =>
+      emit({ ...p, ruleDone: confident.length }),
+    );
     const postById = new Map(ambiguous.map((p) => [String(p.postId), p]));
     for (const r of aiResults) {
       if (!r || r.postId == null) continue;
@@ -317,14 +406,33 @@ export async function runLeadClassification(deps = {}) {
     }
   }
 
-  // 4) Lưu nhãn cho từng bài.
+  // 4) Lưu nhãn cho từng bài. Chạy SONG SONG qua hồ luồng (tối đa SAVE_CONCURRENCY
+  //    request cùng lúc) thay vì tuần tự 1 bài/lần — với ~1000 bài, lưu tuần tự
+  //    là nút thắt lớn. Mỗi lần lưu bọc try/catch: 1 bài lỗi không kéo sập cả mẻ.
   let ruleCount = 0;
   let aiCount = 0;
-  for (const it of labeled) {
-    await savePost(it.post.postId, it.label, it.source);
-    if (it.source === "rule") ruleCount++;
-    else aiCount++;
-  }
+  let saved = 0;
+  const totalSave = labeled.length;
+  let nextSave = 0;
+  const saveWorker = async () => {
+    while (nextSave < totalSave) {
+      const it = labeled[nextSave++];
+      try {
+        await savePost(it.post.postId, it.label, it.source);
+      } catch (_) {
+        /* best-effort: 1 bài lưu lỗi không dừng cả mẻ */
+      }
+      if (it.source === "rule") ruleCount++;
+      else aiCount++;
+      saved++;
+      // Nhịp báo mỗi ~20 bài để tránh spam broadcast nhưng vẫn thấy nhúc nhích.
+      if (saved % 20 === 0 || saved === totalSave) {
+        emit({ phase: "save", done: saved, total: totalSave });
+      }
+    }
+  };
+  const savePool = Math.min(AI_CONCURRENCY, totalSave);
+  await Promise.all(Array.from({ length: savePool }, () => saveWorker()));
 
   // 5) VÒNG HỌC: đào cụm từ đặc trưng từ các bài vừa gán nhãn chắc chắn.
   const minedPosts = labeled
@@ -377,6 +485,12 @@ export async function runLeadClassification(deps = {}) {
     }
   }
 
+  emit({
+    phase: "done",
+    processed: labeled.length,
+    total: labeled.length,
+    aiCount,
+  });
   return {
     processed: labeled.length,
     ruleCount,

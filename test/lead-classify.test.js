@@ -68,6 +68,18 @@ test("selectForClassify: lấy bài chưa nhãn/nhãn cũ, bỏ manual & bản h
   assert.deepEqual(ids, ["a", "c", "e"]);
 });
 
+test("selectForClassify: force=true -> lấy mọi bài không phải manual bất kể nhãn/phiên bản", () => {
+  const posts = [
+    null,
+    { postId: "a" }, // chưa nhãn -> lấy
+    { postId: "b", leadLabel: "buy", leadVer: 1 }, // đúng phiên bản nhưng force -> lấy
+    { postId: "c", leadLabel: "other", leadVer: 1 }, // đã gán other -> vẫn lấy khi force
+    { postId: "d", leadSource: "manual", leadLabel: "seller" }, // manual -> vẫn bỏ
+  ];
+  const ids = selectForClassify(posts, 1, { force: true }).map((p) => p.postId);
+  assert.deepEqual(ids, ["a", "b", "c"]);
+});
+
 test("selectForClassify: đầu vào không phải mảng -> []", () => {
   assert.deepEqual(selectForClassify(null), []);
   assert.deepEqual(selectForClassify("nope"), []);
@@ -113,6 +125,26 @@ test("classifyBatch: mảng rỗng / không phải mảng -> [] (không gọi AI
   };
   assert.deepEqual(await classifyBatch([], aiCall), []);
   assert.deepEqual(await classifyBatch("no", aiCall), []);
+});
+
+test("classifyBatch: 1 lô ném lỗi -> lô đó rơi về 'other', các lô khác VẪN chạy", async () => {
+  // 25 bài -> 3 lô [12,12,1]. Lô thứ 2 (index 1) ném lỗi; các lô còn lại OK.
+  const posts = Array.from({ length: 25 }, (_, i) => ({ postId: String(i) }));
+  let call = 0;
+  const aiCall = async (batch) => {
+    const idx = call++;
+    if (idx === 1) throw new Error("giả lập rate-limit/timeout ở lô 2");
+    return batch.map((p) => ({ postId: p.postId, label: "buy" }));
+  };
+  const out = await classifyBatch(posts, aiCall);
+  // Không mất bài nào: đủ 25 kết quả dù 1 lô hỏng.
+  assert.equal(out.length, 25);
+  const byId = new Map(out.map((r) => [r.postId, r.label]));
+  // Bài trong lô hỏng (index 12..23) -> 'other'; còn lại -> 'buy'.
+  assert.equal(byId.get("0"), "buy");
+  assert.equal(byId.get("12"), "other");
+  assert.equal(byId.get("23"), "other");
+  assert.equal(byId.get("24"), "buy");
 });
 
 /* ========================= mineKeywordCandidates ========================== */

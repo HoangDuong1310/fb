@@ -1364,20 +1364,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "RUN_LEAD_CLASSIFICATION": {
       (async () => {
         await readyPromise;
-        // SERVER-SIDE AI: tiêm aiCall gọi /api/ai/classify-leads để key AI không
-        // rời server; phần chọn bài + rule + đào keyword vẫn ở SW như cũ.
-        const result = await runLeadClassification({
-          aiCall: async (batch) => {
-            const resp = await API.apiFetch("/api/ai/classify-leads", {
-              method: "POST",
-              body: JSON.stringify({ batch }),
-            });
-            return (resp && resp.results) || [];
-          },
-        });
-        sendResponse({ ok: true, ...result });
+        // Giữ service worker thức trong suốt job dài (nhiều lô AI + lưu ~ngàn
+        // bài). MV3 hay cho SW ngủ khi "im" 30s -> nếu ngủ giữa chừng thì
+        // sendResponse không bao giờ bắn, UI kẹt ở "Đang phân loại…". Ping nhẹ
+        // mỗi 20s để reset đồng hồ ngủ.
+        const keepAlive = setInterval(() => {
+          try {
+            chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError);
+          } catch (_) {}
+        }, 20000);
+        try {
+          // SERVER-SIDE AI: tiêm aiCall gọi /api/ai/classify-leads để key AI
+          // không rời server; phần chọn bài + rule + đào keyword vẫn ở SW.
+          const result = await runLeadClassification({
+            force: !!msg.force,
+            // Phát tiến độ realtime để UI biết job ĐANG chạy (không đơ spinner).
+            onProgress: (info) => broadcast("LEAD_PROGRESS", info || {}),
+            aiCall: async (batch) => {
+              const resp = await API.apiFetch("/api/ai/classify-leads", {
+                method: "POST",
+                body: JSON.stringify({ batch }),
+              });
+              return (resp && resp.results) || [];
+            },
+          });
+          sendResponse({ ok: true, ...result });
+        } finally {
+          clearInterval(keepAlive);
+        }
       })().catch((e) => {
         const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
+        // Báo lỗi ra UI qua cả kênh trả lời lẫn broadcast (phòng khi port đã đóng).
+        broadcast("LEAD_PROGRESS", { phase: "error", error: clean });
         sendResponse({ ok: false, error: clean });
       });
       return true;

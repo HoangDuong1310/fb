@@ -172,7 +172,6 @@ export function ChatAI() {
   // Model picker.
   const [modelList, setModelList] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
-  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [model, setModel] = useState<string>(DEFAULT_MODEL);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -230,7 +229,6 @@ export function ChatAI() {
     setLoadingModels(true);
     const res = await bg<ModelsResp>("LIST_MODELS");
     setLoadingModels(false);
-    setModelsLoaded(true);
     if (res.ok && Array.isArray(res.models)) {
       setModelList(res.models);
     }

@@ -8,6 +8,7 @@ import {
   KeyRound,
   FileSignature,
   Wrench,
+  Bot,
   Sparkles,
   ShieldAlert,
 } from "lucide-react";
@@ -20,6 +21,7 @@ import { Prices } from "@/views/Prices";
 import { Keywords } from "@/views/Keywords";
 import { Profiles } from "@/views/Profiles";
 import { Tools } from "@/views/Tools";
+import { ChatAI } from "@/views/ChatAI";
 
 /* -------------------------------------------------------------------------
    App shell — Facebook-like information architecture.
@@ -37,7 +39,8 @@ type ViewId =
   | "prices"
   | "keywords"
   | "profiles"
-  | "tools";
+  | "tools"
+  | "chat";
 
 interface NavItem {
   id: ViewId;
@@ -95,6 +98,12 @@ const NAV: NavItem[] = [
     hint: "Thu thập, giá thị trường, cấu hình",
     icon: Wrench,
   },
+  {
+    id: "chat",
+    label: "Trợ lý AI",
+    hint: "Chat với AI — điều khiển tool, lưu lịch sử trên server",
+    icon: Bot,
+  },
 ];
 
 const VIEW_TITLE: Record<ViewId, { title: string; sub: string }> = {
@@ -130,6 +139,10 @@ const VIEW_TITLE: Record<ViewId, { title: string; sub: string }> = {
     title: "Công cụ",
     sub: "Thu thập dữ liệu, so giá thị trường và cấu hình hệ thống.",
   },
+  chat: {
+    title: "Trợ lý AI",
+    sub: "Trò chuyện với AI, chọn model, lưu hội thoại — điều khiển công cụ qua chat.",
+  },
 };
 
 export function App() {
@@ -137,9 +150,9 @@ export function App() {
   const head = VIEW_TITLE[view];
 
   return (
-    <div className="grid min-h-screen grid-cols-[248px_1fr]">
+    <div className="flex h-screen overflow-hidden">
       {/* ---- Sidebar: deepest instrument shelf ---- */}
-      <aside className="sticky top-0 flex h-screen flex-col border-r border-sb-line bg-sb">
+      <aside className="flex h-screen w-[248px] shrink-0 flex-col border-r border-sb-line bg-sb">
         <div className="flex items-center gap-3 px-4 py-4">
           <div className="grid size-[38px] place-items-center rounded-lg bg-accent font-mono text-lg font-bold text-on-accent">
             GR
@@ -200,8 +213,8 @@ export function App() {
       </aside>
 
       {/* ---- Main ---- */}
-      <main className="flex min-w-0 flex-col">
-        <header className="sticky top-0 z-sticky flex items-center justify-between border-b border-line bg-bg/85 px-6 py-4 backdrop-blur">
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <header className="z-sticky flex shrink-0 items-center justify-between border-b border-line bg-bg/85 px-6 py-4 backdrop-blur">
           <div className="min-w-0">
             <h1 className="text-lg font-semibold text-ink">{head.title}</h1>
             <p className="mt-0.5 truncate text-sm text-ink-faint">{head.sub}</p>
@@ -218,7 +231,7 @@ export function App() {
         <section
           className={cn(
             "min-h-0 flex-1",
-            view === "messenger"
+            view === "messenger" || view === "chat"
               ? "overflow-hidden p-4"
               : "overflow-y-auto p-6",
           )}
@@ -237,6 +250,8 @@ export function App() {
             <Keywords />
           ) : view === "profiles" ? (
             <Profiles />
+          ) : view === "chat" ? (
+            <ChatAI />
           ) : (
             <Tools />
           )}

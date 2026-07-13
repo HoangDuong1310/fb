@@ -192,6 +192,9 @@ export function Feed() {
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast>(null);
   const [reclassifying, setReclassifying] = useState(false);
+  // Dòng tiến độ realtime cho lượt phân loại (service worker broadcast
+  // LEAD_PROGRESS). Giúp người dùng thấy job ĐANG chạy thay vì spinner đơ.
+  const [reclassProgress, setReclassProgress] = useState<string | null>(null);
   const toastTimer = useRef<number | null>(null);
 
   function flash(kind: NonNullable<Toast>["kind"], text: string, ms = 3200) {
@@ -221,6 +224,42 @@ export function Feed() {
       if (toastTimer.current) window.clearTimeout(toastTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Nghe tiến độ phân loại realtime từ service worker (LEAD_PROGRESS) để đổi
+  // nhãn nút từ "Đang phân loại…" đơ sang dòng có số liệu ("AI 24/120…").
+  useEffect(() => {
+    interface LeadProgressMsg {
+      type?: string;
+      phase?: string;
+      done?: number;
+      total?: number;
+      error?: string;
+    }
+    const handler = (msg: LeadProgressMsg) => {
+      if (!msg || msg.type !== "LEAD_PROGRESS") return;
+      if (msg.phase === "select") {
+        setReclassProgress(`Chuẩn bị ${msg.total ?? 0} bài…`);
+      } else if (msg.phase === "ai") {
+        setReclassProgress(`AI ${msg.done ?? 0}/${msg.total ?? 0}…`);
+      } else if (msg.phase === "save") {
+        setReclassProgress(`Lưu ${msg.done ?? 0}/${msg.total ?? 0}…`);
+      } else if (msg.phase === "done" || msg.phase === "error") {
+        setReclassProgress(null);
+      }
+    };
+    try {
+      chrome.runtime.onMessage.addListener(handler);
+    } catch {
+      /* ngoài môi trường extension (dev thuần) thì bỏ qua */
+    }
+    return () => {
+      try {
+        chrome.runtime.onMessage.removeListener(handler);
+      } catch {
+        /* no-op */
+      }
+    };
   }, []);
 
   const visible = useMemo(() => {
@@ -367,28 +406,33 @@ export function Feed() {
   }
 
   // Phân loại lại toàn kho: rule chốt ca rõ, AI xử ca mơ hồ, rồi học từ khoá.
+  // INCREMENTAL: chỉ phân loại bài CHƯA phân loại hoặc còn ở phiên bản logic cũ
+  // (lead_ver < LEAD_VER). Không gửi force -> bấm lại nhiều lần khi mọi bài đã
+  // xong sẽ KHÔNG tốn token. Bài cũ/nhãn sai era-bug tự chữa đúng một lần nhờ
+  // LEAD_VER đã bump. Rule chốt ca rõ miễn phí; chỉ ca mơ hồ mới gọi AI.
   async function reclassify() {
     setReclassifying(true);
     try {
       const res = await bg<ReclassifyResponse>("RUN_LEAD_CLASSIFICATION");
       if (!res.ok) {
-        flash("err", res.error || "Phân loại lại thất bại.");
+        flash("err", res.error || "Phân loại thất bại.");
+        return;
+      }
+      if (!res.processed) {
+        flash("info", "Tất cả bài đã được phân loại — không có bài mới để chạy.");
+        await load();
         return;
       }
       const parts: string[] = [];
-      if (res.processed != null) parts.push(`${res.processed} bài`);
+      parts.push(`${res.processed} bài`);
       if (res.aiCount) parts.push(`${res.aiCount} qua AI`);
       if (res.promoted) parts.push(`+${res.promoted} từ khoá mới`);
       if (res.queued) parts.push(`${res.queued} chờ duyệt`);
-      flash(
-        "ok",
-        "Đã phân loại lại" +
-          (parts.length ? ": " + parts.join(", ") : "") +
-          ".",
-      );
+      flash("ok", "Đã phân loại: " + parts.join(", ") + ".");
       await load();
     } finally {
       setReclassifying(false);
+      setReclassProgress(null);
     }
   }
 
@@ -411,7 +455,7 @@ export function Feed() {
             <button
               onClick={reclassify}
               disabled={loading || reclassifying}
-              title="Phân loại lại toàn kho: rule chốt ca rõ, AI xử ca mơ hồ, rồi tự học thêm từ khoá"
+              title="Phân loại bài chưa gán nhãn (rule chốt ca rõ, AI xử ca mơ hồ, rồi tự học từ khoá). Bấm lại khi đã xong sẽ không tốn token."
               className="inline-flex items-center gap-1.5 rounded-sm border border-line bg-surface-2 px-2.5 py-1 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-60"
             >
               <Sparkles
@@ -420,7 +464,9 @@ export function Feed() {
                   reclassifying && "animate-pulse",
                 )}
               />
-              {reclassifying ? "Đang phân loại…" : "Phân loại lại"}
+              {reclassifying
+                ? reclassProgress || "Đang phân loại…"
+                : "Phân loại lại"}
             </button>
             <button
               onClick={load}
