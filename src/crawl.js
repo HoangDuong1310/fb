@@ -528,6 +528,12 @@ async function crawlGroupApiTabless(groupId, options) {
     pageDelay: (options && options.pageDelay) || 800,
     ...(options || {}),
   };
+  // Chuẩn hoá SAU spread để mặc định KHÔNG bị options nuốt mất (auto-crawl có
+  // thể truyền options rỗng {}). stopAfterKnown: số bài ĐÃ-BIẾT/CŨ gặp LIÊN
+  // TIẾP thì dừng sớm (cào TĂNG DẦN — mỗi lần chỉ lấy bài mới). fromTs: mốc
+  // "Chỉ lấy bài từ ngày" tính bằng ms (0 = tắt lọc). Đồng bộ với runApiCrawl.
+  opts.stopAfterKnown = opts.stopAfterKnown || 8;
+  opts.fromTs = opts.fromTs || 0;
 
   const tpl = await getStoredGqlTemplate();
   if (!tpl || !tpl.doc_id) {
@@ -564,6 +570,15 @@ async function crawlGroupApiTabless(groupId, options) {
     let newCount = 0;
     let pages = 0;
     let batch = [];
+    // Bộ đếm cho DỪNG SỚM (cào TĂNG DẦN, đồng bộ ngữ nghĩa với runApiCrawl/DOM
+    // crawl). Feed sắp xếp MỚI→CŨ nên khi gặp nhiều bài ĐÃ-BIẾT hoặc CŨ-hơn-mốc
+    // LIÊN TIẾP nghĩa là đã chạm phần cào lần trước / ngoài khoảng ngày => dừng,
+    // khỏi phân trang tiếp vô ích. stopReason được ingestChunks đặt khi 1 trong
+    // 2 chuỗi chạm ngưỡng opts.stopAfterKnown; vòng phân trang đọc cờ này để
+    // thoát (ingestChunks không return ra ngoài hàm được nên dùng cờ chung).
+    let consecutiveKnown = 0; // số bài đã có trong DB gặp liên tiếp
+    let consecutiveOld = 0;   // số bài cũ hơn fromTs gặp liên tiếp
+    let stopReason = null;    // "known_limit" | "date_limit" khi dừng sớm
     const flush = async () => {
       if (batch.length === 0) return;
       const toSave = batch;
@@ -577,9 +592,36 @@ async function crawlGroupApiTabless(groupId, options) {
         origin: "https://www.facebook.com",
       });
       for (const p of posts) {
-        if (seenThisRun.has(p.postId)) continue;
+        if (seenThisRun.has(p.postId)) continue; // trùng trong phiên => bỏ
         seenThisRun.add(p.postId);
-        if (known.has(p.postId)) continue;
+
+        // (1) BÀI ĐÃ CÓ TRONG DB (cào TĂNG DẦN): feed MỚI→CŨ nên gặp bài đã
+        // biết nghĩa là đang chạm phần đã cào lần trước. Đếm LIÊN TIẾP; đủ
+        // ngưỡng => đánh dấu dừng sớm (không cào lại data cũ mỗi ngày).
+        if (known.has(p.postId)) {
+          consecutiveKnown += 1;
+          if (consecutiveKnown >= opts.stopAfterKnown) {
+            stopReason = "known_limit";
+            break;
+          }
+          continue; // đã có => không lưu lại
+        }
+        consecutiveKnown = 0; // gặp bài mới => reset chuỗi "đã biết"
+
+        // (2) LỌC THEO NGÀY (fromTs, ms). Chỉ áp khi bật (fromTs>0) và bài CÓ
+        // timestamp hợp lệ. Bài KHÔNG có timestamp (null) được GIỮ để tránh bỏ
+        // nhầm (giống DOM crawl). Feed MỚI→CŨ nên gặp nhiều bài cũ hơn mốc LIÊN
+        // TIẾP => đã ra ngoài khoảng ngày cần lấy => dừng sớm.
+        if (opts.fromTs && p.timestamp && p.timestamp < opts.fromTs) {
+          consecutiveOld += 1;
+          if (consecutiveOld >= opts.stopAfterKnown) {
+            stopReason = "date_limit";
+            break;
+          }
+          continue; // cũ hơn mốc => không lưu
+        }
+        consecutiveOld = 0; // gặp bài trong khoảng => reset chuỗi "cũ"
+
         batch.push(p);
         newCount += 1;
       }
@@ -710,6 +752,7 @@ async function crawlGroupApiTabless(groupId, options) {
 
     while (
       !blockedReason &&
+      !stopReason && // đủ bài đã-biết/cũ liên tiếp => dừng sớm (cào tăng dần)
       cursor &&
       newCount < opts.maxNewPosts &&
       pages < opts.maxPages
@@ -731,9 +774,13 @@ async function crawlGroupApiTabless(groupId, options) {
     else await clearCrawlBlock();
     let reason = blockedReason
       ? blockedReason
-      : newCount >= opts.maxNewPosts
-        ? "Đã đạt giới hạn số bài mới."
-        : "Đã hết trang feed (API không-tab).";
+      : stopReason === "known_limit"
+        ? "Đã gặp đủ bài cũ liên tiếp — coi như hết bài mới."
+        : stopReason === "date_limit"
+          ? "Đã tới bài cũ hơn ngày bắt đầu — dừng theo bộ lọc ngày."
+          : newCount >= opts.maxNewPosts
+            ? "Đã đạt giới hạn số bài mới."
+            : "Đã hết trang feed (API không-tab).";
     // Khi +0 bài, đính chẩn đoán phản hồi để soi lý do ngay trên UI (khỏi mở devtools).
     if (newCount === 0 && lastDiag) {
       reason +=
