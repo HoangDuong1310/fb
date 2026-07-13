@@ -30,7 +30,7 @@ import {
   type LeadLabel,
   type LeadMode,
 } from "@/lib/leadfilter";
-import { compressImageFiles } from "@/lib/image";
+import { compressAndUploadImages } from "@/lib/upload";
 
 /* -------------------------------------------------------------------------
    Messenger view — two surfaces behind a tab switch:
@@ -279,10 +279,10 @@ function fillTemplate(content: string, name: string): string {
   return String(content ?? "").replace(/\{\{\s*ten\s*\}\}/gi, who);
 }
 
-// Chuyển FileList -> mảng data URL để đính kèm ảnh (giống Compose).
-// Nén ảnh trước khi vào hàng đợi để tránh phình cột jobs.data (xem ui/src/lib/image.ts).
+// Nén ảnh rồi TẢI LÊN storage, trả về URL "/uploads/..." (xem ui/src/lib/upload.ts).
+// Không còn nhúng base64 vào job.images / message_templates.images -> jobs.data không phình.
 function readFiles(fileList: FileList): Promise<string[]> {
-  return compressImageFiles(fileList);
+  return compressAndUploadImages(fileList);
 }
 
 const PITCH_LEAD_FILTERS: { id: LeadMode; label: string }[] = [

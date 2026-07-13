@@ -401,6 +401,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    case "UPLOAD_IMAGES": {
+      // UI gửi lên mảng data URL ảnh (đã nén phía client). Backend ghi từng ảnh
+      // ra ổ đĩa và trả về mảng URL công khai "/uploads/...". UI dùng các URL này
+      // thay cho base64 khi tạo job -> jobs.data không còn phình vì ảnh.
+      API.apiFetch("/api/uploads", {
+        method: "POST",
+        body: JSON.stringify({ dataUrls: Array.isArray(msg.dataUrls) ? msg.dataUrls : [] }),
+      })
+        .then((res) => sendResponse({ ok: true, urls: (res && res.urls) || [] }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     case "RECORD_POSTED_GROUPS": {
       // Lưu lịch sử nhóm đã đăng theo tài khoản (device-local).
       // authUser?.id dùng để tách dữ liệu theo từng tài khoản đăng nhập.

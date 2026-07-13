@@ -13,6 +13,7 @@ import {
 } from "./util.js";
 import { syncAllSources } from "./prices.js";
 import { extractPostsFromChunks } from "./gql-parse.js";
+import { API_BASE_URL } from "./config.js";
 
 /* ------------------------- QUẢN LÝ TAB CRAWL --------------------------- */
 // Lưu danh sách tab do background tự mở vào chrome.storage.session để sống sót khi
@@ -1203,6 +1204,58 @@ async function runCommentInPage(text, images) {
   return { ok: true, commentId: captured.commentId, commentUrl: captured.commentUrl };
 }
 
+// job.images GIỜ chứa URL "/uploads/..." (không còn base64) để jobs.data không
+// phình. Nhưng code bơm ảnh vào trang FB (dataUrlToFile/attachImages) vẫn cần
+// data URL. Nên NGAY TRƯỚC executeScript ta tải mỗi URL -> data URL. Phần DOM
+// giữ nguyên. Ảnh nào là data URL sẵn (bản cũ / template cũ) thì để nguyên.
+
+// Chuẩn hoá "/uploads/..." -> URL tuyệt đối tới backend để fetch được từ SW.
+function toAbsoluteImageUrl(u) {
+  const s = String(u == null ? "" : u).trim();
+  if (!s) return "";
+  if (/^https?:\/\//i.test(s)) return s;
+  if (s.startsWith("/")) return API_BASE_URL + s;
+  return s;
+}
+
+// Tải MỘT URL ảnh -> data URL (base64). Dùng arrayBuffer + btoa để không phụ
+// thuộc FileReader (an toàn trong service worker MV3).
+async function imageUrlToDataUrl(url) {
+  const abs = toAbsoluteImageUrl(url);
+  const res = await fetchWithTimeout(abs, {}, 20000);
+  if (!res || !res.ok) throw new Error("HTTP " + (res && res.status));
+  const buf = await res.arrayBuffer();
+  const mime = (res.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return "data:" + mime + ";base64," + btoa(binary);
+}
+
+// Chuyển mảng job.images (URL hoặc data URL) -> mảng data URL để bơm vào trang.
+// Ảnh tải lỗi bị bỏ qua (không chặn cả job); giữ nguyên thứ tự các ảnh còn lại.
+async function resolveJobImages(images) {
+  const arr = Array.isArray(images) ? images.filter(Boolean) : [];
+  const out = [];
+  for (const it of arr) {
+    const s = String(it == null ? "" : it).trim();
+    if (!s) continue;
+    if (s.startsWith("data:")) {
+      out.push(s);
+      continue;
+    }
+    try {
+      out.push(await imageUrlToDataUrl(s));
+    } catch (_) {
+      // Bỏ qua ảnh tải lỗi để job vẫn chạy với các ảnh còn lại (hoặc chỉ text).
+    }
+  }
+  return out;
+}
+
 async function executePostJob(job) {
   // Đăng lên trang cá nhân (timeline) hoặc trong nhóm tuỳ targetType.
   const isProfile = job.targetType === "profile";
@@ -1212,7 +1265,7 @@ async function executePostJob(job) {
   if (!isProfile && !job.groupId) {
     return { ok: false, error: "Thiếu nhóm để đăng bài." };
   }
-  const images = Array.isArray(job.images) ? job.images : [];
+  const images = await resolveJobImages(job.images);
   const active = await shouldFocusTabs();
   const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   await waitTabComplete(tab.id, 30000);
@@ -1237,7 +1290,7 @@ async function executePostJob(job) {
 async function executeCommentJob(job) {
   const url = job.targetUrl;
   if (!url) return { ok: false, error: "Thiếu link bài viết để bình luận." };
-  const images = Array.isArray(job.images) ? job.images : [];
+  const images = await resolveJobImages(job.images);
   const meta = job.meta || {};
   // CHẠY NGẦM: mở tab ở NỀN (active:false) để KHÔNG chiếm màn hình người dùng;
   // waitTabComplete chỉ nghe tabs.onUpdated nên không cần tab active. Đóng tab
@@ -1447,13 +1500,16 @@ async function executeMessageJob(job) {
   const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   await waitTabComplete(tab.id, 30000);
   await sleep(4500);
+  // Ảnh job giờ là URL "/uploads/..."; tải về -> data URL để bơm vào trang
+  // (runMessageInPage giữ nguyên, vẫn nhận data URL như trước).
+  const images = await resolveJobImages(job.images);
   let res;
   let out = { ok: false, error: "Không có kết quả." };
   try {
     res = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: runMessageInPage,
-      args: [job.content || "", Array.isArray(job.images) ? job.images : []],
+      args: [job.content || "", images],
     });
     out = (res && res[0] && res[0].result) || out;
   } catch (e) {
