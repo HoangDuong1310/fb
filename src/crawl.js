@@ -14,6 +14,7 @@ import {
 import { syncAllSources } from "./prices.js";
 import { extractPostsFromChunks } from "./gql-parse.js";
 import { API_BASE_URL } from "./config.js";
+import { assertFbMatch, MATCH_MISMATCH, MATCH_FB_ABSENT } from "./fb-identity.js";
 
 /* ------------------------- QUẢN LÝ TAB CRAWL --------------------------- */
 // Lưu danh sách tab do background tự mở vào chrome.storage.session để sống sót khi
@@ -2083,6 +2084,33 @@ async function _getAuthUserId() {
 }
 
 async function runJob(job) {
+  // CHỐT AN TOÀN: chỉ chạy job automation FB khi tài khoản FB đang đăng nhập
+  // KHỚP với tài khoản FB đã ràng buộc cho tài khoản app này. Nếu sai FB (hoặc
+  // đã bind nhưng không thấy FB đăng nhập), CHẶN job để tránh thao tác nhầm
+  // người/nhầm phiên gây bất đồng bộ dữ liệu. Không tăng attempts, giữ job ở
+  // "pending" để tự chạy lại khi người dùng chuyển đúng FB.
+  try {
+    const m = await assertFbMatch();
+    if (!m.ok && (m.code === MATCH_MISMATCH || m.code === MATCH_FB_ABSENT)) {
+      const reason =
+        m.code === MATCH_MISMATCH
+          ? "Sai tài khoản Facebook: đã ràng buộc với FB khác."
+          : "Không tìm thấy tài khoản Facebook đang đăng nhập để xác minh.";
+      await DB.updateJob(job.id, { status: "pending", error: reason });
+      broadcast("FB_MISMATCH", {
+        jobId: job.id,
+        code: m.code,
+        bound: m.bound || null,
+        boundName: m.boundName || null,
+        current: m.current || null,
+      });
+      broadcast("JOB_UPDATE", { jobId: job.id });
+      return { ok: false, error: reason, blocked: true, code: m.code };
+    }
+  } catch (e) {
+    // Không xác minh được (lỗi bất ngờ) -> KHÔNG chặn để tránh kẹt job khi
+    // module identity gặp sự cố; cứ để job chạy như cũ.
+  }
   await DB.updateJob(job.id, { status: "running", attempts: (job.attempts || 0) + 1, error: null });
   broadcast("JOB_UPDATE", { jobId: job.id });
   let result;

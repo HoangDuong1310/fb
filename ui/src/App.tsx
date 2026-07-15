@@ -11,6 +11,7 @@ import {
   Bot,
   Sparkles,
   ShieldAlert,
+  ShieldCheck,
   LogOut,
   Loader2,
 } from "lucide-react";
@@ -26,6 +27,7 @@ import { Keywords } from "@/views/Keywords";
 import { Profiles } from "@/views/Profiles";
 import { Tools } from "@/views/Tools";
 import { ChatAI } from "@/views/ChatAI";
+import { AccountBinding } from "@/views/AccountBinding";
 
 /* -------------------------------------------------------------------------
    App shell — Facebook-like information architecture.
@@ -48,6 +50,7 @@ type ViewId =
   | "prices"
   | "keywords"
   | "profiles"
+  | "account"
   | "tools"
   | "chat";
 
@@ -124,6 +127,12 @@ const NAV: NavItem[] = [
     icon: FileSignature,
   },
   {
+    id: "account",
+    label: "Kết nối FB",
+    hint: "Gắn tài khoản Facebook — cảnh báo dùng nhầm tài khoản",
+    icon: ShieldCheck,
+  },
+  {
     id: "tools",
     label: "Công cụ",
     hint: "Thu thập, giá thị trường, cấu hình",
@@ -165,6 +174,10 @@ const VIEW_TITLE: Record<ViewId, { title: string; sub: string }> = {
   profiles: {
     title: "Hồ sơ ngành",
     sub: "Tạo và kích hoạt bộ prompt AI theo ngành — phân loại lead, soạn tin, trích giá từ bài rao.",
+  },
+  account: {
+    title: "Kết nối tài khoản Facebook",
+    sub: "Gắn tài khoản Group Radar với một trang Facebook và cảnh báo khi đang dùng nhầm tài khoản.",
   },
   tools: {
     title: "Công cụ",
@@ -373,6 +386,8 @@ export function App() {
             <Keywords />
           ) : view === "profiles" ? (
             <Profiles />
+          ) : view === "account" ? (
+            <AccountBinding />
           ) : view === "chat" ? (
             <ChatAI />
           ) : (

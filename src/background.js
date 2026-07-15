@@ -73,6 +73,13 @@ import {
   scheduleNextWarming,
   initWarming,
 } from "./crawl.js";
+import {
+  readActiveFbId,
+  getBinding,
+  setBinding,
+  clearBinding,
+  assertFbMatch,
+} from "./fb-identity.js";
 import { runGroupPriceExtraction } from "./group-prices.js";
 import { runLeadClassification } from "./lead-classify.js";
 import { pollRemoteCommands, connectRealtime, disconnectRealtime } from "./remote-commands.js";
@@ -1682,6 +1689,63 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           display_name: (token && authUser && authUser.displayName) || "",
           userId: (token && authUser && authUser.id) || null,
         });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // ----------------------- RÀNG BUỘC TÀI KHOẢN FACEBOOK -----------------
+    // Hướng A: đọc cookie c_user qua chrome.cookies (chạy ở background, không cần
+    // mở tab FB). Cho phép UI: xem FB đang đăng nhập, xem/đặt/gỡ ràng buộc, và
+    // kiểm tra khớp trước khi chạy automation. Mọi thao tác binding lưu theo TÀI
+    // KHOẢN app qua /api/settings (JWT-scoped) nên đồng bộ nhiều máy.
+
+    // FB đang đăng nhập trên trình duyệt này (chỉ id, hoặc null nếu chưa login).
+    case "FB_ACTIVE_ID": {
+      (async () => {
+        await readyPromise;
+        const fbId = await readActiveFbId();
+        sendResponse({ ok: true, fbId });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Ràng buộc hiện tại của tài khoản app ({ fbId, fbName } hoặc null).
+    case "FB_GET_BINDING": {
+      (async () => {
+        await readyPromise;
+        const binding = await getBinding();
+        sendResponse({ ok: true, binding });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Khoá tài khoản app với FB đang đăng nhập (hoặc fbId/fbName truyền vào).
+    case "FB_BIND_ACTIVE": {
+      (async () => {
+        await readyPromise;
+        const res = await setBinding(msg.fbId || null, msg.fbName || null);
+        sendResponse(res);
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Gỡ ràng buộc FB của tài khoản app hiện tại.
+    case "FB_UNBIND": {
+      (async () => {
+        await readyPromise;
+        const res = await clearBinding();
+        sendResponse(res);
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Kiểm tra khớp bound vs active. Trả { ok, code, bound, current, boundName }.
+    // UI dùng để cảnh báo trước khi chạy automation / khi mở app.
+    case "FB_CHECK_MATCH": {
+      (async () => {
+        await readyPromise;
+        const res = await assertFbMatch();
+        sendResponse({ ok: true, ...res });
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
