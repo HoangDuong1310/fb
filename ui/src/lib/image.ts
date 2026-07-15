@@ -27,6 +27,40 @@ const DEFAULTS: Required<CompressOptions> = {
   maxInputBytes: 0,
 };
 
+/** Các MIME ảnh mà BACKEND chấp nhận (khớp UPLOAD_EXT_BY_MIME ở server). */
+const SUPPORTED_UPLOAD_MIME = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+]);
+
+/**
+ * Lỗi khi ảnh có định dạng backend không nhận (vd: HEIC/HEIF từ iPhone/Mac).
+ * Ném lỗi này thay vì âm thầm tải ảnh lên rồi bị server trả 400 — để UI báo rõ.
+ */
+export class UnsupportedImageError extends Error {
+  readonly fileName: string;
+  constructor(fileName: string) {
+    super(
+      `Ảnh "${fileName}" có định dạng không hỗ trợ (vd: HEIC/HEIF từ iPhone/Mac). ` +
+        `Hãy đổi sang JPG/PNG rồi thử lại.`,
+    );
+    this.name = "UnsupportedImageError";
+    this.fileName = fileName;
+  }
+}
+
+/** Kiểm tra file có phải định dạng ảnh backend hỗ trợ hay không. */
+function isSupportedImage(file: File): boolean {
+  const mime = (file.type || "").toLowerCase();
+  if (mime && SUPPORTED_UPLOAD_MIME.has(mime)) return true;
+  // Một số trình duyệt để TRỐNG file.type với HEIC -> đoán thêm qua đuôi file.
+  const name = (file.name || "").toLowerCase();
+  return /\.(jpe?g|png|webp|gif)$/.test(name);
+}
+
 /** Đọc File thành data URL (không nén) — dùng làm fallback khi canvas lỗi. */
 function readAsDataURL(file: File): Promise<string | null> {
   return new Promise((resolve) => {
@@ -37,12 +71,34 @@ function readAsDataURL(file: File): Promise<string | null> {
   });
 }
 
-/** Nạp một data URL / blob URL vào HTMLImageElement. */
-function loadImage(src: string): Promise<HTMLImageElement> {
+/**
+ * Nạp một data URL / blob URL vào HTMLImageElement, CÓ TIMEOUT.
+ * Trên Mac/iPhone, ảnh HEIC không giải mã được trong <img> nên onerror có thể
+ * KHÔNG bao giờ nổ (treo vô hạn). Timeout đảm bảo Promise luôn kết thúc.
+ */
+function loadImage(src: string, timeoutMs = 15000): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("image decode failed"));
+    let done = false;
+    const timer = window.setTimeout(() => {
+      if (done) return;
+      done = true;
+      img.onload = null;
+      img.onerror = null;
+      reject(new Error("image decode timeout"));
+    }, timeoutMs);
+    img.onload = () => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      resolve(img);
+    };
+    img.onerror = () => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      reject(new Error("image decode failed"));
+    };
     img.src = src;
   });
 }
@@ -57,8 +113,14 @@ export async function compressImageFile(
 ): Promise<string | null> {
   const o = { ...DEFAULTS, ...opts };
 
-  // Không phải ảnh raster (vd: gif động, svg) -> giữ nguyên để tránh hỏng.
-  if (!file.type.startsWith("image/") || file.type === "image/gif") {
+  // Định dạng backend KHÔNG nhận (vd: HEIC/HEIF từ iPhone/Mac) -> báo lỗi rõ
+  // ràng thay vì tải lên rồi bị server trả 400 (khiến UI treo im lặng).
+  if (!isSupportedImage(file)) {
+    throw new UnsupportedImageError(file.name || "ảnh");
+  }
+
+  // gif giữ nguyên (không vẽ lại canvas để tránh mất khung động).
+  if (file.type === "image/gif") {
     return readAsDataURL(file);
   }
 
@@ -86,8 +148,11 @@ export async function compressImageFile(
     const out = canvas.toDataURL("image/jpeg", o.quality);
     // Nếu vì lý do nào đó bản "nén" lại to hơn bản gốc thì giữ bản gốc.
     return out && out.length < original.length ? out : original;
-  } catch {
-    return original;
+  } catch (e) {
+    // Timeout / decode-fail: rất có thể là định dạng trình duyệt không giải mã
+    // được (HEIC/HEIF). Báo lỗi rõ ràng thay vì trả bản gốc (server sẽ 400).
+    if (e instanceof UnsupportedImageError) throw e;
+    throw new UnsupportedImageError(file.name || "ảnh");
   }
 }
 

@@ -123,6 +123,7 @@ export function Compose() {
 
   // Ảnh + lịch
   const [images, setImages] = useState<string[]>([]);
+  const [imgBusy, setImgBusy] = useState(false);
   const [scheduleAt, setScheduleAt] = useState("");
   const [spacing, setSpacing] = useState(0);
 
@@ -373,10 +374,20 @@ export function Compose() {
   }
 
   async function onPickImages(list: FileList | null) {
-    if (!list || !list.length) return;
-    const arr = await readFiles(list);
-    setImages((imgs) => [...imgs, ...arr]);
-    if (fileInput.current) fileInput.current.value = "";
+    if (!list || !list.length || imgBusy) return;
+    setImgBusy(true);
+    try {
+      const arr = await readFiles(list);
+      setImages((imgs) => [...imgs, ...arr]);
+    } catch (e) {
+      flash(
+        "err",
+        e instanceof Error ? e.message : "Không tải được ảnh lên. Thử lại.",
+      );
+    } finally {
+      setImgBusy(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
   }
 
   function removeImage(i: number) {
@@ -627,10 +638,20 @@ export function Compose() {
               </span>
               <button
                 onClick={() => fileInput.current?.click()}
-                className="inline-flex items-center gap-1.5 rounded-sm border border-line bg-surface-2 px-2.5 py-1 text-xs font-medium text-ink-soft hover:border-accent/50 hover:text-ink"
+                disabled={imgBusy}
+                className="inline-flex items-center gap-1.5 rounded-sm border border-line bg-surface-2 px-2.5 py-1 text-xs font-medium text-ink-soft hover:border-accent/50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
               >
-                <ImagePlus className="size-3.5" />
-                Thêm ảnh
+                {imgBusy ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin" />
+                    Đang tải…
+                  </>
+                ) : (
+                  <>
+                    <ImagePlus className="size-3.5" />
+                    Thêm ảnh
+                  </>
+                )}
               </button>
               <input
                 ref={fileInput}

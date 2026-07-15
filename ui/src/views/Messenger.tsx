@@ -316,6 +316,8 @@ function PitchPane() {
   const [imageDrafts, setImageDrafts] = useState<Record<string, string[]>>({});
   const composeFileInput = useRef<HTMLInputElement>(null);
   const editorFileInput = useRef<HTMLInputElement>(null);
+  const [composeImgBusy, setComposeImgBusy] = useState(false);
+  const [editorImgBusy, setEditorImgBusy] = useState(false);
 
   const { toast, flash } = useToast();
 
@@ -413,11 +415,23 @@ function PitchPane() {
 
   // Ảnh cho tin sắp gửi (theo prospect đang chọn).
   async function onPickComposeImages(list: FileList | null) {
-    if (!list || !list.length || !selectedId) return;
-    const urls = await readFiles(list);
+    if (!list || !list.length || !selectedId || composeImgBusy) return;
     const key = selectedId;
-    setImageDrafts((d) => ({ ...d, [key]: [...(d[key] ?? []), ...urls] }));
-    setConfirming(false);
+    setComposeImgBusy(true);
+    try {
+      const urls = await readFiles(list);
+      setImageDrafts((d) => ({ ...d, [key]: [...(d[key] ?? []), ...urls] }));
+      setConfirming(false);
+    } catch (e) {
+      flash(
+        "err",
+        e instanceof Error ? e.message : "Không tải được ảnh lên. Thử lại.",
+        5000,
+      );
+    } finally {
+      setComposeImgBusy(false);
+      if (composeFileInput.current) composeFileInput.current.value = "";
+    }
   }
   function removeComposeImage(idx: number) {
     if (!selectedId) return;
@@ -429,11 +443,23 @@ function PitchPane() {
   }
   // Ảnh cho mẫu tin đang soạn trong editor.
   async function onPickEditorImages(list: FileList | null) {
-    if (!list || !list.length) return;
-    const urls = await readFiles(list);
-    setEditor((ed) =>
-      ed ? { ...ed, images: [...(ed.images ?? []), ...urls] } : ed,
-    );
+    if (!list || !list.length || editorImgBusy) return;
+    setEditorImgBusy(true);
+    try {
+      const urls = await readFiles(list);
+      setEditor((ed) =>
+        ed ? { ...ed, images: [...(ed.images ?? []), ...urls] } : ed,
+      );
+    } catch (e) {
+      flash(
+        "err",
+        e instanceof Error ? e.message : "Không tải được ảnh lên. Thử lại.",
+        5000,
+      );
+    } finally {
+      setEditorImgBusy(false);
+      if (editorFileInput.current) editorFileInput.current.value = "";
+    }
   }
   function removeEditorImage(idx: number) {
     setEditor((ed) =>
@@ -817,11 +843,21 @@ function PitchPane() {
                           </span>
                           <button
                             type="button"
+                            disabled={editorImgBusy}
                             onClick={() => editorFileInput.current?.click()}
-                            className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink"
+                            className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
                           >
-                            <ImagePlus className="size-3" />
-                            Thêm ảnh
+                            {editorImgBusy ? (
+                              <>
+                                <Loader2 className="size-3 animate-spin" />
+                                Đang xử lý…
+                              </>
+                            ) : (
+                              <>
+                                <ImagePlus className="size-3" />
+                                Thêm ảnh
+                              </>
+                            )}
                           </button>
                           <input
                             ref={editorFileInput}
@@ -979,11 +1015,21 @@ function PitchPane() {
                     </span>
                     <button
                       type="button"
+                      disabled={composeImgBusy}
                       onClick={() => composeFileInput.current?.click()}
-                      className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink"
+                      className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      <ImagePlus className="size-3" />
-                      Thêm ảnh
+                      {composeImgBusy ? (
+                        <>
+                          <Loader2 className="size-3 animate-spin" />
+                          Đang xử lý…
+                        </>
+                      ) : (
+                        <>
+                          <ImagePlus className="size-3" />
+                          Thêm ảnh
+                        </>
+                      )}
                     </button>
                     <input
                       ref={composeFileInput}
