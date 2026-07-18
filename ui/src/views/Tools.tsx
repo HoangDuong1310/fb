@@ -24,6 +24,11 @@ import { bg, type BgResponse } from "@/lib/bg";
 import { colorFor, initials } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
 import { useIncremental } from "@/lib/useIncremental";
+import {
+  normalizeWarmingActivityEntries,
+  warmingDiagnosticText,
+  type WarmingDiagnosticEntry,
+} from "@/lib/warming-diagnostics";
 
 /* -------------------------------------------------------------------------
    Tools — the closed-loop control room. Three logical stages, one per tab:
@@ -898,7 +903,7 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
     }
     flash(
       "ok",
-      `Đã quét ${res.scanned ?? 0} nhóm (mới: ${res.added ?? 0}, cập nhật: ${res.updated ?? 0}).`,
+      `Đã quét ${res.scanned ?? 0} nhóm (mới: ${res.added ?? 0}, cập nhật: ${res.updated ?? 0}, đã loại: ${res.removed ?? 0}).`,
     );
     load();
   }
@@ -1349,28 +1354,75 @@ interface WarmingConfig {
   intervalMinutes: number;
   actionsPerRun: number;
   actions: string[];
+  useOwnedTabOnly?: boolean;
+  maxSessionsPerDay?: number;
+  maxWritePerDay?: number;
+  writeCooldownMinutes?: number;
+  reactionChancePercent?: number;
+  minSessionGapMinutes?: number;
+  quietHoursStart?: number;
+  quietHoursEnd?: number;
+  riskFailThreshold?: number;
+  riskBackoffMultiplier?: number;
+  nextRunAt?: number | null;
+  delayMinutes?: number;
+}
+
+interface WarmingStateSummary {
+  sessionsToday?: number;
+  writeCountToday?: number;
+  riskLevel?: number;
+  recentFailCount?: number;
+  lastSessionAt?: number;
 }
 
 interface WarmingConfigResponse extends BgResponse {
   config?: WarmingConfig;
+  state?: WarmingStateSummary | null;
+  nextRunAt?: number | null;
+  delayMinutes?: number;
+  source?: "server" | "default" | "cache" | string;
+  stale?: boolean;
+  status?: string;
+  found?: boolean;
+  retryable?: boolean;
 }
 
-interface WarmingActivityEntry {
-  id: number;
-  type: string;
-  status: string;
-  createdAt?: number | null;
-  data?: unknown;
+interface BindingStatus {
+  fbId: string | null;
+  fbName: string | null;
+  matchCode?: string;
+  matchOk?: boolean;
+  current?: string | null;
+  stale?: boolean;
+  source?: string;
 }
+
+type WarmingActivityEntry = WarmingDiagnosticEntry;
 
 interface WarmingActivityResponse extends BgResponse {
-  entries?: WarmingActivityEntry[];
+  entries?: unknown;
+}
+
+interface WarmingSkippedWrite {
+  action?: string;
+  ok?: boolean;
+  code?: string;
+  reason?: string;
 }
 
 interface WarmingRunResponse extends BgResponse {
   done?: number;
+  succeeded?: number;
+  failed?: number;
+  skipped?: number;
+  skippedWrites?: WarmingSkippedWrite[];
+  unverified?: number;
+  noOp?: number;
+  attempted?: number;
   blocked?: boolean;
   stopped?: boolean;
+  deferred?: boolean;
 }
 
 // Các hành động hợp lệ, khớp WARMING_ACTIONS trong src/crawl.js.
@@ -1402,7 +1454,7 @@ const WARMING_ACTION_LABELS: { id: string; label: string; hint: string }[] = [
   {
     id: "reactReels",
     label: "Thả cảm xúc Reels",
-    hint: "Tương tác thật với Reels (thước phim). Rất dễ dính checkpoint với tài khoản mới nên chỉ thực hiện ngẫu nhiên ~30% số lượt, tối đa 1 Reel.",
+    hint: "Thực hiện theo tỷ lệ thả cảm xúc chung, tối đa 1 Reel; vẫn áp dụng giới hạn ngày và cooldown.",
   },
 ];
 
@@ -1417,13 +1469,27 @@ function warmingIntervalLabel(n: number): string {
 
 const WARMING_STATUS_LABELS: Record<string, string> = {
   done: "Xong",
+  success: "Xong",
   error: "Lỗi",
   blocked: "Bị chặn",
   stopped: "Đã dừng",
+  no_op: "Không có đối tượng",
+  unverified: "Chưa xác minh",
+  skipped: "Bỏ qua",
+  deferred: "Hoãn",
 };
 
 function warmingActionLabel(type: string): string {
   return WARMING_ACTION_LABELS.find((a) => a.id === type)?.label || type;
+}
+
+function formatNextRunAt(ts?: number | null): string {
+  if (ts == null || !Number.isFinite(ts)) return "Chưa lên lịch";
+  try {
+    return new Date(ts).toLocaleString();
+  } catch {
+    return "—";
+  }
 }
 
 function WarmingTab({ flash }: { flash: FlashFn }) {
@@ -1431,6 +1497,13 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
     enabled: false,
     intervalMinutes: 90,
     actionsPerRun: 3,
+    useOwnedTabOnly: true,
+    maxSessionsPerDay: 8,
+    maxWritePerDay: 3,
+    writeCooldownMinutes: 90,
+    minSessionGapMinutes: 20,
+    quietHoursStart: 0,
+    quietHoursEnd: 6,
     // Các hành động GHI (reactPost/reactReels) là tương tác thật nên KHÔNG bật
     // sẵn; người dùng phải chủ động tích. Khớp mặc định phía backend
     // (WARMING_DEFAULT chỉ bật các loại read-only).
@@ -1444,11 +1517,81 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
   const [progress, setProgress] = useState<string | null>(null);
   const [entries, setEntries] = useState<WarmingActivityEntry[]>([]);
   const [logLoading, setLogLoading] = useState(true);
+  const [warmingState, setWarmingState] = useState<WarmingStateSummary | null>(
+    null,
+  );
+  const [binding, setBinding] = useState<BindingStatus | null>(null);
+  // RISK-BE-04: config may be default/stale when Backend is unavailable.
+  const [configMeta, setConfigMeta] = useState<{
+    stale: boolean;
+    source: string;
+    status: string;
+  }>({ stale: false, source: "server", status: "found" });
+
+  async function loadBinding() {
+    try {
+      const [bindRes, matchRes] = await Promise.all([
+        bg<
+          BgResponse & {
+            binding?: { fbId: string | null; fbName: string | null };
+            stale?: boolean;
+            source?: string;
+          }
+        >("FB_GET_BINDING", {}),
+        bg<
+          BgResponse & {
+            code?: string;
+            bound?: string | null;
+            current?: string | null;
+            boundName?: string | null;
+          }
+        >("FB_CHECK_MATCH", {}),
+      ]);
+      const b = bindRes.binding || { fbId: null, fbName: null };
+      const code = matchRes.code || "";
+      const matchOk =
+        code === "OK" || code === "UNBOUND"
+          ? true
+          : code === "MISMATCH" || code === "FB_ABSENT"
+            ? false
+            : !!matchRes.ok;
+      setBinding({
+        fbId: b.fbId ?? null,
+        fbName: b.fbName ?? null,
+        matchCode: code || undefined,
+        matchOk,
+        current: matchRes.current ?? null,
+        stale: !!bindRes.stale,
+        source: bindRes.source,
+      });
+    } catch {
+      setBinding(null);
+    }
+  }
 
   async function loadConfig() {
     setLoading(true);
     const res = await bg<WarmingConfigResponse>("GET_WARMING_CONFIG", {});
-    if (res.ok && res.config) setConfig(res.config);
+    if (res.config) {
+      setConfig({
+        ...res.config,
+        nextRunAt: res.nextRunAt ?? res.config.nextRunAt ?? null,
+        delayMinutes: res.delayMinutes ?? res.config.delayMinutes,
+      });
+    }
+    if (res.state) setWarmingState(res.state);
+    setConfigMeta({
+      stale: !!res.stale || !res.ok,
+      source: res.source || (res.ok ? "server" : "default"),
+      status: res.status || (res.ok ? "found" : "server_error"),
+    });
+    if (!res.ok) {
+      flash(
+        "info",
+        res.error ||
+          "Không kết nối được Backend — đang hiển thị cấu hình mặc định (stale).",
+      );
+    }
     setLoading(false);
   }
 
@@ -1457,13 +1600,14 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
     const res = await bg<WarmingActivityResponse>("GET_WARMING_ACTIVITY", {
       limit: 30,
     });
-    if (res.ok && Array.isArray(res.entries)) setEntries(res.entries);
+    if (res.ok) setEntries(normalizeWarmingActivityEntries(res.entries));
     setLogLoading(false);
   }
 
   useEffect(() => {
     void loadConfig();
     void loadLog();
+    void loadBinding();
   }, []);
 
   // Lắng nghe tiến trình realtime WARMING_PROGRESS từ service worker (giống
@@ -1506,15 +1650,11 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function toggleAction(id: string) {
-    setConfig((c) => {
-      const has = c.actions.includes(id);
-      const next = has
-        ? c.actions.filter((a) => a !== id)
-        : [...c.actions, id];
-      // Luôn giữ ít nhất một hành động để mỗi lượt có việc để làm.
-      return { ...c, actions: next.length ? next : c.actions };
-    });
+  function computeNextActions(current: string[], id: string): string[] {
+    const has = current.includes(id);
+    const next = has ? current.filter((a) => a !== id) : [...current, id];
+    // Luôn giữ ít nhất một hành động để mỗi lượt có việc để làm.
+    return next.length ? next : current;
   }
 
   async function save(patch: Partial<WarmingConfig>) {
@@ -1533,30 +1673,83 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
     flash("ok", "Đã lưu cấu hình nuôi tài khoản.");
   }
 
+  async function toggleActionAndSave(id: string) {
+    const nextActions = computeNextActions(config.actions, id);
+    if (nextActions === config.actions) return;
+    await save({ actions: nextActions });
+  }
+
   async function runNow() {
+    // Soft gate: warn on binding mismatch / FB absent; still allow user to force
+    // if they confirm (backend processWarming will hard-block if needed).
+    if (binding && binding.matchOk === false) {
+      const msg =
+        binding.matchCode === "MISMATCH"
+          ? "Facebook đang đăng nhập không khớp tài khoản đã liên kết. Vẫn chạy?"
+          : binding.matchCode === "FB_ABSENT"
+            ? "Không thấy Facebook đăng nhập. Vẫn chạy?"
+            : "Trạng thái binding không ổn định. Vẫn chạy?";
+      const ok = window.confirm(msg);
+      if (!ok) return;
+    }
     setRunning(true);
     setProgress("Đang chạy một lượt nuôi tài khoản…");
     const res = await bg<WarmingRunResponse>("WARMING_RUN_NOW", {
       actionsPerRun: config.actionsPerRun,
     });
     setRunning(false);
-    if (!res.ok) {
+    if (!res.ok && !res.blocked && !res.stopped && !res.deferred) {
       setProgress(null);
       flash("err", res.error || "Không chạy được lượt nuôi tài khoản.");
       return;
     }
+    const succeeded = res.succeeded ?? res.done ?? 0;
+    const failed = res.failed ?? 0;
+    const unverified = res.unverified ?? 0;
+    const noOp = res.noOp ?? 0;
+    const skippedWriteReasons = Array.isArray(res.skippedWrites)
+      ? res.skippedWrites
+          .map((item) => {
+            const action = warmingActionLabel(item.action || "");
+            const code = item.code ? ` (${item.code})` : "";
+            return item.reason ? `${action}${code}: ${item.reason}` : `${action}${code}`;
+          })
+          .filter(Boolean)
+      : [];
     if (res.blocked) {
-      setProgress("Lượt chạy dừng sớm: có dấu hiệu bị chặn.");
-      flash("info", "Đã dừng vì FB có dấu hiệu chặn.");
+      setProgress("Lượt chạy dừng sớm: có dấu hiệu bị chặn / sai tài khoản.");
+      flash("info", res.error || "Đã dừng vì FB chặn hoặc sai tài khoản.");
+    } else if (res.deferred) {
+      setProgress(res.error || "Hoãn phiên theo chính sách.");
+      flash("info", res.error || "Hoãn phiên nuôi tài khoản.");
     } else if (res.stopped) {
-      setProgress(`Đã dừng theo yêu cầu (xong ${res.done || 0} hành động).`);
+      setProgress(
+        `Đã dừng (thành công ${succeeded}, lỗi ${failed}, chưa xác minh ${unverified}).`,
+      );
       flash("info", "Đã dừng lượt nuôi tài khoản.");
+    } else if ((res.attempted ?? 0) === 0 && skippedWriteReasons.length > 0) {
+      const reasonText = skippedWriteReasons.join(" · ");
+      setProgress(`Chưa chạy hành động: ${reasonText}`);
+      flash("info", `Hành động ghi chưa được thực thi: ${reasonText}`);
     } else {
-      setProgress(`Xong ${res.done || 0} hành động.`);
-      flash("ok", `Đã nuôi ${res.done || 0} hành động.`);
+      setProgress(
+        `Thành công ${succeeded}` +
+          (failed ? `, lỗi ${failed}` : "") +
+          (unverified ? `, chưa xác minh ${unverified}` : "") +
+          (noOp ? `, không đối tượng ${noOp}` : "") +
+          ".",
+      );
+      flash(
+        "ok",
+        `Đã nuôi: ${succeeded} thành công` +
+          (failed ? `, ${failed} lỗi` : "") +
+          ".",
+      );
     }
-    window.setTimeout(() => setProgress(null), 6000);
+    window.setTimeout(() => setProgress(null), 8000);
     void loadLog();
+    void loadConfig();
+    void loadBinding();
   }
 
   async function stopNow() {
@@ -1589,6 +1782,12 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
                 Chạy các hành động đọc thụ động theo lịch để tài khoản trông tự
                 nhiên. Không đăng bài, không bình luận.
               </p>
+              {configMeta.stale ? (
+                <p className="mt-1 text-xs text-amber-600">
+                  Cấu hình đang là {configMeta.source === "default" ? "mặc định" : configMeta.source}
+                  {" "}(Backend: {configMeta.status}). Automation sẽ không chạy cho đến khi đọc lại được server.
+                </p>
+              ) : null}
             </div>
           </div>
           <label className="flex cursor-pointer items-center gap-2 text-sm text-ink-soft">
@@ -1647,6 +1846,264 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
           </label>
         </div>
 
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md border border-line-soft bg-surface-2/40 px-3 py-2 text-xs text-ink-soft">
+          <span>
+            Lịch kế tiếp:{" "}
+            <span className="font-medium text-ink">
+              {formatNextRunAt(config.nextRunAt)}
+            </span>
+            {config.enabled ? null : (
+              <span className="text-ink-faint"> (đang tắt)</span>
+            )}
+          </span>
+          {warmingState ? (
+            <>
+              <span>
+                Phiên hôm nay:{" "}
+                <span className="font-medium text-ink">
+                  {warmingState.sessionsToday ?? 0}
+                  {config.maxSessionsPerDay != null
+                    ? `/${config.maxSessionsPerDay}`
+                    : ""}
+                </span>
+              </span>
+              <span>
+                Tương tác ghi:{" "}
+                <span className="font-medium text-ink">
+                  {warmingState.writeCountToday ?? 0}
+                  {config.maxWritePerDay != null
+                    ? `/${config.maxWritePerDay}`
+                    : ""}
+                </span>
+              </span>
+              {(warmingState.riskLevel ?? 0) > 0 ? (
+                <span className="text-amber-600">
+                  Risk level {warmingState.riskLevel}
+                  {warmingState.recentFailCount
+                    ? ` (${warmingState.recentFailCount} lỗi gần đây)`
+                    : ""}
+                </span>
+              ) : null}
+            </>
+          ) : null}
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Tỷ lệ thả cảm xúc (%)
+            <input
+              type="number"
+              min={0}
+              max={100}
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.reactionChancePercent ?? 30}
+              disabled={saving}
+              onChange={(e) =>
+                setConfig((c) => ({
+                  ...c,
+                  reactionChancePercent: clamp(
+                    parseInt(e.target.value, 10),
+                    0,
+                    100,
+                    c.reactionChancePercent ?? 30,
+                  ),
+                }))
+              }
+              onBlur={() =>
+                void save({ reactionChancePercent: config.reactionChancePercent })
+              }
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Tối đa phiên/ngày
+            <input
+              type="number"
+              min={1}
+              max={48}
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.maxSessionsPerDay ?? 8}
+              disabled={saving}
+              onChange={(e) =>
+                setConfig((c) => ({
+                  ...c,
+                  maxSessionsPerDay: clamp(
+                    parseInt(e.target.value, 10),
+                    1,
+                    48,
+                    c.maxSessionsPerDay ?? 8,
+                  ),
+                }))
+              }
+              onBlur={() =>
+                void save({ maxSessionsPerDay: config.maxSessionsPerDay })
+              }
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Tối đa ghi/ngày
+            <input
+              type="number"
+              min={0}
+              max={20}
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.maxWritePerDay ?? 3}
+              disabled={saving}
+              onChange={(e) =>
+                setConfig((c) => ({
+                  ...c,
+                  maxWritePerDay: clamp(
+                    parseInt(e.target.value, 10),
+                    0,
+                    20,
+                    c.maxWritePerDay ?? 3,
+                  ),
+                }))
+              }
+              onBlur={() => void save({ maxWritePerDay: config.maxWritePerDay })}
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Cooldown ghi (phút)
+            <input
+              type="number"
+              min={15}
+              max={1440}
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.writeCooldownMinutes ?? 90}
+              disabled={saving}
+              onChange={(e) =>
+                setConfig((c) => ({
+                  ...c,
+                  writeCooldownMinutes: clamp(
+                    parseInt(e.target.value, 10),
+                    15,
+                    1440,
+                    c.writeCooldownMinutes ?? 90,
+                  ),
+                }))
+              }
+              onBlur={() =>
+                void save({ writeCooldownMinutes: config.writeCooldownMinutes })
+              }
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Nghỉ giữa phiên (phút)
+            <input
+              type="number"
+              min={0}
+              max={720}
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.minSessionGapMinutes ?? 20}
+              disabled={saving}
+              onChange={(e) =>
+                setConfig((c) => ({
+                  ...c,
+                  minSessionGapMinutes: clamp(
+                    parseInt(e.target.value, 10),
+                    0,
+                    720,
+                    c.minSessionGapMinutes ?? 20,
+                  ),
+                }))
+              }
+              onBlur={() =>
+                void save({
+                  minSessionGapMinutes: config.minSessionGapMinutes,
+                })
+              }
+            />
+          </label>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Giờ yên lặng bắt đầu
+            <input
+              type="number"
+              min={0}
+              max={23}
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.quietHoursStart ?? 0}
+              disabled={saving}
+              onChange={(e) =>
+                setConfig((c) => ({
+                  ...c,
+                  quietHoursStart: clamp(
+                    parseInt(e.target.value, 10),
+                    0,
+                    23,
+                    c.quietHoursStart ?? 0,
+                  ),
+                }))
+              }
+              onBlur={() =>
+                void save({ quietHoursStart: config.quietHoursStart })
+              }
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+            Giờ yên lặng kết thúc
+            <input
+              type="number"
+              min={0}
+              max={23}
+              className="rounded-md border border-line bg-surface-2 px-3 py-2 text-sm text-ink outline-none focus:border-accent/50"
+              value={config.quietHoursEnd ?? 6}
+              disabled={saving}
+              onChange={(e) =>
+                setConfig((c) => ({
+                  ...c,
+                  quietHoursEnd: clamp(
+                    parseInt(e.target.value, 10),
+                    0,
+                    23,
+                    c.quietHoursEnd ?? 6,
+                  ),
+                }))
+              }
+              onBlur={() => void save({ quietHoursEnd: config.quietHoursEnd })}
+            />
+          </label>
+          <p className="col-span-2 self-end text-xs text-ink-faint sm:col-span-2">
+            Cửa sổ yên lặng theo giờ máy local (bắt đầu inclusive, kết thúc
+            exclusive). Đặt hai giá trị bằng nhau để tắt. Ví dụ 0→6 = nửa đêm đến
+            6h sáng.
+          </p>
+        </div>
+
+        {binding ? (
+          <div
+            className={cn(
+              "rounded-md border px-3 py-2.5 text-xs",
+              binding.matchOk === false
+                ? "border-rose-300/60 bg-rose-500/5 text-rose-700"
+                : binding.stale
+                  ? "border-amber-300/60 bg-amber-500/5 text-amber-800"
+                  : "border-line-soft bg-surface-2/40 text-ink-soft",
+            )}
+          >
+            <div className="font-medium text-ink">
+              Binding Facebook
+              {binding.fbName ? `: ${binding.fbName}` : ""}
+              {binding.fbId ? ` (${binding.fbId})` : " — chưa liên kết"}
+            </div>
+            <div className="mt-0.5">
+              {binding.matchOk === false
+                ? binding.matchCode === "MISMATCH"
+                  ? `Tài khoản đang đăng nhập${binding.current ? ` (${binding.current})` : ""} không khớp binding. Chạy ngay có thể bị chặn.`
+                  : binding.matchCode === "FB_ABSENT"
+                    ? "Không thấy Facebook đăng nhập trên trình duyệt. Chạy ngay có thể bị chặn."
+                    : "Trạng thái binding không ổn định."
+                : binding.stale
+                  ? "Binding lấy từ cache (Backend lỗi) — có thể lệch."
+                  : binding.fbId
+                    ? "Binding khớp / sẵn sàng."
+                    : "Chưa bind: warming vẫn chạy nhưng nên liên kết tài khoản để tránh nhầm profile."}
+            </div>
+          </div>
+        ) : null}
+
         <div className="flex flex-col gap-2">
           <span className="text-xs font-medium text-ink-soft">
             Hành động cho phép
@@ -1663,9 +2120,8 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
                   checked={config.actions.includes(a.id)}
                   disabled={saving}
                   onChange={() => {
-                    toggleAction(a.id);
+                    void toggleActionAndSave(a.id);
                   }}
-                  onBlur={() => void save({ actions: config.actions })}
                 />
                 <span className="flex flex-col">
                   <span className="text-ink">{a.label}</span>
@@ -1675,6 +2131,23 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
             ))}
           </div>
         </div>
+
+        <label className="flex cursor-pointer items-start gap-2.5 rounded-md border border-line-soft bg-surface-2/40 px-3 py-2.5 text-sm text-ink-soft">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 accent-accent"
+            checked={config.useOwnedTabOnly !== false}
+            disabled={saving}
+            onChange={(e) => void save({ useOwnedTabOnly: e.target.checked })}
+          />
+          <span className="flex flex-col">
+            <span className="text-ink">Dùng tab riêng (khuyến nghị)</span>
+            <span className="text-xs text-ink-faint">
+              Mở tab Facebook do extension sở hữu, không chiếm tab bạn đang đọc
+              hoặc soạn thảo.
+            </span>
+          </span>
+        </label>
 
         <div className="flex flex-wrap items-center gap-3 border-t border-line-soft pt-3">
           <button
@@ -1731,40 +2204,59 @@ function WarmingTab({ flash }: { flash: FlashFn }) {
           </p>
         ) : (
           <ul className="flex flex-col divide-y divide-line-soft">
-            {entries.map((e) => (
-              <li
-                key={e.id}
-                className="flex items-center justify-between gap-3 py-2.5 text-sm"
-              >
-                <div className="flex items-center gap-2.5">
-                  <span
-                    className={cn(
-                      "inline-flex h-6 w-6 items-center justify-center rounded-full",
-                      e.status === "done"
-                        ? "bg-emerald-500/10 text-emerald-500"
-                        : e.status === "blocked"
-                          ? "bg-amber-500/10 text-amber-500"
-                          : "bg-rose-500/10 text-rose-500",
-                    )}
-                  >
-                    {e.status === "done" ? (
-                      <CheckCircle2 size={14} />
-                    ) : (
-                      <AlertCircle size={14} />
-                    )}
+            {entries.map((e) => {
+              const diagnostic = warmingDiagnosticText(e);
+              return (
+                <li
+                  key={e.id}
+                  className="flex items-start justify-between gap-3 py-2.5 text-sm"
+                >
+                  <div className="flex min-w-0 items-start gap-2.5">
+                    <span
+                      className={cn(
+                        "mt-0.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
+                        e.status === "done" || e.status === "success"
+                          ? "bg-emerald-500/10 text-emerald-500"
+                          : e.status === "blocked" ||
+                              e.status === "deferred" ||
+                              e.status === "unverified" ||
+                              e.status === "no_op" ||
+                              e.status === "skipped"
+                            ? "bg-amber-500/10 text-amber-500"
+                            : "bg-rose-500/10 text-rose-500",
+                      )}
+                    >
+                      {e.status === "done" || e.status === "success" ? (
+                        <CheckCircle2 size={14} />
+                      ) : (
+                        <AlertCircle size={14} />
+                      )}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                        <span className="text-ink">
+                          {warmingActionLabel(e.type)}
+                        </span>
+                        <span className="text-xs text-ink-faint">
+                          {WARMING_STATUS_LABELS[e.status] || "Không xác định"}
+                        </span>
+                      </div>
+                      {diagnostic ? (
+                        <p
+                          className="mt-1 break-words text-xs leading-5 text-ink-faint"
+                          title={diagnostic}
+                        >
+                          {diagnostic}
+                        </p>
+                      ) : null}
+                    </div>
+                  </div>
+                  <span className="shrink-0 text-xs text-ink-faint">
+                    {timeAgo(e.createdAt ?? undefined)}
                   </span>
-                  <span className="text-ink">
-                    {warmingActionLabel(e.type)}
-                  </span>
-                  <span className="text-xs text-ink-faint">
-                    {WARMING_STATUS_LABELS[e.status] || e.status}
-                  </span>
-                </div>
-                <span className="text-xs text-ink-faint">
-                  {timeAgo(e.createdAt ?? undefined)}
-                </span>
-              </li>
-            ))}
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>

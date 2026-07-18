@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+
+export function didIncrementalItemsChange<T>(previous: T[], current: T[]): boolean {
+  return (
+    previous.length !== current.length ||
+    previous.some((item, index) => !Object.is(item, current[index]))
+  );
+}
 
 /**
  * useIncremental — render a large list in chunks instead of all at once.
@@ -8,8 +15,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * the first paint is fast and scrolling stays smooth even with thousands of
  * source rows. Purely client-side windowing — no backend/API changes needed.
  *
- * The window resets to the first page whenever the source array identity
- * changes (e.g. after a refetch or when filters recompute the list).
+ * The window resets only when the list's CONTENT changes. Many callers derive
+ * arrays with filter()/sort() during render, so array identity alone is not a
+ * valid reset signal: resetting on every new reference makes loadMore() jump
+ * immediately back to the first page.
  */
 export function useIncremental<T, E extends HTMLElement = HTMLDivElement>(
   items: T[],
@@ -18,10 +27,14 @@ export function useIncremental<T, E extends HTMLElement = HTMLDivElement>(
   const pageSize = opts.pageSize ?? 12;
   const [count, setCount] = useState(pageSize);
   const sentinelRef = useRef<E | null>(null);
+  const previousItemsRef = useRef(items);
 
-  // Reset to first page when the source list changes (refetch / filter change).
-  useEffect(() => {
-    setCount(pageSize);
+  // Reset only when item content/order changed, not merely because filter()/sort()
+  // returned a fresh array reference containing the same item objects.
+  useLayoutEffect(() => {
+    const previous = previousItemsRef.current;
+    previousItemsRef.current = items;
+    if (didIncrementalItemsChange(previous, items)) setCount(pageSize);
   }, [items, pageSize]);
 
   const total = items.length;
@@ -29,8 +42,8 @@ export function useIncremental<T, E extends HTMLElement = HTMLDivElement>(
   const hasMore = shown < total;
 
   const loadMore = useCallback(() => {
-    setCount((c) => c + pageSize);
-  }, [pageSize]);
+    setCount((c) => Math.min(items.length, c + pageSize));
+  }, [items.length, pageSize]);
 
   // Auto-reveal the next chunk as the sentinel nears the viewport.
   useEffect(() => {

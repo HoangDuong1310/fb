@@ -52,21 +52,26 @@ import {
   scheduleTickSoon,
   AUTOCRAWL_ALARM,
   getAutoCrawlConfig,
+  getAutoCrawlConfigResult,
   applyAutoCrawlConfig,
   processAutoCrawl,
   initAutoCrawl,
   AUTOSYNC_ALARM,
   getAutoSyncConfig,
+  getAutoSyncConfigResult,
   applyAutoSyncConfig,
   processAutoSync,
   initAutoSync,
   WATCH_ALARM,
   getWatchConfig,
+  getWatchConfigResult,
   applyWatchConfig,
   processReplyWatch,
   initReplyWatch,
   WARMING_ALARM,
   getWarmingConfig,
+  getWarmingConfigResult,
+  getWarmingStateResult,
   applyWarmingConfig,
   processWarming,
   stopWarming,
@@ -76,10 +81,12 @@ import {
 import {
   readActiveFbId,
   getBinding,
+  getBindingResult,
   setBinding,
   clearBinding,
   assertFbMatch,
 } from "./fb-identity.js";
+import { listTelemetry, clearTelemetry } from "./client-telemetry.js";
 import { runGroupPriceExtraction } from "./group-prices.js";
 import { runLeadClassification } from "./lead-classify.js";
 import { pollRemoteCommands, connectRealtime, disconnectRealtime } from "./remote-commands.js";
@@ -512,9 +519,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "GET_AUTOCRAWL": {
-      getAutoCrawlConfig()
-        .then((cfg) => sendResponse({ ok: true, config: cfg }))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const r =
+          typeof getAutoCrawlConfigResult === "function"
+            ? await getAutoCrawlConfigResult()
+            : { ok: true, config: await getAutoCrawlConfig(), source: "server", stale: false, status: "found", found: true };
+        sendResponse({
+          ok: !!r.ok,
+          config: r.config,
+          source: r.source || (r.ok ? "server" : "default"),
+          stale: !!r.stale || !r.ok,
+          status: r.status || (r.ok ? "found" : "server_error"),
+          found: !!r.found,
+          error: r.ok ? undefined : r.message,
+        });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
@@ -526,9 +546,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "GET_AUTOSYNC": {
-      getAutoSyncConfig()
-        .then((cfg) => sendResponse({ ok: true, config: cfg }))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const r =
+          typeof getAutoSyncConfigResult === "function"
+            ? await getAutoSyncConfigResult()
+            : { ok: true, config: await getAutoSyncConfig(), source: "server", stale: false, status: "found", found: true };
+        sendResponse({
+          ok: !!r.ok,
+          config: r.config,
+          source: r.source || (r.ok ? "server" : "default"),
+          stale: !!r.stale || !r.ok,
+          status: r.status || (r.ok ? "found" : "server_error"),
+          found: !!r.found,
+          error: r.ok ? undefined : r.message,
+        });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
@@ -1267,24 +1300,72 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "GET_WARMING_CONFIG": {
-      getWarmingConfig()
-        .then((config) => sendResponse({ ok: true, config }))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        // RISK-BE-04: structured read — UI can distinguish server/default/stale.
+        // Always include a normalized config for display; set ok/stale/source.
+        // Also attach nextRunAt (from schedule/alarm) + state counters for UI caps.
+        const r =
+          typeof getWarmingConfigResult === "function"
+            ? await getWarmingConfigResult()
+            : { ok: true, config: await getWarmingConfig(), source: "server", stale: false, status: "found", found: true };
+        let nextRunAt = null;
+        let delayMinutes = 0;
+        try {
+          const alarm = await chrome.alarms.get(WARMING_ALARM);
+          if (alarm && alarm.scheduledTime) {
+            nextRunAt = alarm.scheduledTime;
+            delayMinutes = Math.max(0, Math.round((alarm.scheduledTime - Date.now()) / 60000));
+          }
+        } catch (e) {}
+        let state = null;
+        try {
+          if (typeof getWarmingStateResult === "function") {
+            const st = await getWarmingStateResult();
+            if (st && st.ok) state = st.state;
+          }
+        } catch (e) {}
+        const config = r.config
+          ? { ...r.config, nextRunAt, delayMinutes }
+          : r.config;
+        sendResponse({
+          ok: !!r.ok,
+          config,
+          state,
+          nextRunAt,
+          delayMinutes,
+          source: r.source || (r.ok ? "server" : "default"),
+          stale: !!r.stale || !r.ok,
+          status: r.status || (r.ok ? "found" : "server_error"),
+          found: !!r.found,
+          retryable: !!r.retryable,
+          error: r.ok ? undefined : r.message || "Không đọc được warmingConfig",
+        });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
     case "SET_WARMING_CONFIG": {
-      applyWarmingConfig(msg.config || {})
-        .then((config) => sendResponse({ ok: true, config }))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const config = await applyWarmingConfig(msg.config || {});
+        sendResponse({ ok: true, config });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
     // Chạy NGAY một lượt nuôi tài khoản (nút bấm tay), bỏ qua cờ enabled.
     case "WARMING_RUN_NOW": {
-      processWarming({ manual: true, actionsPerRun: msg.actionsPerRun })
-        .then((r) => sendResponse(r))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        const r = await processWarming({
+          manual: true,
+          actionsPerRun: msg.actionsPerRun,
+          forceAllRead: !!msg.forceAllRead,
+          forceWrite: !!msg.forceWrite,
+        });
+        sendResponse(r);
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
@@ -1295,9 +1376,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "GET_WARMING_ACTIVITY": {
-      DB.getWarmingActivity({ limit: msg.limit })
-        .then((entries) => sendResponse({ ok: true, entries }))
-        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      (async () => {
+        await readyPromise;
+        // DB.getWarmingActivity() returns the backend body { entries: [...] }.
+        // Unwrap so the UI receives { ok: true, entries: [...] } (array), not a
+        // nested { entries: { entries: [...] } } which fails Array.isArray().
+        const result = await DB.getWarmingActivity({ limit: msg.limit });
+        sendResponse({
+          ok: true,
+          entries: Array.isArray(result?.entries) ? result.entries : [],
+        });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
@@ -1710,11 +1799,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     // Ràng buộc hiện tại của tài khoản app ({ fbId, fbName } hoặc null).
+    // Structured: source/stale/status so UI can warn before manual automation.
     case "FB_GET_BINDING": {
       (async () => {
         await readyPromise;
-        const binding = await getBinding();
-        sendResponse({ ok: true, binding });
+        if (typeof getBindingResult === "function") {
+          const r = await getBindingResult();
+          sendResponse({
+            ok: !!r.ok,
+            binding: r.binding,
+            source: r.source,
+            stale: !!r.stale,
+            status: r.status,
+            found: !!r.found,
+            retryable: !!r.retryable,
+            error: r.ok ? undefined : r.message,
+          });
+        } else {
+          const binding = await getBinding();
+          sendResponse({ ok: true, binding, source: "server", stale: false });
+        }
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Local client telemetry (redacted, no server endpoint).
+    case "GET_TELEMETRY": {
+      (async () => {
+        const r = await listTelemetry({ limit: msg.limit });
+        sendResponse(r);
+      })().catch((e) => sendResponse({ ok: false, events: [], error: String(e) }));
+      return true;
+    }
+
+    case "CLEAR_TELEMETRY": {
+      (async () => {
+        const r = await clearTelemetry();
+        sendResponse(r);
       })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
@@ -1826,15 +1947,22 @@ try {
     else if (a.name === AUTOSYNC_ALARM) processAutoSync();
     else if (a.name === WATCH_ALARM) processReplyWatch();
     else if (a.name === WARMING_ALARM) {
-      // Alarm một-lần: chạy lượt rồi TỰ lên lịch lượt kế tiếp (có dao động) để
-      // lịch trình không máy móc. Reschedule cả khi lượt lỗi/bị bỏ qua.
-      processWarming().finally(() => scheduleNextWarming());
+      // Alarm một-lần: chờ token sẵn sàng, chạy lượt rồi TỰ lên lịch lượt kế tiếp.
+      // Nếu Backend tạm lỗi đúng lúc alarm bắn, đặt retry ngắn để chuỗi alarm
+      // không biến mất vĩnh viễn sau khi one-shot hiện tại đã bị tiêu thụ.
+      readyPromise
+        .then(() => processWarming())
+        .catch(() => {})
+        .finally(() => scheduleNextWarming({ retryOnFailure: true }));
     }
   });
   initAutoCrawl();
   initAutoSync();
   initReplyWatch();
-  initWarming();
+  // Các init đọc settings qua Backend nên phải chờ token được nạp. Nếu gọi ngay
+  // khi MV3 service worker vừa thức dậy, chúng có thể thấy auth/network failure và
+  // bỏ qua việc khôi phục alarm dù cấu hình nuôi đang bật.
+  readyPromise.then(() => initWarming()).catch(() => {});
   // Dọn nguồn trùng "Linh kiện máy tính" đời cũ TRƯỚC khi seed lại 4 nguồn chuẩn.
   // PHẢI đợi readyPromise (token đã nạp vào cache) trước, nếu không các lệnh
   // getSources/saveSource bắn đi khi SW vừa thức dậy sẽ thiếu Authorization ->

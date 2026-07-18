@@ -15,6 +15,20 @@ import { syncAllSources } from "./prices.js";
 import { extractPostsFromChunks } from "./gql-parse.js";
 import { API_BASE_URL } from "./config.js";
 import { assertFbMatch, MATCH_MISMATCH, MATCH_FB_ABSENT } from "./fb-identity.js";
+import { recordTelemetry } from "./client-telemetry.js";
+import {
+  normalizeWarmingActions as policyNormalizeWarmingActions,
+  normalizeWarmingConfig,
+  warmingNextDelayMinutes as policyWarmingNextDelayMinutes,
+  canStartWarmingSession,
+  planWarmingActions,
+  aggregateWarmingResults,
+  statusFromActionDetail,
+  applySessionToWarmingState,
+  rollWarmingStateDay,
+  computeRiskLevel,
+  applyRiskToWarmingState,
+} from "./warming-policy.js";
 
 /* ------------------------- QUẢN LÝ TAB CRAWL --------------------------- */
 // Lưu danh sách tab do background tự mở vào chrome.storage.session để sống sót khi
@@ -421,8 +435,13 @@ function getStoredGqlTemplate() {
 function splitGqlChunks(text) {
   const out = [];
   if (!text) return out;
+  const normalizeLine = (line) =>
+    String(line || "")
+      .trim()
+      .replace(/^(?:for\s*\(;;\);|while\s*\(1\);)\s*/, "")
+      .trim();
   for (const line of String(text).split("\n")) {
-    const t = line.trim();
+    const t = normalizeLine(line);
     if (!t) continue;
     try {
       out.push(JSON.parse(t));
@@ -430,7 +449,8 @@ function splitGqlChunks(text) {
   }
   if (out.length === 0) {
     try {
-      out.push(JSON.parse(text));
+      const normalized = normalizeLine(text);
+      if (normalized) out.push(JSON.parse(normalized));
     } catch (e) {}
   }
   return out;
@@ -805,13 +825,16 @@ async function crawlGroupApiTabless(groupId, options) {
 
 /* ----------------------- QUÉT NHÓM ĐÃ THAM GIA -------------------------- */
 
-/** Hàm tự-chứa chạy trong trang "Nhóm của bạn" để thu thập (groupId, groupName). */
-async function scanJoinedGroupsInPage() {
+/** Hàm tự-chứa chạy trong trang "Nhóm của bạn" để thu thập (groupId, groupName).
+ * `opts` chỉ phục vụ kiểm thử; khi inject vào Facebook hàm được gọi không đối số. */
+export async function scanJoinedGroupsInPage(opts = {}) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const scrollRounds = Number.isFinite(opts.scrollRounds) ? opts.scrollRounds : 10;
+  const scrollDelayMs = Number.isFinite(opts.scrollDelayMs) ? opts.scrollDelayMs : 800;
   // Cuộn để tải hết danh sách nhóm.
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < scrollRounds; i++) {
     window.scrollTo(0, document.body.scrollHeight);
-    await sleep(800);
+    await sleep(scrollDelayMs);
   }
   const RESERVED = new Set([
     "joins", "feed", "discover", "create", "your_groups", "category", "search", "notifications",
@@ -831,27 +854,151 @@ async function scanJoinedGroupsInPage() {
     "đã trả lời",
     "đã thích",
     "bài viết của bạn",
+    "Giờ bạn có thể đăng bài",
+    "kết nối với các thành viên khác",
+    "Now you can post",
+    "connect with other members",
   ];
-  // Làm sạch tên nhóm: bỏ tiền tố "Chưa đọc", cắt phần phụ đề hoạt động, bỏ mốc thời gian ở đuôi.
+  // Trang /groups/joins có thể chứa cả nhóm được đề xuất. Kiểm tra action thật
+  // (text/aria-label của button), không chỉ textContent của link.
+  const JOIN_ACTION_RE = /(?:tham\s+gia(?:\s+nhóm)?|join\s+group|request\s+to\s+join)/i;
+  const NOTIFICATION_ACTION_RE = /^(?:đánh\s+dấu\s+là\s+đã\s+đọc|mark\s+as\s+read|chưa\s+đọc|unread)\b/i;
+  const POST_PREVIEW_RE = /:\s*["“”'‘’].+(?:["“”'‘’]|…|\.\.\.)?\s*$/;
+  const GENERIC_LINK_RE = /^(?:truy\s+cập|xem|mở|visit|view|open)\s+(?:nhóm|group)\s*/i;
+
+  // Làm sạch MỌI dạng label Facebook đang dùng. Không phụ thuộc tên nhóm cụ thể.
   const cleanName = (raw) => {
-    let s = (raw || "").trim();
+    let s = String(raw || "").replace(/\s+/g, " ").trim();
     if (!s) return "";
     s = s.replace(/^Chưa đọc\s*/i, "").trim();
+    s = s.replace(GENERIC_LINK_RE, "").trim();
+
+    // Dạng thông báo bài mới: tên nằm sau "bạn truy cập vào nhóm".
+    const visitMatch = /(?:từ\s+)?lần(?:\s+gần\s+đây)?\s+nhất\s+bạn\s+truy\s+cập(?:\s+vào)?\s+nhóm\s+/i.exec(s);
+    if (visitMatch && /bài\s+viết\s+mới/i.test(s.slice(0, visitMatch.index))) {
+      s = s.slice(visitMatch.index + visitMatch[0].length).trim();
+    }
+
+    // Dạng thẻ chào mừng thành viên mới:
+    // "Chào mừng bạn đến với TÊN NHÓM Giờ bạn có thể đăng bài, ...".
+    const welcome = /^(?:chào\s+mừng\s+bạn\s+đến\s+với|welcome\s+to)\s+(.+?)(?=\s+(?:giờ\s+bạn\s+có\s+thể|now\s+you\s+can)\b|$)/i.exec(s);
+    if (welcome) s = welcome[1].trim();
+
     let cut = s.length;
+    const lower = s.toLocaleLowerCase("vi");
     for (const mk of NOISE_MARKERS) {
-      const idx = s.indexOf(mk);
+      const idx = lower.indexOf(mk.toLocaleLowerCase("vi"));
       if (idx >= 0 && idx < cut) cut = idx;
     }
     s = s.slice(0, cut).trim();
     // Bỏ mốc thời gian tương đối ở đuôi, vd ".3 giờ", ".41 phút", "1 tuần".
     s = s.replace(/[.\s]*\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm)(\s*trước)?$/i, "").trim();
-    // Bỏ dấu câu thừa ở đuôi.
-    s = s.replace(/[:.\-\s]+$/, "").trim();
+    // Bỏ dấu câu thừa do phần phụ đề bị cắt; giữ dấu hợp lệ bên trong tên.
+    s = s.replace(/[:.\-–—\s]+$/, "").trim();
     return s;
+  };
+
+  const isJoinSuggestion = (a) => {
+    let scope = a;
+    for (let depth = 0; depth < 8 && scope; depth++, scope = scope.parentElement) {
+      const ownLabel = [
+        scope.getAttribute && scope.getAttribute("aria-label"),
+        scope.getAttribute && scope.getAttribute("title"),
+      ].filter(Boolean).join(" ");
+      if (JOIN_ACTION_RE.test(ownLabel)) return true;
+
+      // Dừng trước khi đọc action của một container chung chứa nhiều card; nếu
+      // không, nút "Tham gia nhóm" của card khác sẽ làm loại nhầm nhóm đã tham gia.
+      if (
+        scope !== a &&
+        scope.querySelectorAll &&
+        scope.querySelectorAll('a[href*="/groups/"]').length > 3
+      ) break;
+
+      if (scope.querySelectorAll) {
+        const actions = scope.querySelectorAll('button,[role="button"]');
+        for (const action of actions) {
+          const label = [
+            action.innerText,
+            action.textContent,
+            action.getAttribute && action.getAttribute("aria-label"),
+            action.getAttribute && action.getAttribute("title"),
+          ].filter(Boolean).join(" ");
+          if (JOIN_ACTION_RE.test(label)) return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  const nameCandidates = (a) => {
+    const out = [];
+    const seen = new Set();
+    const linkLabel = [
+      a.getAttribute && a.getAttribute("aria-label"),
+      a.getAttribute && a.getAttribute("title"),
+    ].filter(Boolean).join(" ");
+    const linkIsNotification = NOTIFICATION_ACTION_RE.test(linkLabel);
+    const push = (value, priority, allowKnownNotificationFormat = false) => {
+      const raw = String(value || "").replace(/\s+/g, " ").trim();
+      if (!raw) return;
+
+      // aria-label/textContent của card thông báo thường là một câu hành động +
+      // tên nhóm + preview bài viết. Đây không phải node tên nhóm và tuyệt đối
+      // không được thắng heading/title chỉ chứa tên.
+      const isNotificationLabel = NOTIFICATION_ACTION_RE.test(raw) || POST_PREVIEW_RE.test(raw);
+      const hasKnownExtractableFormat =
+        /bài\s+viết\s+mới[\s\S]*bạn\s+truy\s+cập(?:\s+vào)?\s+nhóm\s+/i.test(raw) ||
+        /^(?:chào\s+mừng\s+bạn\s+đến\s+với|welcome\s+to)\s+/i.test(raw);
+      if (isNotificationLabel && !(allowKnownNotificationFormat && hasKnownExtractableFormat)) return;
+
+      const name = cleanName(raw);
+      if (
+        !name ||
+        name.length < 2 ||
+        name.length >= 160 ||
+        /^https?:/i.test(name) ||
+        NOTIFICATION_ACTION_RE.test(name) ||
+        POST_PREVIEW_RE.test(name) ||
+        seen.has(name)
+      ) return;
+
+      seen.add(name);
+      // Chuỗi bị ellipsis là nhãn hiển thị đã cắt; chỉ dùng khi không có nguồn đầy đủ.
+      const truncated = /(?:\.\.\.|…)$/.test(name);
+      out.push({ name, score: priority - (truncated ? 100 : 0) });
+    };
+
+    // Nguồn semantic nằm bên trong link/card là nguồn chính. Facebook thường đặt
+    // riêng tên nhóm trong heading, còn aria-label của chính link có thể chứa cả
+    // trạng thái đọc và preview bài viết.
+    if (a.querySelectorAll) {
+      for (const el of a.querySelectorAll('h1,h2,h3,h4,[role="heading"],[title],[aria-label]')) {
+        push(el.innerText || el.textContent, 500);
+        push(el.getAttribute && el.getAttribute("title"), 480);
+        push(el.getAttribute && el.getAttribute("aria-label"), 460);
+      }
+    }
+
+    // title/aria-label của link chỉ được dùng nếu không mang cấu trúc notification.
+    push(a.getAttribute && a.getAttribute("title"), 400);
+    push(a.getAttribute && a.getAttribute("aria-label"), 380);
+    // Text toàn link là fallback cuối cho layout cũ. Khi chính link có nhãn action
+    // notification, không dùng text này vì preview có thể không có ngoặc kép; chỉ
+    // các định dạng cũ có quy tắc tách tên rõ ràng mới được phép đi qua.
+    const wholeLinkText = a.innerText || a.textContent;
+    const hasKnownWholeLinkFormat =
+      /bài\s+viết\s+mới[\s\S]*bạn\s+truy\s+cập(?:\s+vào)?\s+nhóm\s+/i.test(String(wholeLinkText || "")) ||
+      /^(?:chào\s+mừng\s+bạn\s+đến\s+với|welcome\s+to)\s+/i.test(String(wholeLinkText || "").trim());
+    if (!linkIsNotification || hasKnownWholeLinkFormat) {
+      push(wholeLinkText, 200, true);
+    }
+    return out.sort((x, y) => y.score - x.score);
   };
   const map = {};
   document.querySelectorAll('a[href*="/groups/"]').forEach((a) => {
     const href = a.href || "";
+    if (isJoinSuggestion(a)) return;
     const path = href.split(/[?#]/)[0];
     const m = path.match(/\/groups\/([^/]+)(\/[^?#]*)?$/);
     if (!m) return;
@@ -860,28 +1007,154 @@ async function scanJoinedGroupsInPage() {
     // Bỏ qua link trỏ tới bài viết/thông báo cụ thể (vd /groups/{id}/posts/...).
     const rest = (m[2] || "").replace(/^\/+|\/+$/g, "");
     if (rest && POST_SEGMENTS.has(rest.split("/")[0])) return;
-    const name = cleanName(a.textContent || "");
-    if (
-      name &&
-      name.length > 1 &&
-      name.length < 120 &&
-      !/^https?:/i.test(name) &&
-      !NOISE_MARKERS.some((mk) => name.includes(mk)) &&
-      !map[id]
-    ) {
-      map[id] = name;
-    }
+    const best = nameCandidates(a)[0];
+    if (best && !map[id]) map[id] = best.name;
   });
   return Object.keys(map).map((id) => ({ groupId: id, groupName: map[id] }));
 }
 
-/** Mở trang "Nhóm của bạn", quét rồi lưu danh sách nhóm vào IndexedDB. */
-async function scanJoinedGroups() {
+/** Dùng chung đúng một Promise cho mọi caller trong khi tác vụ còn đang chạy. */
+function runSingleFlight(getInFlight, setInFlight, operation) {
+  const current = getInFlight();
+  if (current) return current;
+
+  let promise;
+  try {
+    promise = Promise.resolve(operation());
+  } catch (error) {
+    promise = Promise.reject(error);
+  }
+  setInFlight(promise);
+  promise.then(
+    () => {
+      if (getInFlight() === promise) setInFlight(null);
+    },
+    () => {
+      if (getInFlight() === promise) setInFlight(null);
+    },
+  );
+  return promise;
+}
+
+let joinedGroupsScanInFlight = null;
+
+function formatJoinedGroupsDiagnostic(diagnostic = {}) {
+  const list = (value, fallback = "-") => {
+    const values = Array.isArray(value)
+      ? value.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    return values.length ? values.slice(0, 24).join(",") : fallback;
+  };
+
+  return [
+    `friendly=${diagnostic.friendly || "-"}`,
+    `reason=${diagnostic.reason || "-"}`,
+    `requests=${Number(diagnostic.capturedRequests) || 0}`,
+    `chunks=${Number(diagnostic.capturedChunks) || 0}`,
+    `connections=${Number(diagnostic.candidateConnections) || 0}`,
+    `selected=${diagnostic.selectedConnection || "-"}`,
+    `path=${diagnostic.selectedPath || "-"}`,
+    `pageInfo=${diagnostic.hasPageInfo === true ? "yes" : "no"}`,
+    `next=${typeof diagnostic.hasNextPage === "boolean" ? String(diagnostic.hasNextPage) : "null"}`,
+    `top=${list(diagnostic.topLevelKeys)}`,
+    `objects=${list(diagnostic.objectPaths)}`,
+    `hookSeen=${Number(diagnostic.hookSeen) || 0}`,
+    // This includes route-fallback inspection traffic; it is not proof of an
+    // authoritative joined-groups operation, so label it as candidates.
+    `hookCandidates=${Number(diagnostic.hookJoinedGroupsSeen) || 0}`,
+    `observed=${list(diagnostic.hookFriendlyNames)}`,
+  ].join("; ");
+}
+
+function isTrustedJoinedGroupsSnapshot(api) {
+  return !!(
+    api &&
+    api.ok &&
+    api.trusted &&
+    api.complete === true &&
+    Array.isArray(api.groups)
+  );
+}
+
+/**
+ * Trang joined-groups phải foreground để Facebook Comet chạy lazy page-data.
+ * Không dùng preference focusTabs tại đây: khác feed đã có replay template,
+ * joined-groups chưa có khuôn an toàn để seed khi tab nền bị throttle.
+ */
+function openJoinedGroupsTab(url) {
+  return new Promise((resolve) => chrome.tabs.create({ url, active: true }, resolve));
+}
+
+/** Mở trang "Nhóm của bạn", ưu tiên GraphQL; DOM chỉ là fallback không phá dữ liệu. */
+async function scanJoinedGroupsOnce() {
   const url = "https://www.facebook.com/groups/joins/";
-  const active = await shouldFocusTabs();
-  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
+  const tab = await openJoinedGroupsTab(url);
   await waitTabComplete(tab.id, 30000);
-  await sleep(2500);
+  await sleep(1800);
+
+  // GraphQL là nguồn chính: id/tên lấy từ Group node trong joined connection,
+  // không đọc notification text hoặc card đề xuất trong DOM.
+  try {
+    const api = await chrome.tabs.sendMessage(tab.id, {
+      type: "GET_JOINED_GROUPS_API",
+      timeoutMs: 12000,
+    });
+    if (api && Array.isArray(api.groups)) {
+      // Chỉ response đã đi tới page_info.has_next_page=false mới được phép xóa
+      // membership cũ. Query nhận diện đúng nhưng thiếu/trễ pagination phải fail-safe.
+      // Danh sách rỗng vẫn là snapshot hợp lệ: tài khoản có thể đã rời mọi nhóm.
+      if (isTrustedJoinedGroupsSnapshot(api)) {
+        const saved = await DB.saveGroups(api.groups, { replace: true });
+        return {
+          ok: true,
+          source: "graphql",
+          scanned: api.groups.length,
+          added: saved.added,
+          updated: saved.updated,
+          removed: saved.removed,
+        };
+      }
+
+      // GraphQL đã được nhận diện nhưng chưa đủ bằng chứng hoàn tất: không được
+      // rơi xuống DOM rồi upsert, vì như vậy sẽ che giấu lỗi pagination và khiến
+      // UI báo thành công giả. Chỉ fallback DOM khi GraphQL hoàn toàn không bắt.
+      if (api.friendly || api.reason || Number(api.hookSeen) > 0) {
+        const diagnostic = {
+          friendly: api.friendly,
+          reason: api.reason,
+          complete: api.complete === true,
+          pages: api.pages || 0,
+          capturedRequests: api.capturedRequests || 0,
+          capturedChunks: api.capturedChunks || 0,
+          candidateConnections: api.candidateConnections || 0,
+          selectedConnection: api.selectedConnection || "",
+          selectedPath: api.selectedPath || "",
+          topLevelKeys: Array.isArray(api.topLevelKeys) ? api.topLevelKeys : [],
+          objectPaths: Array.isArray(api.objectPaths) ? api.objectPaths : [],
+          hasPageInfo: api.hasPageInfo === true,
+          hasNextPage:
+            typeof api.hasNextPage === "boolean" ? api.hasNextPage : null,
+          hookSeen: api.hookSeen || 0,
+          hookJoinedGroupsSeen: api.hookJoinedGroupsSeen || 0,
+          hookFriendlyNames: Array.isArray(api.hookFriendlyNames)
+            ? api.hookFriendlyNames
+            : [],
+        };
+        return {
+          ok: false,
+          error: (
+            api.groups.length
+              ? "GraphQL danh sách nhóm chưa quét hết phân trang; không thay đổi dữ liệu hiện có."
+              : "Đã bắt GraphQL danh sách nhóm nhưng chưa đọc được Group node; không thay đổi dữ liệu hiện có."
+          ) + " Chi tiết: " + formatJoinedGroupsDiagnostic(diagnostic),
+          diagnostic,
+        };
+      }
+    }
+  } catch (e) {
+    // Chuyển sang DOM fallback ở dưới. Fallback không được replace membership.
+  }
+
   let res;
   try {
     res = await chrome.scripting.executeScript({
@@ -895,11 +1168,30 @@ async function scanJoinedGroups() {
   if (!groups.length) {
     return {
       ok: false,
-      error: "Không tìm thấy nhóm nào. Hãy chắc chắn đã đăng nhập và mở trang 'Nhóm của bạn'.",
+      error: "Không bắt được GraphQL và DOM cũng không tìm thấy nhóm. Hãy kiểm tra đăng nhập Facebook.",
     };
   }
-  const saved = await DB.saveGroups(groups);
-  return { ok: true, scanned: groups.length, added: saved.added, updated: saved.updated };
+
+  // DOM không chứng minh được membership tuyệt đối, nên chỉ upsert; không xóa
+  // nhóm hiện có. Lần GraphQL thành công tiếp theo mới được phép replace.
+  const saved = await DB.saveGroups(groups, { replace: false });
+  return {
+    ok: true,
+    source: "dom-fallback",
+    warning: "GraphQL chưa được bắt; đã dùng DOM fallback và không loại nhóm cũ để tránh xóa nhầm.",
+    scanned: groups.length,
+    added: saved.added,
+    updated: saved.updated,
+    removed: 0,
+  };
+}
+
+function scanJoinedGroups() {
+  return runSingleFlight(
+    () => joinedGroupsScanInFlight,
+    (value) => { joinedGroupsScanInFlight = value; },
+    scanJoinedGroupsOnce,
+  );
 }
 
 /* ----------------------- AUTOMATION: ĐĂNG BÀI --------------------------- */
@@ -2357,17 +2649,75 @@ async function writeSetting(key, value) {
   }
 }
 
-/** Đọc cấu hình auto-crawl từ server theo tài khoản, trộn với mặc định. */
-async function getAutoCrawlConfig() {
-  const saved = (await DB.getSetting(AUTOCRAWL_KEY)) || {};
+/**
+ * Chuẩn hoá object autoCrawl từ value server (hoặc {}).
+ * @param {object|null|undefined} saved
+ */
+function normalizeAutoCrawlConfig(saved) {
+  const s = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
   return {
-    enabled: !!saved.enabled,
+    enabled: !!s.enabled,
     intervalMinutes: Math.max(
       1,
-      Math.min(1440, parseInt(saved.intervalMinutes, 10) || AUTOCRAWL_DEFAULT.intervalMinutes)
+      Math.min(1440, parseInt(s.intervalMinutes, 10) || AUTOCRAWL_DEFAULT.intervalMinutes)
     ),
-    options: saved.options && typeof saved.options === "object" ? saved.options : {},
+    options: s.options && typeof s.options === "object" ? s.options : {},
   };
+}
+
+/**
+ * Structured read autoCrawlConfig (RISK-BE-04 migration bước 7).
+ * Failure: ok:false + default config + stale — automation không coi là "đã tắt".
+ */
+async function getAutoCrawlConfigResult() {
+  const r = await DB.getSettingResult(AUTOCRAWL_KEY);
+  if (!r || !r.ok) {
+    try {
+      await recordTelemetry("settings.autoCrawl.fail", {
+        status: (r && r.status) || "server_error",
+        retryable: !!(r && r.retryable),
+      }, { level: "warn" });
+    } catch (e) {}
+    return {
+      ok: false,
+      status: (r && r.status) || "server_error",
+      httpStatus: r && r.httpStatus != null ? r.httpStatus : null,
+      retryable: !!(r && r.retryable),
+      code: (r && r.code) || null,
+      message: (r && r.message) || "Không đọc được autoCrawlConfig",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeAutoCrawlConfig({}),
+    };
+  }
+  if (r.found && r.value != null && (typeof r.value !== "object" || Array.isArray(r.value))) {
+    return {
+      ok: false,
+      status: "invalid_response",
+      httpStatus: 200,
+      retryable: true,
+      message: "autoCrawlConfig value không phải object",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeAutoCrawlConfig({}),
+    };
+  }
+  return {
+    ok: true,
+    status: r.status,
+    found: !!r.found,
+    source: r.found ? "server" : "default",
+    stale: false,
+    config: normalizeAutoCrawlConfig(r.found ? r.value || {} : {}),
+  };
+}
+
+/** Đọc cấu hình auto-crawl (compatibility). Failure → default. */
+async function getAutoCrawlConfig() {
+  const r = await getAutoCrawlConfigResult();
+  return r.config;
 }
 
 /** Lưu cấu hình + (tái)tạo hoặc xóa alarm theo trạng thái bật/tắt. */
@@ -2413,7 +2763,22 @@ function shuffleInPlace(arr) {
  */
 async function processAutoCrawl() {
   if (_autoCrawling) return;
-  const cfg = await getAutoCrawlConfig();
+  // Structured: Backend lỗi → không giả "đang tắt", bỏ qua chu kỳ (fail-safe).
+  const cfgRes = await getAutoCrawlConfigResult();
+  if (!cfgRes.ok) {
+    try {
+      await recordTelemetry(
+        "autoCrawl.deferred_settings",
+        {
+          status: cfgRes.status,
+          code: "SETTINGS_" + String(cfgRes.status || "error").toUpperCase(),
+        },
+        { level: "warn" }
+      );
+    } catch (e) {}
+    return { ok: false, deferred: true, status: cfgRes.status, error: cfgRes.message };
+  }
+  const cfg = cfgRes.config;
   if (!cfg.enabled) return;
   _autoCrawling = true;
   try {
@@ -2519,13 +2884,67 @@ function normalizeSyncHours(v) {
   return AUTOSYNC_INTERVALS.includes(h) ? h : AUTOSYNC_DEFAULT.intervalHours;
 }
 
-/** Đọc cấu hình auto-sync từ server theo tài khoản, trộn với mặc định. */
-async function getAutoSyncConfig() {
-  const saved = (await DB.getSetting(AUTOSYNC_KEY)) || {};
+function normalizeAutoSyncConfig(saved) {
+  const s = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
   return {
-    enabled: !!saved.enabled,
-    intervalHours: normalizeSyncHours(saved.intervalHours),
+    enabled: !!s.enabled,
+    intervalHours: normalizeSyncHours(s.intervalHours),
   };
+}
+
+/** Structured read autoSyncConfig. */
+async function getAutoSyncConfigResult() {
+  const r = await DB.getSettingResult(AUTOSYNC_KEY);
+  if (!r || !r.ok) {
+    try {
+      await recordTelemetry(
+        "settings.autoSync.fail",
+        {
+          status: (r && r.status) || "server_error",
+          retryable: !!(r && r.retryable),
+        },
+        { level: "warn" }
+      );
+    } catch (e) {}
+    return {
+      ok: false,
+      status: (r && r.status) || "server_error",
+      httpStatus: r && r.httpStatus != null ? r.httpStatus : null,
+      retryable: !!(r && r.retryable),
+      message: (r && r.message) || "Không đọc được autoSyncConfig",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeAutoSyncConfig({}),
+    };
+  }
+  if (r.found && r.value != null && (typeof r.value !== "object" || Array.isArray(r.value))) {
+    return {
+      ok: false,
+      status: "invalid_response",
+      httpStatus: 200,
+      retryable: true,
+      message: "autoSyncConfig value không phải object",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeAutoSyncConfig({}),
+    };
+  }
+  return {
+    ok: true,
+    status: r.status,
+    found: !!r.found,
+    source: r.found ? "server" : "default",
+    stale: false,
+    config: normalizeAutoSyncConfig(r.found ? r.value || {} : {}),
+  };
+}
+
+/** Đọc cấu hình auto-sync (compatibility). */
+async function getAutoSyncConfig() {
+  const r = await getAutoSyncConfigResult();
+  return r.config;
 }
 
 /** Lưu cấu hình + (tái)tạo hoặc xóa alarm theo trạng thái bật/tắt. */
@@ -2555,7 +2974,18 @@ let _autoSyncing = false;
 /** Gọi đồng bộ TẤT CẢ nguồn giá khi tới chu kỳ (chống chạy chồng). */
 async function processAutoSync() {
   if (_autoSyncing) return;
-  const cfg = await getAutoSyncConfig();
+  const cfgRes = await getAutoSyncConfigResult();
+  if (!cfgRes.ok) {
+    try {
+      await recordTelemetry(
+        "autoSync.deferred_settings",
+        { status: cfgRes.status },
+        { level: "warn" }
+      );
+    } catch (e) {}
+    return { ok: false, deferred: true, status: cfgRes.status, error: cfgRes.message };
+  }
+  const cfg = cfgRes.config;
   if (!cfg.enabled) return;
   _autoSyncing = true;
   try {
@@ -2590,17 +3020,71 @@ const WATCH_ALARM = "watchReplies";
 // các hội thoại đang "watching"/"replied" để gom reply mới của người khác.
 const WATCH_DEFAULT = { enabled: false, intervalMinutes: 30, maxPerRun: 8 };
 
-/** Đọc cấu hình theo-dõi-reply từ server theo tài khoản, trộn với mặc định. */
-async function getWatchConfig() {
-  const saved = (await DB.getSetting(WATCH_KEY)) || {};
+function normalizeWatchConfig(saved) {
+  const s = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
   return {
-    enabled: !!saved.enabled,
+    enabled: !!s.enabled,
     intervalMinutes: Math.max(
       5,
-      Math.min(720, parseInt(saved.intervalMinutes, 10) || WATCH_DEFAULT.intervalMinutes)
+      Math.min(720, parseInt(s.intervalMinutes, 10) || WATCH_DEFAULT.intervalMinutes)
     ),
-    maxPerRun: Math.max(1, Math.min(30, parseInt(saved.maxPerRun, 10) || WATCH_DEFAULT.maxPerRun)),
+    maxPerRun: Math.max(1, Math.min(30, parseInt(s.maxPerRun, 10) || WATCH_DEFAULT.maxPerRun)),
   };
+}
+
+/** Structured read watchRepliesConfig. */
+async function getWatchConfigResult() {
+  const r = await DB.getSettingResult(WATCH_KEY);
+  if (!r || !r.ok) {
+    try {
+      await recordTelemetry(
+        "settings.watch.fail",
+        {
+          status: (r && r.status) || "server_error",
+          retryable: !!(r && r.retryable),
+        },
+        { level: "warn" }
+      );
+    } catch (e) {}
+    return {
+      ok: false,
+      status: (r && r.status) || "server_error",
+      httpStatus: r && r.httpStatus != null ? r.httpStatus : null,
+      retryable: !!(r && r.retryable),
+      message: (r && r.message) || "Không đọc được watchRepliesConfig",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeWatchConfig({}),
+    };
+  }
+  if (r.found && r.value != null && (typeof r.value !== "object" || Array.isArray(r.value))) {
+    return {
+      ok: false,
+      status: "invalid_response",
+      httpStatus: 200,
+      retryable: true,
+      message: "watchRepliesConfig value không phải object",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeWatchConfig({}),
+    };
+  }
+  return {
+    ok: true,
+    status: r.status,
+    found: !!r.found,
+    source: r.found ? "server" : "default",
+    stale: false,
+    config: normalizeWatchConfig(r.found ? r.value || {} : {}),
+  };
+}
+
+/** Đọc cấu hình theo-dõi-reply (compatibility). */
+async function getWatchConfig() {
+  const r = await getWatchConfigResult();
+  return r.config;
 }
 
 /** Lưu cấu hình + (tái)tạo hoặc xóa alarm theo trạng thái bật/tắt. */
@@ -2636,7 +3120,27 @@ let _watching = false;
  */
 async function processReplyWatch(opts = {}) {
   if (_watching) return { ok: false, error: "Đang theo dõi, bỏ qua lượt này." };
-  const cfg = await getWatchConfig();
+  // Structured: Backend lỗi → không giả "đang tắt", bỏ qua chu kỳ (fail-safe).
+  const cfgRes = await getWatchConfigResult();
+  if (!cfgRes.ok) {
+    try {
+      await recordTelemetry(
+        "replyWatch.deferred_settings",
+        {
+          status: cfgRes.status,
+          code: "SETTINGS_" + String(cfgRes.status || "error").toUpperCase(),
+        },
+        { level: "warn" }
+      );
+    } catch (e) {}
+    return {
+      ok: false,
+      deferred: true,
+      status: cfgRes.status,
+      error: cfgRes.message || "Không đọc được cấu hình theo dõi reply.",
+    };
+  }
+  const cfg = cfgRes.config;
   // Khi gọi thủ công (manual=true) thì chạy kể cả khi alarm tắt.
   if (!cfg.enabled && !opts.manual) return { ok: false, error: "Theo dõi reply đang tắt." };
   // NGẮT MẠCH CHUNG (feed/inbox/comment): đang trong thời gian nghỉ vì FB chặn
@@ -2750,153 +3254,285 @@ async function initReplyWatch() {
 
 /* -------------------- NUÔI TÀI KHOẢN (WARMING, alarms) ---------------- */
 //
-// AN TOÀN TÀI KHOẢN — "nuôi" = mô phỏng hành vi người dùng thật một cách THỤ
-// ĐỘNG để giữ tài khoản "ấm" (đáng tin) trước/xen kẽ các tác vụ đăng bài & nhắn
-// tin. TẤT CẢ hành động đều READ-ONLY (cuộn feed, xem video vài giây, mở thông
-// báo) — KHÔNG like/comment/share/gửi để tránh bị gắn cờ spam.
+// AN TOÀN TÀI KHOẢN — "nuôi" = mô phỏng hành vi người dùng thật (chủ yếu THỤ
+// ĐỘNG) để giữ tài khoản "ấm". Policy thuần (lịch, plan, budget) nằm ở
+// warming-policy.js; file này giữ chrome/DOM/tab execution.
 //
-//  - Chỉ mở 1 tab nền/lần, làm xong ĐÓNG ngay (như watch/inbox).
-//  - Dùng chung NGẮT MẠCH: đang bị FB chặn thì bỏ qua CẢ lượt, không mở tab nào.
-//  - Giãn cách ngẫu nhiên giữa các hành động để không đều như máy.
-//  - Mỗi hành động ghi NHẬT KÝ lên SERVER theo tài khoản qua
-//    DB.recordWarmingActivity (KHÔNG dùng chrome.storage.local).
+//  - Ưu tiên tab owned riêng; không chiếm tab active của người dùng (mặc định).
+//  - Dùng chung NGẮT MẠCH: đang bị FB chặn thì bỏ qua CẢ lượt.
+//  - Xác minh account binding trước khi thao tác.
+//  - Đếm success/error/no_op/unverified tách bạch; không clear kill-switch chung.
+//  - Mỗi hành động ghi NHẬT KÝ lên SERVER theo tài khoản.
 
 const WARMING_KEY = "warmingConfig";
+const WARMING_STATE_KEY = "warmingState";
 const WARMING_ALARM = "warming";
-// Các loại hành động hợp lệ. 3 loại đầu + scrollGroups là THỤ ĐỘNG (READ-ONLY).
-// reactPost là hành động GHI (thả cảm xúc) — chỉ chạy xác suất thấp, xem
-// WARMING_REACT_CHANCE bên dưới.
-const WARMING_ACTIONS = [
-  "scrollFeed",
-  "watchVideo",
-  "openNotifications",
-  "scrollGroups",
-  "scrollReels",
-  "reactPost",
-  "reactReels",
-];
-
-// Các hành động GHI (tương tác thật). Chúng KHÔNG được tính vào việc bốc read-only
-// và mỗi loại chỉ chạy theo xác suất thấp, tối đa 1 tương tác/lượt. reactReels =
-// thả cảm xúc cho Reels (thước phim). Rất dễ dính checkpoint nếu lạm dụng.
-const WARMING_WRITE_ACTIONS = ["reactPost", "reactReels"];
-
-// reactPost/reactReels RẤT dễ khiến tài khoản mới dính checkpoint nếu thả cảm xúc
-// liên tục. Vì vậy dù người dùng có bật, mỗi lượt CHỈ ~30% khả năng thực sự thả,
-// và tối đa 1 tương tác/loại. Đây là điểm mấu chốt để "giống người".
-const WARMING_REACT_CHANCE = 0.3;
-
-// Biên độ dao động thời gian giữa các lượt (±40%). Người thật không vào FB đúng
-// mỗi X phút như máy -> mỗi lần lệch ngẫu nhiên trong khoảng này.
-const WARMING_JITTER = 0.4;
-
-// Khung "giờ ngủ" (giờ địa phương): bỏ qua/lùi lượt rơi vào khoảng này cho giống
-// nhịp sinh hoạt người thật. [0h, 6h).
-const WARMING_QUIET_START = 0;
-const WARMING_QUIET_END = 6;
-
-// Mặc định TẮT; chu kỳ tính bằng phút (kẹp 15..1440 = 24 giờ). `actionsPerRun`
-// KHÔNG còn là "làm đúng N việc" mà là SỐ VIỆC TỐI ĐA mỗi lượt — mỗi lượt bốc
-// ngẫu nhiên từ 1..N việc trong số các loại đã bật (mỗi loại nhiều nhất 1 lần).
-// Mặc định chỉ bật các hành động READ-ONLY; reactPost để người dùng tự chọn.
-const WARMING_DEFAULT = {
-  enabled: false,
-  intervalMinutes: 90,
-  actionsPerRun: 3,
-  actions: ["scrollFeed", "watchVideo", "openNotifications", "scrollGroups", "scrollReels"],
-};
 
 /** Lọc danh sách hành động về các loại hợp lệ; luôn còn tối thiểu 1 loại. */
 function normalizeWarmingActions(list) {
-  const arr = Array.isArray(list) ? list.filter((a) => WARMING_ACTIONS.includes(a)) : [];
-  const uniq = Array.from(new Set(arr));
-  return uniq.length ? uniq : WARMING_DEFAULT.actions.slice();
+  return policyNormalizeWarmingActions(list);
 }
 
-/** Đọc cấu hình nuôi tài khoản từ server theo tài khoản, trộn với mặc định. */
-async function getWarmingConfig() {
-  const saved = (await DB.getSetting(WARMING_KEY)) || {};
+/**
+ * Chuẩn hoá kết quả lỗi đọc settings cho warming (RISK-BE-04).
+ * Không chạy session khi chưa xác nhận được policy/state từ Backend.
+ */
+function warmingSettingsFailure(result, keyLabel) {
+  const status = (result && result.status) || "server_error";
   return {
-    enabled: !!saved.enabled,
-    intervalMinutes: Math.max(
-      15,
-      Math.min(1440, parseInt(saved.intervalMinutes, 10) || WARMING_DEFAULT.intervalMinutes)
-    ),
-    actionsPerRun: Math.max(
-      1,
-      Math.min(8, parseInt(saved.actionsPerRun, 10) || WARMING_DEFAULT.actionsPerRun)
-    ),
-    actions: normalizeWarmingActions(saved.actions),
+    ok: false,
+    deferred: true,
+    code: "SETTINGS_" + String(status).toUpperCase(),
+    retryable: !!(result && result.retryable),
+    status,
+    httpStatus: result && result.httpStatus != null ? result.httpStatus : null,
+    error:
+      (result && result.message) ||
+      "Không xác nhận được " + keyLabel + " từ Backend.",
   };
 }
 
 /**
- * Tính độ trễ (phút) cho LƯỢT KẾ TIẾP theo kiểu người thật:
- *  - Lệch ngẫu nhiên quanh chu kỳ gốc ±WARMING_JITTER (vd 90' -> 54'..126').
- *  - Nếu thời điểm bắn rơi vào "giờ ngủ" [0h,6h) -> lùi tới ~7-8h sáng.
- * Trả về số phút (>= 15) để dùng với chrome.alarms { delayInMinutes }.
+ * Đọc warmingConfig có cấu trúc: found/missing hợp lệ hoặc failure taxonomy.
+ * Failure vẫn kèm `config` default để UI hiển thị, nhưng `ok:false` + `stale:true`
+ * để automation không nhầm thành "đã tắt".
  */
-function warmingNextDelayMinutes(baseMinutes, now = new Date()) {
-  const base = Math.max(15, Math.min(1440, baseMinutes || WARMING_DEFAULT.intervalMinutes));
-  const factor = 1 + (Math.random() * 2 - 1) * WARMING_JITTER; // 0.6..1.4
-  let delay = Math.max(15, Math.round(base * factor));
-  // Kiểm tra giờ bắn dự kiến; nếu rơi vào khung ngủ thì lùi tới sáng.
-  const fireAt = new Date(now.getTime() + delay * 60000);
-  const h = fireAt.getHours();
-  const inQuiet =
-    WARMING_QUIET_START <= WARMING_QUIET_END
-      ? h >= WARMING_QUIET_START && h < WARMING_QUIET_END
-      : h >= WARMING_QUIET_START || h < WARMING_QUIET_END;
-  if (inQuiet) {
-    // Lùi tới WARMING_QUIET_END giờ sáng + 0..90' ngẫu nhiên (tránh mọi máy bật
-    // cùng lúc). Cộng dồn từ thời điểm bắn dự kiến.
-    const wake = new Date(fireAt);
-    wake.setHours(WARMING_QUIET_END, 0, 0, 0);
-    if (wake.getTime() <= fireAt.getTime()) wake.setDate(wake.getDate() + 1);
-    wake.setTime(wake.getTime() + Math.floor(Math.random() * 90) * 60000);
-    delay = Math.max(15, Math.round((wake.getTime() - now.getTime()) / 60000));
+async function getWarmingConfigResult() {
+  const r = await DB.getSettingResult(WARMING_KEY);
+  if (!r || !r.ok) {
+    return {
+      ok: false,
+      status: (r && r.status) || "server_error",
+      httpStatus: r && r.httpStatus != null ? r.httpStatus : null,
+      retryable: !!(r && r.retryable),
+      code: (r && r.code) || null,
+      reason: (r && r.reason) || null,
+      message: (r && r.message) || "Không đọc được warmingConfig",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeWarmingConfig({}),
+    };
   }
-  return delay;
+  // found nhưng value không phải object phẳng -> contract violation.
+  if (
+    r.found &&
+    r.value != null &&
+    (typeof r.value !== "object" || Array.isArray(r.value))
+  ) {
+    return {
+      ok: false,
+      status: "invalid_response",
+      httpStatus: 200,
+      retryable: true,
+      code: null,
+      reason: null,
+      message: "warmingConfig value không phải object",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeWarmingConfig({}),
+    };
+  }
+  const saved = r.found ? r.value || {} : {};
+  return {
+    ok: true,
+    status: r.status,
+    found: !!r.found,
+    source: r.found ? "server" : "default",
+    stale: false,
+    config: normalizeWarmingConfig(saved),
+  };
 }
 
 /**
- * Đặt lịch cho LƯỢT KẾ TIẾP bằng alarm MỘT-LẦN (delayInMinutes) thay vì
- * periodInMinutes cố định. Sau mỗi lần bắn, caller phải gọi lại hàm này để tự
- * lên lịch lượt sau -> lịch trình dao động, không máy móc. Nếu đã tắt -> xóa
- * alarm.
+ * Đọc warmingState có cấu trúc. missing -> state mới hợp lệ;
+ * failure -> không giả state mới cho automation.
  */
-async function scheduleNextWarming() {
-  const cfg = await getWarmingConfig();
+async function getWarmingStateResult() {
+  const r = await DB.getSettingResult(WARMING_STATE_KEY);
+  if (!r || !r.ok) {
+    return {
+      ok: false,
+      status: (r && r.status) || "server_error",
+      httpStatus: r && r.httpStatus != null ? r.httpStatus : null,
+      retryable: !!(r && r.retryable),
+      code: (r && r.code) || null,
+      reason: (r && r.reason) || null,
+      message: (r && r.message) || "Không đọc được warmingState",
+      found: false,
+      source: "default",
+      stale: true,
+      state: null,
+    };
+  }
+  if (
+    r.found &&
+    r.value != null &&
+    (typeof r.value !== "object" || Array.isArray(r.value))
+  ) {
+    return {
+      ok: false,
+      status: "invalid_response",
+      httpStatus: 200,
+      retryable: true,
+      code: null,
+      reason: null,
+      message: "warmingState value không phải object",
+      found: false,
+      source: "default",
+      stale: true,
+      state: null,
+    };
+  }
+  const saved = r.found ? r.value || {} : {};
+  return {
+    ok: true,
+    status: r.status,
+    found: !!r.found,
+    source: r.found ? "server" : "default",
+    stale: false,
+    state: rollWarmingStateDay(saved),
+  };
+}
+
+/**
+ * Đọc cấu hình nuôi tài khoản (compatibility). Trả config đã normalize.
+ * Khi Backend lỗi sẽ rơi về default — chỉ dùng cho UI/non-critical.
+ * Automation phải dùng getWarmingConfigResult().
+ */
+async function getWarmingConfig() {
+  const r = await getWarmingConfigResult();
+  return r.config;
+}
+
+/**
+ * Runtime counters (sessions/day, write cooldown, recent actions).
+ * Compatibility: failure rơi về state mới — không dùng cho processWarming.
+ */
+async function getWarmingState() {
+  const r = await getWarmingStateResult();
+  if (r.ok && r.state) return r.state;
+  return rollWarmingStateDay({});
+}
+
+async function saveWarmingState(state) {
+  await writeSetting(WARMING_STATE_KEY, state);
+}
+
+/**
+ * Tính độ trễ (phút) cho LƯỢT KẾ TIẾP (jitter ±40% + quiet hours + risk backoff).
+ * Trả về số phút (>= 15) cho chrome.alarms { delayInMinutes }.
+ * opts: quietHoursStart/End, riskLevel, riskBackoffMultiplier (from config/state).
+ */
+function warmingNextDelayMinutes(baseMinutes, now = new Date(), opts = {}) {
+  return policyWarmingNextDelayMinutes(baseMinutes, now, opts);
+}
+
+/**
+ * Đặt lịch cho LƯỢT KẾ TIẾP bằng alarm MỘT-LẦN (delayInMinutes).
+ * Sau mỗi lần bắn, caller gọi lại để lịch dao động. Nếu tắt -> xóa alarm.
+ * Trả về { delayMinutes, nextRunAt } khi bật.
+ * Nếu không đọc được config từ Backend: KHÔNG xoá alarm hiện có (tránh false-disabled).
+ * Khi alarm một-lần vừa bắn, `retryOnFailure` tạo một alarm phục hồi ngắn để một
+ * lỗi Backend tạm thời không làm lịch nuôi biến mất vĩnh viễn.
+ * `config` cho phép luồng vừa lưu dùng ngay giá trị đã xác nhận, tránh GET lần hai.
+ * Quiet hours + risk throttle lấy từ config + warmingState (nếu đọc được).
+ */
+async function scheduleNextWarming(opts = {}) {
+  const suppliedConfig =
+    opts.config && typeof opts.config === "object"
+      ? normalizeWarmingConfig(opts.config)
+      : null;
+  const cfgRes = suppliedConfig
+    ? { ok: true, config: suppliedConfig }
+    : await getWarmingConfigResult();
+  if (!cfgRes.ok) {
+    let retryDelayMinutes = 0;
+    let nextRunAt = null;
+    if (opts.retryOnFailure) {
+      // Bounded retry for an expired one-shot alarm. Five minutes avoids a hot
+      // loop while ensuring a transient outage cannot disable automation forever.
+      retryDelayMinutes = 5;
+      try {
+        chrome.alarms.create(WARMING_ALARM, {
+          delayInMinutes: retryDelayMinutes,
+        });
+        nextRunAt = Date.now() + retryDelayMinutes * 60000;
+      } catch (e) {}
+    }
+    try {
+      await recordTelemetry(
+        "warming.schedule_deferred",
+        {
+          status: cfgRes.status,
+          recoveryScheduled: nextRunAt != null,
+          retryDelayMinutes,
+        },
+        { level: "warn" }
+      );
+    } catch (e) {}
+    return {
+      delayMinutes: retryDelayMinutes,
+      nextRunAt,
+      deferred: true,
+      status: cfgRes.status,
+      retryable: !!cfgRes.retryable,
+      error: cfgRes.message,
+    };
+  }
+  const cfg = cfgRes.config;
+  // Best-effort state for riskLevel; failure does not block scheduling.
+  let riskLevel = 0;
+  try {
+    const stateRes = await getWarmingStateResult();
+    if (stateRes.ok && stateRes.state) {
+      riskLevel =
+        parseInt(stateRes.state.riskLevel, 10) ||
+        computeRiskLevel(stateRes.state, cfg) ||
+        0;
+    }
+  } catch (e) {}
   try {
     await chrome.alarms.clear(WARMING_ALARM);
     if (cfg.enabled) {
-      const delay = warmingNextDelayMinutes(cfg.intervalMinutes);
+      const delay = warmingNextDelayMinutes(cfg.intervalMinutes, new Date(), {
+        quietHoursStart: cfg.quietHoursStart,
+        quietHoursEnd: cfg.quietHoursEnd,
+        riskLevel,
+        riskBackoffMultiplier: cfg.riskBackoffMultiplier,
+      });
       chrome.alarms.create(WARMING_ALARM, { delayInMinutes: delay });
+      return {
+        delayMinutes: delay,
+        nextRunAt: Date.now() + delay * 60000,
+        riskLevel,
+      };
     }
   } catch (e) {}
+  return { delayMinutes: 0, nextRunAt: null };
 }
 
 /** Lưu cấu hình + đặt lại lịch (một-lần, có dao động) theo trạng thái bật/tắt. */
 async function applyWarmingConfig(input) {
-  const current = await getWarmingConfig();
-  const next = {
-    enabled: input.enabled != null ? !!input.enabled : current.enabled,
-    intervalMinutes:
-      input.intervalMinutes != null
-        ? Math.max(
-            15,
-            Math.min(1440, parseInt(input.intervalMinutes, 10) || current.intervalMinutes)
-          )
-        : current.intervalMinutes,
-    actionsPerRun:
-      input.actionsPerRun != null
-        ? Math.max(1, Math.min(8, parseInt(input.actionsPerRun, 10) || current.actionsPerRun))
-        : current.actionsPerRun,
-    actions: input.actions != null ? normalizeWarmingActions(input.actions) : current.actions,
+  const currentRes = await getWarmingConfigResult();
+  // Nếu đọc fail, merge từ default thay vì bịa "enabled:false đã lưu".
+  const current = currentRes.ok ? currentRes.config : normalizeWarmingConfig({});
+  const merged = {
+    ...current,
+    ...(input && typeof input === "object" ? input : {}),
   };
-  await writeSetting(WARMING_KEY, next);
-  await scheduleNextWarming();
-  return next;
+  // Preserve explicit booleans/numbers via normalize.
+  if (input && input.enabled != null) merged.enabled = !!input.enabled;
+  if (input && input.useOwnedTabOnly != null) merged.useOwnedTabOnly = !!input.useOwnedTabOnly;
+  if (input && input.actions != null) merged.actions = input.actions;
+  const next = normalizeWarmingConfig(merged);
+
+  // Cấu hình bật/tắt là critical: không được nuốt lỗi rồi báo UI "đã lưu".
+  // Chỉ tạo alarm sau khi Backend xác nhận lưu thành công.
+  await DB.setSetting(WARMING_KEY, next);
+  const schedule = await scheduleNextWarming({ config: next });
+  return { ...next, ...schedule };
 }
 
 /**
@@ -2965,7 +3601,17 @@ async function runWatchVideoInPage() {
     }
   }
   if (!target && vids.length) target = vids[0];
-  if (!target) return { ok: true, watchedMs: 0, note: "no-video" };
+  if (!target) {
+    return {
+      ok: true,
+      watchedMs: 0,
+      played: false,
+      note: "no-video",
+      status: "no_op",
+    };
+  }
+  let playError = null;
+  let t0 = 0;
   try {
     target.scrollIntoView({ block: "center", behavior: "smooth" });
     await sleep(rnd(800, 1600));
@@ -2980,15 +3626,60 @@ async function runWatchVideoInPage() {
       } catch (e) {}
     }
     target.muted = true; // giữ im lặng, tránh phát tiếng bất ngờ
+    try {
+      t0 = Number(target.currentTime) || 0;
+    } catch (e) {
+      t0 = 0;
+    }
     const p = target.play();
-    if (p && typeof p.catch === "function") p.catch(() => {});
+    if (p && typeof p.then === "function") {
+      try {
+        await p;
+      } catch (e) {
+        playError = String((e && e.message) || e || "play-rejected");
+      }
+    }
+  } catch (e) {
+    playError = String((e && e.message) || e);
+  }
+  const dwellMs = rnd(5000, 15000);
+  await sleep(dwellMs);
+  let t1 = t0;
+  let paused = true;
+  let readyState = 0;
+  try {
+    t1 = Number(target.currentTime) || 0;
+    paused = !!target.paused;
+    readyState = Number(target.readyState) || 0;
   } catch (e) {}
-  const watchedMs = rnd(5000, 15000);
-  await sleep(watchedMs);
   try {
     target.pause();
   } catch (e) {}
-  return { ok: true, watchedMs };
+  const progressMs = Math.max(0, Math.round((t1 - t0) * 1000));
+  // Video thực sự chạy nếu currentTime tiến hoặc đang không pause sau dwell.
+  const played = progressMs >= 400 || (!paused && readyState >= 2 && !playError);
+  if (!played) {
+    return {
+      ok: true,
+      watchedMs: progressMs,
+      dwellMs,
+      played: false,
+      progressMs,
+      readyState,
+      note: playError ? "play-blocked" : "no-progress",
+      status: "unverified",
+      playError: playError || undefined,
+    };
+  }
+  return {
+    ok: true,
+    watchedMs: progressMs || dwellMs,
+    dwellMs,
+    played: true,
+    progressMs,
+    readyState,
+    status: "done",
+  };
 }
 
 /**
@@ -3019,7 +3710,38 @@ async function runNotificationsInPage() {
       const r = el.getBoundingClientRect();
       return r.width > 120 && r.height > 30;
     });
+  const pagePath = String(location.pathname || "");
+  const notificationContentFound = Array.from(
+    document.querySelectorAll('[role="main"], [role="dialog"]')
+  ).some((el) => {
+    try {
+      const label = String(el.getAttribute("aria-label") || "").toLowerCase();
+      const text = String(el.textContent || "").slice(0, 500).toLowerCase();
+      return (
+        label.includes("notification") ||
+        label.includes("thông báo") ||
+        text.includes("notifications") ||
+        text.includes("thông báo")
+      );
+    } catch (e) {
+      return false;
+    }
+  });
+  const notificationLandmarkFound =
+    pagePath.toLowerCase().includes("/notifications") || notificationContentFound;
+  if (!notificationLandmarkFound) {
+    return {
+      ok: true,
+      status: "unverified",
+      note: "notification-landmark-missing",
+      hovered: 0,
+      candidatesFound: 0,
+      pagePath,
+      notificationLandmarkFound,
+    };
+  }
   let items = collect();
+  let candidatesFound = items.length;
   let hovered = 0;
   const rounds = rnd(3, 6);
   for (let i = 0; i < rounds; i++) {
@@ -3036,9 +3758,18 @@ async function runNotificationsInPage() {
       window.scrollBy({ top: rnd(300, 600), left: 0, behavior: "smooth" });
       await sleep(rnd(900, 1800));
       items = collect(); // nạp thêm mục sau khi cuộn
+      candidatesFound = Math.max(candidatesFound, items.length);
     }
   }
-  return { ok: true, hovered };
+  return {
+    ok: true,
+    status: hovered > 0 ? "done" : "no_op",
+    note: hovered > 0 ? "notifications-hovered" : "no-notification-items",
+    hovered,
+    candidatesFound,
+    pagePath,
+    notificationLandmarkFound,
+  };
 }
 
 /**
@@ -3128,35 +3859,194 @@ async function runReactPostInPage() {
     btn = findLike();
     tries += 1;
   }
-  if (!btn) return { ok: true, reacted: false, note: "no-like-button" };
+  if (!btn) {
+    return {
+      ok: true,
+      reacted: false,
+      verified: false,
+      note: "no-like-button",
+      status: "no_op",
+    };
+  }
+  const pressedBefore = btn.getAttribute("aria-pressed");
+  const labelBefore = (btn.getAttribute("aria-label") || "").toLowerCase();
+  const originalRect = btn.getBoundingClientRect();
+  const originalCenter = {
+    x: originalRect.left + originalRect.width / 2,
+    y: originalRect.top + originalRect.height / 2,
+  };
+  const readReactionSignals = (candidate) => {
+    if (!candidate) return null;
+    try {
+      const label = (candidate.getAttribute("aria-label") || "").toLowerCase();
+      const pressed = candidate.getAttribute("aria-pressed");
+      const verified =
+        pressed === "true" ||
+        (pressedBefore !== "true" && pressed != null && pressed !== pressedBefore) ||
+        label.includes("bỏ thích") ||
+        label.includes("gỡ thích") ||
+        label.includes("unlike") ||
+        label.includes("remove like");
+      return { candidate, label, pressed, verified };
+    } catch (e) {
+      return null;
+    }
+  };
+  const reactionScope = (() => {
+    try {
+      return typeof btn.closest === "function"
+        ? btn.closest('[role="article"], article')
+        : null;
+    } catch (e) {
+      return null;
+    }
+  })();
+  const findReactionState = () => {
+    const direct = readReactionSignals(btn);
+    if (direct && direct.verified) return direct;
+    const root = reactionScope || document;
+    const candidates = Array.from(
+      root.querySelectorAll('div[role="button"], [aria-label], [aria-pressed]')
+    )
+      .map((candidate) => {
+        const signal = readReactionSignals(candidate);
+        if (!signal) return null;
+        const labelRelevant =
+          LIKE_MARKERS.includes(signal.label.trim()) ||
+          signal.label.includes("bỏ thích") ||
+          signal.label.includes("gỡ thích") ||
+          signal.label.includes("unlike") ||
+          signal.label.includes("remove like");
+        if (!labelRelevant) return null;
+        const rect = candidate.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        const distance = Math.hypot(x - originalCenter.x, y - originalCenter.y);
+        if (distance > 160) return null;
+        return { ...signal, distance };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.distance - b.distance);
+    return candidates[0] || direct;
+  };
+  const waitForReactionState = (timeoutMs) =>
+    new Promise((resolve) => {
+      let settled = false;
+      let observer = null;
+      let timer = null;
+      let interval = null;
+      const finish = (signal) => {
+        if (settled) return;
+        settled = true;
+        if (observer) observer.disconnect();
+        if (timer) clearTimeout(timer);
+        if (interval) clearInterval(interval);
+        resolve(signal || findReactionState());
+      };
+      const check = () => {
+        const signal = findReactionState();
+        if (signal && signal.verified) finish(signal);
+      };
+      try {
+        observer = new MutationObserver(check);
+        observer.observe(document.body || document.documentElement, {
+          attributes: true,
+          childList: true,
+          subtree: true,
+          attributeFilter: ["aria-label", "aria-pressed", "class"],
+        });
+      } catch (e) {}
+      interval = setInterval(check, 150);
+      timer = setTimeout(() => finish(findReactionState()), timeoutMs);
+      check();
+    });
   try {
     btn.scrollIntoView({ block: "center", behavior: "smooth" });
     await sleep(rnd(800, 1800));
     const r = btn.getBoundingClientRect();
     const cx = r.left + r.width / 2;
     const cy = r.top + r.height / 2;
-    // Hover trước như người đang rê tới nút.
     for (const type of ["mousemove", "mouseover", "mouseenter"]) {
       try {
         btn.dispatchEvent(
-          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy })
+          new MouseEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+          })
         );
       } catch (e) {}
     }
     await sleep(rnd(600, 1500));
-    // Bấm 1 lần (Thích mặc định). KHÔNG giữ để mở thanh cảm xúc.
-    for (const type of ["mousedown", "mouseup", "click"]) {
+    if (typeof btn.click === "function") {
       try {
+        btn.click();
+      } catch (e) {
+        return {
+          ok: true,
+          reacted: true,
+          verified: false,
+          status: "unverified",
+          note: "react-click-uncertain",
+          error: String(e),
+          pressedBefore,
+          labelBefore,
+        };
+      }
+    } else {
+      for (const type of ["mousedown", "mouseup", "click"]) {
         btn.dispatchEvent(
-          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy })
+          new MouseEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+          })
         );
-      } catch (e) {}
+      }
     }
-    await sleep(rnd(700, 1600));
   } catch (e) {
-    return { ok: false, reacted: false, error: String(e) };
+    return {
+      ok: false,
+      reacted: false,
+      verified: false,
+      error: String(e),
+      status: "error",
+    };
   }
-  return { ok: true, reacted: true };
+  const signalAfter = await waitForReactionState(3000);
+  const pressedAfter = signalAfter ? signalAfter.pressed : null;
+  const labelAfter = signalAfter ? signalAfter.label : "";
+  if (signalAfter && signalAfter.verified) {
+    return {
+      ok: true,
+      reacted: true,
+      verified: true,
+      status: "done",
+      verificationSignals: {
+        pressedBefore,
+        pressedAfter,
+        labelBefore,
+        labelAfter,
+        nodeReplaced: signalAfter.candidate !== btn,
+      },
+    };
+  }
+  return {
+    ok: true,
+    reacted: true,
+    verified: false,
+    note: "react-unverified",
+    status: "unverified",
+    pressedBefore,
+    pressedAfter,
+    labelBefore,
+    labelAfter,
+    nodeReplaced: !!(signalAfter && signalAfter.candidate !== btn),
+  };
 }
 
 /**
@@ -3264,7 +4154,107 @@ async function runReactReelsInPage() {
     btn = findLike();
     tries += 1;
   }
-  if (!btn) return { ok: true, reacted: false, note: "no-like-button" };
+  if (!btn) {
+    return {
+      ok: true,
+      reacted: false,
+      verified: false,
+      note: "no-like-button",
+      status: "no_op",
+    };
+  }
+  const pressedBefore = btn.getAttribute("aria-pressed");
+  const labelBefore = (btn.getAttribute("aria-label") || "").toLowerCase();
+  const originalRect = btn.getBoundingClientRect();
+  const originalCenter = {
+    x: originalRect.left + originalRect.width / 2,
+    y: originalRect.top + originalRect.height / 2,
+  };
+  const readReactionSignals = (candidate) => {
+    if (!candidate) return null;
+    try {
+      const label = (candidate.getAttribute("aria-label") || "").toLowerCase();
+      const pressed = candidate.getAttribute("aria-pressed");
+      const verified =
+        pressed === "true" ||
+        (pressedBefore !== "true" && pressed != null && pressed !== pressedBefore) ||
+        label.includes("bỏ thích") ||
+        label.includes("gỡ thích") ||
+        label.includes("unlike") ||
+        label.includes("remove like");
+      return { candidate, label, pressed, verified };
+    } catch (e) {
+      return null;
+    }
+  };
+  const reactionScope = (() => {
+    try {
+      return typeof btn.closest === "function"
+        ? btn.closest('[role="article"], article')
+        : null;
+    } catch (e) {
+      return null;
+    }
+  })();
+  const findReactionState = () => {
+    const direct = readReactionSignals(btn);
+    if (direct && direct.verified) return direct;
+    const root = reactionScope || document;
+    const candidates = Array.from(
+      root.querySelectorAll('div[role="button"], [aria-label], [aria-pressed]')
+    )
+      .map((candidate) => {
+        const signal = readReactionSignals(candidate);
+        if (!signal) return null;
+        const labelRelevant =
+          LIKE_MARKERS.includes(signal.label.trim()) ||
+          signal.label.includes("bỏ thích") ||
+          signal.label.includes("gỡ thích") ||
+          signal.label.includes("unlike") ||
+          signal.label.includes("remove like");
+        if (!labelRelevant) return null;
+        const rect = candidate.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        const distance = Math.hypot(x - originalCenter.x, y - originalCenter.y);
+        if (distance > 160) return null;
+        return { ...signal, distance };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.distance - b.distance);
+    return candidates[0] || direct;
+  };
+  const waitForReactionState = (timeoutMs) =>
+    new Promise((resolve) => {
+      let settled = false;
+      let observer = null;
+      let timer = null;
+      let interval = null;
+      const finish = (signal) => {
+        if (settled) return;
+        settled = true;
+        if (observer) observer.disconnect();
+        if (timer) clearTimeout(timer);
+        if (interval) clearInterval(interval);
+        resolve(signal || findReactionState());
+      };
+      const check = () => {
+        const signal = findReactionState();
+        if (signal && signal.verified) finish(signal);
+      };
+      try {
+        observer = new MutationObserver(check);
+        observer.observe(document.body || document.documentElement, {
+          attributes: true,
+          childList: true,
+          subtree: true,
+          attributeFilter: ["aria-label", "aria-pressed", "class"],
+        });
+      } catch (e) {}
+      interval = setInterval(check, 150);
+      timer = setTimeout(() => finish(findReactionState()), timeoutMs);
+      check();
+    });
   try {
     btn.scrollIntoView({ block: "center", behavior: "smooth" });
     await sleep(rnd(800, 1800));
@@ -3275,24 +4265,86 @@ async function runReactReelsInPage() {
     for (const type of ["mousemove", "mouseover", "mouseenter"]) {
       try {
         btn.dispatchEvent(
-          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy })
+          new MouseEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+          })
         );
       } catch (e) {}
     }
     await sleep(rnd(600, 1500));
-    // Bấm 1 lần (Thích mặc định). KHÔNG giữ để mở thanh cảm xúc.
-    for (const type of ["mousedown", "mouseup", "click"]) {
+    // Một khi HTMLElement.click() đã được gọi, tuyệt đối không phát thêm click
+    // fallback: exception có thể xảy ra sau khi Facebook đã xử lý side effect.
+    if (typeof btn.click === "function") {
       try {
+        btn.click();
+      } catch (e) {
+        return {
+          ok: true,
+          reacted: true,
+          verified: false,
+          status: "unverified",
+          note: "react-click-uncertain",
+          error: String(e),
+          pressedBefore,
+          labelBefore,
+        };
+      }
+    } else {
+      for (const type of ["mousedown", "mouseup", "click"]) {
         btn.dispatchEvent(
-          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy })
+          new MouseEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+          })
         );
-      } catch (e) {}
+      }
     }
-    await sleep(rnd(700, 1600));
   } catch (e) {
-    return { ok: false, reacted: false, error: String(e) };
+    return {
+      ok: false,
+      reacted: false,
+      verified: false,
+      error: String(e),
+      status: "error",
+    };
   }
-  return { ok: true, reacted: true };
+  const signalAfter = await waitForReactionState(3000);
+  const pressedAfter = signalAfter ? signalAfter.pressed : null;
+  const labelAfter = signalAfter ? signalAfter.label : "";
+  if (signalAfter && signalAfter.verified) {
+    return {
+      ok: true,
+      reacted: true,
+      verified: true,
+      status: "done",
+      verificationSignals: {
+        pressedBefore,
+        pressedAfter,
+        labelBefore,
+        labelAfter,
+        nodeReplaced: signalAfter.candidate !== btn,
+      },
+    };
+  }
+  return {
+    ok: true,
+    reacted: true,
+    verified: false,
+    note: "react-unverified",
+    status: "unverified",
+    pressedBefore,
+    pressedAfter,
+    labelBefore,
+    labelAfter,
+    nodeReplaced: !!(signalAfter && signalAfter.candidate !== btn),
+  };
 }
 
 /**
@@ -3313,7 +4365,26 @@ async function warmingSoftNavigateInPage(target) {
     const r = el.getBoundingClientRect();
     const cx = r.left + r.width / 2;
     const cy = r.top + r.height / 2;
-    for (const type of ["mousemove", "mouseover", "mousedown", "mouseup", "click"]) {
+    for (const type of ["mousemove", "mouseover", "mouseenter"]) {
+      try {
+        el.dispatchEvent(
+          new MouseEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+          })
+        );
+      } catch (e) {}
+    }
+    try {
+      if (typeof el.click === "function") {
+        el.click();
+        return true;
+      }
+    } catch (e) {}
+    for (const type of ["mousedown", "mouseup", "click"]) {
       try {
         el.dispatchEvent(
           new MouseEvent(type, {
@@ -3381,11 +4452,40 @@ async function warmingSoftNavigateInPage(target) {
         }) || null;
     }
   }
-  if (!el) return { ok: false, navigated: false, note: "no-nav-link" };
+  if (!el) return { ok: false, navigated: false, verified: false, note: "no-nav-link" };
+  const urlBefore = String(location.href || "");
   await sleep(rnd(300, 900));
   clickEl(el);
   await sleep(rnd(1500, 3200)); // chờ SPA render nội dung mới
-  return { ok: true, navigated: true, target, url: location.href };
+  const urlAfter = String(location.href || "");
+  // Soft verify: URL changed or path/landmark matches intended target.
+  const path = urlAfter.toLowerCase();
+  let landmarkOk = false;
+  if (target === "home") {
+    landmarkOk =
+      path === "https://www.facebook.com/" ||
+      path === "https://www.facebook.com" ||
+      /facebook\.com\/?(\?|$|#)/.test(path);
+  } else if (target === "watch") {
+    landmarkOk = path.includes("/watch");
+  } else if (target === "notifications") {
+    landmarkOk =
+      path.includes("/notifications") ||
+      !!document.querySelector('[aria-label*="Notification"],[aria-label*="Thông báo"]');
+  } else if (target === "groups") {
+    landmarkOk = path.includes("/groups");
+  } else if (target === "reels") {
+    landmarkOk = path.includes("/reel");
+  }
+  const verified = urlAfter !== urlBefore || landmarkOk;
+  return {
+    ok: true,
+    navigated: true,
+    verified,
+    target,
+    url: urlAfter,
+    status: verified ? "done" : "unverified",
+  };
 }
 
 // URL mở cho từng loại hành động nuôi tài khoản. Chỉ dùng khi CHƯA có tab FB
@@ -3455,32 +4555,44 @@ async function getTabUrl(tabId) {
 }
 
 /**
- * HƯỚNG B+A — Lấy 1 tab Facebook để nuôi tài khoản:
- *  1) Ưu tiên BÁM vào tab facebook.com người dùng đang mở (owned=false -> KHÔNG
- *     đóng sau khi xong, giữ nguyên phiên làm việc của họ).
- *  2) Nếu không có -> tự mở 1 tab NỀN sống lâu (owned=true -> đóng khi kết thúc
- *     lượt), dùng lại cho MỌI hành động trong lượt thay vì mở tab mỗi hành động.
- * Trả { tabId, owned } hoặc { blocked, blockReason } nếu tab đã ở checkpoint,
- * hoặc { error } nếu không mở được.
+ * Lấy 1 tab Facebook để nuôi tài khoản.
+ * Mặc định (useOwnedTabOnly=true): mở tab owned riêng, KHÔNG chiếm tab active
+ * của người dùng. Khi tắt option: ưu tiên tab FB không active / không blocked.
+ * Trả { tabId, owned } | { blocked, blockReason } | { error }.
+ * @param {{ useOwnedTabOnly?: boolean }} [opts]
  */
-async function acquireWarmingTab() {
-  // (1) Tìm tab facebook.com đang mở sẵn.
-  try {
-    const tabs = await new Promise((r) =>
-      chrome.tabs.query({ url: ["*://*.facebook.com/*"] }, (list) => {
-        void chrome.runtime.lastError;
-        r(Array.isArray(list) ? list : []);
-      })
-    );
-    // Bỏ qua tab đang ở checkpoint/login — không an toàn để thao tác.
-    const usable = tabs.find((t) => t && t.id != null && !warmingUrlIsBlocked(t.url));
-    const blockedTab = tabs.find((t) => t && warmingUrlIsBlocked(t.url));
-    if (!usable && blockedTab) {
-      return { blocked: true, blockReason: WARMING_BLOCK_REASON };
-    }
-    if (usable) return { tabId: usable.id, owned: false };
-  } catch (e) {}
-  // (2) Chưa có tab FB -> tự mở 1 tab nền sống lâu (theo công tắc focusTabs).
+async function acquireWarmingTab(opts = {}) {
+  const useOwnedOnly = opts.useOwnedTabOnly !== false;
+
+  // (1) Optionally reuse an existing non-active FB tab (never hijack active tab).
+  if (!useOwnedOnly) {
+    try {
+      const tabs = await new Promise((r) =>
+        chrome.tabs.query({ url: ["*://*.facebook.com/*"] }, (list) => {
+          void chrome.runtime.lastError;
+          r(Array.isArray(list) ? list : []);
+        })
+      );
+      const candidates = (tabs || []).filter(
+        (t) => t && t.id != null && !warmingUrlIsBlocked(t.url)
+      );
+      const blockedTab = (tabs || []).find((t) => t && warmingUrlIsBlocked(t.url));
+      // Prefer inactive tabs so we do not steal the user's current work.
+      const preferred =
+        candidates.find((t) => !t.active) ||
+        candidates.find((t) => t.active === false) ||
+        null;
+      // Only fall back to active if there is truly no other tab and user opted in.
+      const usable = preferred || (candidates.length === 1 ? candidates[0] : preferred);
+      if (!usable && blockedTab && candidates.length === 0) {
+        return { blocked: true, blockReason: WARMING_BLOCK_REASON };
+      }
+      if (usable && !usable.active) return { tabId: usable.id, owned: false };
+      // If only active tab exists, still open owned tab to avoid hijack.
+    } catch (e) {}
+  }
+
+  // (2) Open a dedicated owned tab (default path).
   const active = await shouldFocusTabs();
   let tab;
   try {
@@ -3494,7 +4606,7 @@ async function acquireWarmingTab() {
     return { error: "Không mở được tab nuôi tài khoản: " + String(e) };
   }
   if (!tab || tab.id == null) return { error: "Không mở được tab nuôi tài khoản." };
-  await addCrawlTab(tab.id); // đánh dấu tab do extension mở để dọn đúng tab
+  await addCrawlTab(tab.id);
   await waitTabComplete(tab.id, 30000);
   if (warmingUrlIsBlocked(await getTabUrl(tab.id))) {
     try {
@@ -3526,34 +4638,95 @@ async function releaseWarmingTab(tabId, owned) {
  */
 async function executeWarmingAction(action, tabId) {
   const inPageFn = WARMING_IN_PAGE_FN[action];
-  if (!inPageFn) return { ok: false, error: "Hành động nuôi không hợp lệ: " + action };
+  if (!inPageFn) {
+    return {
+      ok: false,
+      action,
+      detail: {
+        ok: false,
+        status: "error",
+        stage: "validate-action",
+        note: "invalid-warming-action",
+        error: "Hành động nuôi không hợp lệ: " + action,
+      },
+    };
+  }
   const navTarget = WARMING_NAV_TARGET[action] || "home";
+  const sanitizeTabUrl = (rawUrl) => {
+    try {
+      const u = new URL(String(rawUrl || ""));
+      return u.origin + u.pathname;
+    } catch (e) {
+      return String(rawUrl || "").split(/[?#]/)[0].slice(0, 300);
+    }
+  };
+  const navigation = {
+    target: navTarget,
+    method: "soft",
+    navigated: false,
+    verified: false,
+    note: null,
+    error: null,
+    completed: null,
+  };
   // (a) Điều hướng mềm: bấm link/nút trong SPA, giữ nguyên phiên.
-  let navigated = false;
   try {
     const navRes = await chrome.scripting.executeScript({
       target: { tabId },
       func: warmingSoftNavigateInPage,
       args: [navTarget],
     });
-    navigated = !!(navRes && navRes[0] && navRes[0].result && navRes[0].result.navigated);
-  } catch (e) {}
+    const navOut = navRes && navRes[0] && navRes[0].result;
+    navigation.navigated = !!(navOut && navOut.navigated);
+    navigation.verified = !!(navOut && navOut.verified);
+    navigation.note = navOut && navOut.note ? String(navOut.note) : null;
+  } catch (e) {
+    navigation.note = "soft-navigation-error";
+    navigation.error = String(e);
+  }
   // (b) Dự phòng: không thấy link điều hướng -> đổi URL cứng rồi chờ tải xong.
-  if (!navigated) {
+  if (!navigation.navigated || !navigation.verified) {
+    navigation.method = "hard";
     const url = WARMING_ACTION_URLS[action] || WARMING_ACTION_URLS.scrollFeed;
     try {
-      await new Promise((r) =>
+      await new Promise((resolve, reject) => {
         chrome.tabs.update(tabId, { url }, () => {
-          void chrome.runtime.lastError;
-          r();
-        })
-      );
-      await waitTabComplete(tabId, 30000);
-    } catch (e) {}
+          const err = chrome.runtime.lastError;
+          if (err) reject(new Error(err.message || String(err)));
+          else resolve();
+        });
+      });
+      navigation.completed = await waitTabComplete(tabId, 30000);
+      navigation.navigated = true;
+      navigation.verified = navigation.completed === true;
+      navigation.note = navigation.completed ? "hard-navigation-complete" : "hard-navigation-timeout";
+    } catch (e) {
+      navigation.navigated = false;
+      navigation.verified = false;
+      navigation.note = "hard-navigation-error";
+      navigation.error = String(e);
+    }
   }
+  const tabUrl = await getTabUrl(tabId);
+  navigation.url = sanitizeTabUrl(tabUrl);
   // (c) NGẮT MẠCH: sau điều hướng mà rơi vào checkpoint/login -> báo block.
-  if (warmingUrlIsBlocked(await getTabUrl(tabId))) {
+  if (warmingUrlIsBlocked(tabUrl)) {
     return { ok: false, blocked: true, blockReason: WARMING_BLOCK_REASON };
+  }
+  if (!navigation.navigated || navigation.completed === false) {
+    const timedOut = navigation.completed === false;
+    return {
+      ok: false,
+      action,
+      detail: {
+        ok: false,
+        status: timedOut ? "unverified" : "error",
+        stage: "navigation",
+        note: navigation.note || "navigation-failed",
+        error: navigation.error,
+        navigation,
+      },
+    };
   }
   await sleep(randInt(2000, 4500)); // chờ nội dung ổn định, nhịp như người
   // (d) Chạy hành động thụ động đúng loại trong trang.
@@ -3564,10 +4737,48 @@ async function executeWarmingAction(action, tabId) {
       func: inPageFn,
     });
   } catch (e) {
-    return { ok: false, action, error: "Lỗi chạy script nuôi tài khoản: " + String(e) };
+    return {
+      ok: false,
+      action,
+      detail: {
+        ok: false,
+        status: "error",
+        stage: "action-injection",
+        note: "execute-script-error",
+        error: "Lỗi chạy script nuôi tài khoản: " + String(e),
+        tabUrl: sanitizeTabUrl(await getTabUrl(tabId)),
+        navigation,
+      },
+    };
   }
-  const out = (res && res[0] && res[0].result) || { ok: false };
-  return { ok: out.ok !== false, action, detail: out };
+  const mainFrame = Array.isArray(res)
+    ? res.find((entry) => entry && entry.frameId === 0)
+    : null;
+  if (!mainFrame || mainFrame.result == null) {
+    const resultCount = Array.isArray(res) ? res.length : null;
+    return {
+      ok: false,
+      action,
+      detail: {
+        ok: false,
+        status: "error",
+        stage: "action-result",
+        note:
+          resultCount && !mainFrame
+            ? "missing-main-frame-result"
+            : "missing-script-result",
+        resultCount,
+        tabUrl: sanitizeTabUrl(await getTabUrl(tabId)),
+        navigation,
+      },
+    };
+  }
+  const out = mainFrame.result;
+  return {
+    ok: out.ok !== false,
+    action,
+    detail: { ...out, navigation },
+  };
 }
 
 let _warming = false;
@@ -3600,21 +4811,72 @@ async function warmingSleep(ms) {
 
 /**
  * Chạy 1 lượt nuôi tài khoản theo kiểu NGƯỜI THẬT:
- *  - `actionsPerRun` là SỐ VIỆC TỐI ĐA; mỗi lượt bốc ngẫu nhiên 1..N việc trong
- *    số các loại READ-ONLY đã bật (mỗi loại nhiều nhất 1 lần — KHÔNG lặp).
- *  - reactPost (thả cảm xúc, hành động GHI) chỉ được thêm với xác suất
- *    ~WARMING_REACT_CHANCE (30%) và tối đa 1 bài/lượt, đặt ở CUỐI kế hoạch.
- *  - Trộn thứ tự nhóm READ-ONLY, giãn cách 20–75s giữa các việc (ngắt được).
- * Chống chạy chồng bằng cờ _warming; tôn trọng NGẮT MẠCH chung và cờ DỪNG;
- * ghi nhật ký MỖI hành động lên server. Gọi thủ công truyền { manual:true }.
+ *  - Plan từ warming-policy (weighted shuffle, 1..N read actions, write budget).
+ *  - Manual cũng tôn trọng actionsPerRun (không force all / force write).
+ *  - Account binding check; counters succeeded/failed/no_op/unverified.
+ *  - Không clear shared kill-switch sau lượt sạch.
+ *  - Ghi nhật ký từng hành động + session summary.
  */
 async function processWarming(opts = {}) {
   if (_warming) return { ok: false, error: "Đang nuôi tài khoản, bỏ qua lượt này." };
-  const cfg = await getWarmingConfig();
+
+  // RISK-BE-04: xác nhận config/state từ Backend trước khi chạy.
+  // Lỗi đọc không được giả thành "đang tắt" hoặc state mới.
+  const cfgRes = await getWarmingConfigResult();
+  if (!cfgRes.ok) {
+    try {
+      await recordTelemetry(
+        "warming.settings_deferred",
+        { key: "warmingConfig", status: cfgRes.status },
+        { level: "warn" }
+      );
+    } catch (e) {}
+    return warmingSettingsFailure(cfgRes, "warmingConfig");
+  }
+  const cfg = cfgRes.config;
   // Khi gọi thủ công (manual=true) thì chạy kể cả khi alarm tắt.
+  // manual chỉ bỏ qua cờ enabled, KHÔNG bỏ qua yêu cầu xác nhận settings.
   if (!cfg.enabled && !opts.manual) return { ok: false, error: "Nuôi tài khoản đang tắt." };
-  // NGẮT MẠCH CHUNG (feed/inbox/comment/watch): đang nghỉ vì FB chặn thì bỏ qua
-  // CẢ lượt để bảo vệ tài khoản.
+
+  // Session/day policy needs confirmed state for both auto and manual
+  // (manual still must respect quota/cooldown once state is known).
+  const stateRes = await getWarmingStateResult();
+  if (!stateRes.ok) {
+    try {
+      await recordTelemetry(
+        "warming.settings_deferred",
+        { key: "warmingState", status: stateRes.status },
+        { level: "warn" }
+      );
+    } catch (e) {}
+    return warmingSettingsFailure(stateRes, "warmingState");
+  }
+  let warmingState = stateRes.state;
+  // Soft risk level for telemetry / next schedule (throttle on delay).
+  warmingState = {
+    ...warmingState,
+    riskLevel: computeRiskLevel(warmingState, cfg),
+  };
+  if (!opts.manual) {
+    const gate = canStartWarmingSession(cfg, warmingState);
+    if (!gate.ok) {
+      try {
+        await recordTelemetry(
+          "warming.session_deferred",
+          { code: gate.code, reason: gate.reason },
+          { level: "info" }
+        );
+      } catch (e) {}
+      return {
+        ok: false,
+        deferred: true,
+        code: gate.code,
+        error: gate.reason || "Chưa đến lúc chạy phiên nuôi.",
+      };
+    }
+  }
+
+  // NGẮT MẠCH CHUNG: đang nghỉ vì FB chặn thì bỏ qua CẢ lượt.
   const blockState = await getCrawlBlockState();
   if (blockState && blockState.blocked) {
     return {
@@ -3624,21 +4886,65 @@ async function processWarming(opts = {}) {
       blockedUntil: blockState.blockedUntil,
     };
   }
+
+  // Account binding: không thao tác trên sai nick FB.
+  try {
+    const m = await assertFbMatch();
+    if (!m.ok && (m.code === MATCH_MISMATCH || m.code === MATCH_FB_ABSENT)) {
+      const reason =
+        m.code === MATCH_MISMATCH
+          ? "Sai tài khoản Facebook: đã ràng buộc với FB khác."
+          : "Không đọc được Facebook ID hiện tại (chưa đăng nhập?).";
+      try {
+        await DB.recordWarmingActivity({
+          type: "session",
+          status: "blocked",
+          data: {
+            reason,
+            code: m.code,
+            bound: m.bound || null,
+            current: m.current || null,
+          },
+        });
+      } catch (e) {}
+      broadcast("WARMING_PROGRESS", {
+        action: "session",
+        status: "blocked",
+        done: 0,
+        total: 0,
+        succeeded: 0,
+        failed: 0,
+      });
+      return {
+        ok: false,
+        blocked: true,
+        code: m.code,
+        error: reason,
+        done: 0,
+        succeeded: 0,
+        failed: 0,
+      };
+    }
+  } catch (e) {
+    // Binding check failure is non-fatal only if unbound path is allowed;
+    // assertFbMatch itself handles unbound as ok-ish depending on evaluateMatch.
+  }
+
   _warming = true;
   _warmingStop = false;
-  let done = 0;
+  let done = 0; // compat alias → succeeded
   let blocked = false;
   let stopped = false;
-  // Tab dùng CHUNG cho cả lượt (Hướng B+A): bám tab FB đang mở hoặc mở 1 tab
-  // nền sống lâu. `owned` = true nếu chính extension mở (phải tự đóng khi xong).
+  let sessionError = null;
+  const actionResults = [];
+  let plan = [];
+  let skippedWrites = [];
   let warmTabId = null;
   let ownedTab = false;
+
   try {
-    // Lấy tab MỘT LẦN cho cả lượt thay vì mở/đóng tab mỗi hành động.
-    const acq = await acquireWarmingTab();
+    const acq = await acquireWarmingTab({ useOwnedTabOnly: cfg.useOwnedTabOnly !== false });
     if (acq && acq.blocked && acq.blockReason) {
-      // Tab người dùng đang ở checkpoint (hoặc tab nền vừa mở bị đá) -> arm ngắt
-      // mạch chung, ghi log rồi dừng lượt (không có hành động nào chạy).
       await setCrawlBlock(acq.blockReason);
       blocked = true;
       try {
@@ -3653,51 +4959,52 @@ async function processWarming(opts = {}) {
         status: "blocked",
         done: 0,
         total: 0,
+        succeeded: 0,
+        failed: 0,
       });
-      return { ok: true, done: 0, blocked: true };
+      return {
+        ok: false,
+        done: 0,
+        succeeded: 0,
+        failed: 0,
+        blocked: true,
+        stopped: false,
+      };
     }
     if (!acq || acq.tabId == null) {
-      // Không mở được tab -> bỏ lượt, chờ chu kỳ sau (không đụng ngắt mạch).
-      return { ok: false, error: (acq && acq.error) || "Không lấy được tab nuôi tài khoản." };
+      return {
+        ok: false,
+        error: (acq && acq.error) || "Không lấy được tab nuôi tài khoản.",
+        done: 0,
+        succeeded: 0,
+        failed: 0,
+      };
     }
     warmTabId = acq.tabId;
     ownedTab = !!acq.owned;
 
-    const enabled = normalizeWarmingActions(cfg.actions);
     const perRun = Math.max(
       1,
       Math.min(8, parseInt(opts.actionsPerRun, 10) || cfg.actionsPerRun)
     );
-    // Tách nhóm GHI (reactPost/reactReels) khỏi nhóm READ-ONLY. Nhóm GHI chỉ
-    // được thêm theo xác suất thấp, KHÔNG tính vào phần chạy của read-only.
-    const readonlyPool = enabled.filter((a) => !WARMING_WRITE_ACTIONS.includes(a));
-    const writeEnabled = enabled.filter((a) => WARMING_WRITE_ACTIONS.includes(a));
-    // Trộn nhóm read-only rồi CHẠY HẾT các việc đã tích (đúng ý "tích 4 thì làm
-    // cả 4", KHÔNG bốc ngẫu nhiên 1 việc rồi bỏ phần còn lại), mỗi loại nhiều
-    // nhất 1 lần. Lượt TỰ ĐỘNG: kẹp theo perRun để không dồn quá nhiều. Lượt
-    // CHẠY THỬ thủ công (manual): chạy HẾT để người dùng quan sát từng việc.
-    shuffleInPlace(readonlyPool);
-    const plan = [];
-    const readCap = opts.manual
-      ? readonlyPool.length
-      : Math.min(perRun, readonlyPool.length);
-    for (let i = 0; i < readCap; i++) plan.push(readonlyPool[i]);
-    // Nhóm GHI (reactPost/reactReels): mỗi loại ~30% khả năng mỗi lượt, tối đa 1
-    // tương tác/loại, luôn ở CUỐI (sau khi đã "khởi động" bằng vài hành động thụ
-    // động cho giống người thật). Khi CHẠY THỬ thủ công thì BUỘC chạy để người
-    // dùng kiểm chứng được hành động ghi.
-    for (const wa of writeEnabled) {
-      if (opts.manual || Math.random() < WARMING_REACT_CHANCE) plan.push(wa);
-    }
-    // Trường hợp hiếm: chỉ bật mỗi hành động GHI và lần này không trúng 30% ->
-    // lượt rỗng. Vẫn coi là lượt sạch (không làm gì cũng là "giống người").
+    // Plan via pure policy: manual respects actionsPerRun; write chance/budget apply.
+    const planned = planWarmingActions({
+      enabledActions: cfg.actions,
+      actionsPerRun: perRun,
+      manual: !!opts.manual,
+      forceAllRead: !!opts.forceAllRead,
+      forceWrite: !!opts.forceWrite,
+      state: warmingState,
+      config: cfg,
+    });
+    plan = planned.plan || [];
+    skippedWrites = Array.isArray(planned.skippedWrites) ? planned.skippedWrites : [];
+
     for (let i = 0; i < plan.length; i++) {
-      // Người dùng bấm Dừng -> thoát ngay, KHÔNG chạy thêm hành động nào.
       if (_warmingStop) {
         stopped = true;
         break;
       }
-      // Kiểm tra ngắt mạch TRƯỚC mỗi hành động (block có thể tới bất đồng bộ).
       const blk = await getCrawlBlockState();
       if (blk && blk.blocked) {
         blocked = true;
@@ -3710,42 +5017,58 @@ async function processWarming(opts = {}) {
       } catch (e) {
         res = { ok: false, error: String(e) };
       }
-      // FB chặn giữa chừng -> arm ngắt mạch chung, ghi log rồi dừng lượt.
+
       if (res && res.blocked && res.blockReason) {
         await setCrawlBlock(res.blockReason);
         blocked = true;
+        const status = "blocked";
+        actionResults.push({ action, status });
         try {
           await DB.recordWarmingActivity({
             type: action,
-            status: "blocked",
+            status,
             data: { reason: res.blockReason },
           });
         } catch (e) {}
+        const agg = aggregateWarmingResults(actionResults);
         broadcast("WARMING_PROGRESS", {
           action,
-          status: "blocked",
-          done,
+          status,
+          done: agg.succeeded,
           total: plan.length,
+          succeeded: agg.succeeded,
+          failed: agg.failed,
+          skipped: agg.skipped,
+          unverified: agg.unverified,
+          noOp: agg.noOp,
         });
         break;
       }
-      done += 1;
-      // Ghi nhật ký lên SERVER cho từng hành động (BE, không dùng storage local).
+
+      const status = statusFromActionDetail(res && res.detail, res && res.ok);
+      actionResults.push({ action, status, detail: (res && res.detail) || {} });
+      const agg = aggregateWarmingResults(actionResults);
+      done = agg.succeeded;
+
       try {
         await DB.recordWarmingActivity({
           type: action,
-          status: res && res.ok ? "done" : "error",
-          data: (res && res.detail) || {},
+          status,
+          data: (res && res.detail) || { error: res && res.error },
         });
       } catch (e) {}
       broadcast("WARMING_PROGRESS", {
         action,
-        status: res && res.ok ? "done" : "error",
-        done,
+        status,
+        done: agg.succeeded,
         total: plan.length,
+        succeeded: agg.succeeded,
+        failed: agg.failed,
+        skipped: agg.skipped,
+        unverified: agg.unverified,
+        noOp: agg.noOp,
       });
-      // Giãn cách 20–75s GIỮA các hành động (không chờ sau hành động cuối). Ngủ
-      // NGẮT ĐƯỢC: nếu người dùng bấm Dừng giữa lúc chờ thì thoát ngay.
+
       if (i < plan.length - 1) {
         const full = await warmingSleep(randInt(20000, 75000));
         if (!full) {
@@ -3754,43 +5077,134 @@ async function processWarming(opts = {}) {
         }
       }
     }
+
+    // Persist session counters / cooldowns / recent actions + risk signals.
+    try {
+      warmingState = applySessionToWarmingState(warmingState, {
+        plan,
+        results: actionResults,
+        applyRisk: true,
+        blocked,
+        sessionError: false,
+      });
+      await saveWarmingState(warmingState);
+    } catch (e) {}
   } catch (e) {
-    // bỏ qua, chờ chu kỳ sau
+    sessionError = String((e && e.message) || e);
+    try {
+      await DB.recordWarmingActivity({
+        type: "session",
+        status: "error",
+        data: { error: sessionError },
+      });
+    } catch (e2) {}
+    // Apply risk on hard session failure (best-effort).
+    try {
+      warmingState = applyRiskToWarmingState(warmingState || {}, {
+        sessionError: true,
+        failed: 1,
+        blocked: false,
+        succeeded: 0,
+      });
+      await saveWarmingState(warmingState);
+    } catch (e3) {}
+    try {
+      await recordTelemetry(
+        "warming.session_error",
+        { error: sessionError },
+        { level: "error" }
+      );
+    } catch (e4) {}
   } finally {
-    // Chỉ đóng tab nếu chính extension đã mở nó; tab của người dùng giữ nguyên.
     await releaseWarmingTab(warmTabId, ownedTab);
     _warming = false;
     _warmingStop = false;
   }
-  // Người dùng chủ động dừng -> ghi log 1 dòng "stopped" để UI hiển thị rõ.
+
+  const counts = aggregateWarmingResults(actionResults);
+  done = counts.succeeded;
+
   if (stopped) {
     try {
       await DB.recordWarmingActivity({
         type: "session",
         status: "stopped",
-        data: { done },
+        data: {
+          plan,
+          skippedWrites,
+          done: counts.succeeded,
+          succeeded: counts.succeeded,
+          failed: counts.failed,
+          attempted: counts.attempted,
+        },
       });
     } catch (e) {}
     broadcast("WARMING_PROGRESS", {
       action: "session",
       status: "stopped",
-      done,
-      total: done,
+      done: counts.succeeded,
+      total: plan.length || counts.attempted,
+      succeeded: counts.succeeded,
+      failed: counts.failed,
     });
-  }
-  // Lượt sạch (không bị chặn, làm ít nhất 1 hành động) -> reset ngắt mạch, đồng
-  // bộ với feed/inbox/watch.
-  if (!blocked && !stopped && done > 0) {
+  } else if (!sessionError && !blocked) {
     try {
-      await clearCrawlBlock();
+      await DB.recordWarmingActivity({
+        type: "session",
+        status: "done",
+        data: {
+          plan,
+          skippedWrites,
+          succeeded: counts.succeeded,
+          failed: counts.failed,
+          noOp: counts.noOp,
+          unverified: counts.unverified,
+          attempted: counts.attempted,
+        },
+      });
     } catch (e) {}
   }
-  return { ok: true, done, blocked, stopped };
+
+  // BUG-08 fix: do NOT clear shared crawl kill-switch after a clean warming run.
+
+  if (sessionError) {
+    return {
+      ok: false,
+      error: sessionError,
+      done,
+      succeeded: counts.succeeded,
+      failed: counts.failed,
+      skipped: counts.skipped,
+      skippedWrites,
+      unverified: counts.unverified,
+      noOp: counts.noOp,
+      attempted: counts.attempted,
+      blocked,
+      stopped,
+    };
+  }
+
+  return {
+    ok: !blocked,
+    done,
+    succeeded: counts.succeeded,
+    failed: counts.failed,
+    skipped: counts.skipped,
+    skippedWrites,
+    unverified: counts.unverified,
+    noOp: counts.noOp,
+    attempted: counts.attempted,
+    blocked,
+    stopped,
+  };
 }
 
 /** Khôi phục alarm nuôi tài khoản khi service worker khởi động lại. */
 async function initWarming() {
-  const cfg = await getWarmingConfig();
+  const cfgRes = await getWarmingConfigResult();
+  // Backend lỗi: không xoá alarm hiện có (tránh false-disabled).
+  if (!cfgRes.ok) return;
+  const cfg = cfgRes.config;
   try {
     const existing = await chrome.alarms.get(WARMING_ALARM);
     if (cfg.enabled && !existing) {
@@ -4470,6 +5884,10 @@ export {
   crawlGroupApiInTab,
   crawlGroupApiTabless,
   crawlGroupApiSmart,
+  isTrustedJoinedGroupsSnapshot,
+  formatJoinedGroupsDiagnostic,
+  openJoinedGroupsTab,
+  runSingleFlight,
   scanJoinedGroups,
   runJob,
   executeDeletePost,
@@ -4481,21 +5899,30 @@ export {
   scheduleTickSoon,
   AUTOCRAWL_ALARM,
   getAutoCrawlConfig,
+  getAutoCrawlConfigResult,
   applyAutoCrawlConfig,
   processAutoCrawl,
   initAutoCrawl,
   AUTOSYNC_ALARM,
   getAutoSyncConfig,
+  getAutoSyncConfigResult,
   applyAutoSyncConfig,
   processAutoSync,
   initAutoSync,
   WATCH_ALARM,
   getWatchConfig,
+  getWatchConfigResult,
   applyWatchConfig,
   processReplyWatch,
   initReplyWatch,
   WARMING_ALARM,
+  runNotificationsInPage,
+  runReactPostInPage,
+  runReactReelsInPage,
+  executeWarmingAction,
   getWarmingConfig,
+  getWarmingConfigResult,
+  getWarmingStateResult,
   applyWarmingConfig,
   processWarming,
   stopWarming,

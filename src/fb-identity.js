@@ -85,31 +85,143 @@ export function normalizeFbId(v) {
 /* --------------------------- Ràng buộc (binding) ----------------------- */
 
 /**
+ * Structured binding read (RISK-BE-04 migration for non-warming consumer).
+ * Prefer server settings; on failure, fall back to local cache with stale=true.
+ *
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   status: string,
+ *   found: boolean,
+ *   source: "server"|"cache"|"default",
+ *   stale: boolean,
+ *   retryable?: boolean,
+ *   message?: string,
+ *   binding: { fbId: string|null, fbName: string|null }
+ * }>}
+ */
+export async function getBindingResult() {
+  // Read both keys with structured results when possible.
+  let idRes = null;
+  let nameRes = null;
+  try {
+    if (typeof DB.getSettingResult === "function") {
+      idRes = await DB.getSettingResult(KEY_BOUND_ID);
+      nameRes = await DB.getSettingResult(KEY_BOUND_NAME);
+    }
+  } catch (e) {
+    idRes = null;
+    nameRes = null;
+  }
+
+  // Both structured reads available and successful (found or missing).
+  if (
+    idRes &&
+    nameRes &&
+    idRes.ok &&
+    nameRes.ok
+  ) {
+    const fbId = idRes.found ? normalizeFbId(idRes.value) : null;
+    const fbName =
+      nameRes.found && nameRes.value != null ? String(nameRes.value) : null;
+    if (fbId) {
+      await _writeCache({ fbId, fbName });
+    }
+    return {
+      ok: true,
+      status: fbId ? "found" : "missing",
+      found: !!fbId,
+      source: "server",
+      stale: false,
+      binding: { fbId, fbName },
+    };
+  }
+
+  // At least one structured read failed (network/auth/server).
+  const failed = [idRes, nameRes].find((r) => r && !r.ok);
+  const cached = await _readCache();
+  if (cached && cached.fbId) {
+    return {
+      ok: true,
+      status: (failed && failed.status) || "network_error",
+      found: true,
+      source: "cache",
+      stale: true,
+      retryable: failed ? !!failed.retryable : true,
+      message: failed && failed.message ? failed.message : "Dùng cache binding (Backend lỗi).",
+      binding: {
+        fbId: normalizeFbId(cached.fbId),
+        fbName: cached.fbName != null ? String(cached.fbName) : null,
+      },
+    };
+  }
+
+  // No server, no cache — unbound / unknown.
+  if (failed) {
+    return {
+      ok: false,
+      status: failed.status || "server_error",
+      found: false,
+      source: "default",
+      stale: true,
+      retryable: !!failed.retryable,
+      message: failed.message || "Không đọc được ràng buộc FB.",
+      binding: { fbId: null, fbName: null },
+    };
+  }
+
+  // Fallback path when getSettingResult is unavailable (legacy).
+  try {
+    const fbId = normalizeFbId(await DB.getSetting(KEY_BOUND_ID, null));
+    const name = await DB.getSetting(KEY_BOUND_NAME, null);
+    const fbName = name != null ? String(name) : null;
+    if (fbId) await _writeCache({ fbId, fbName });
+    return {
+      ok: true,
+      status: fbId ? "found" : "missing",
+      found: !!fbId,
+      source: "server",
+      stale: false,
+      binding: { fbId, fbName },
+    };
+  } catch (e) {
+    const cached2 = await _readCache();
+    if (cached2 && cached2.fbId) {
+      return {
+        ok: true,
+        status: "network_error",
+        found: true,
+        source: "cache",
+        stale: true,
+        retryable: true,
+        message: String((e && e.message) || e),
+        binding: {
+          fbId: normalizeFbId(cached2.fbId),
+          fbName: cached2.fbName != null ? String(cached2.fbName) : null,
+        },
+      };
+    }
+    return {
+      ok: false,
+      status: "network_error",
+      found: false,
+      source: "default",
+      stale: true,
+      retryable: true,
+      message: String((e && e.message) || e),
+      binding: { fbId: null, fbName: null },
+    };
+  }
+}
+
+/**
  * Lấy ràng buộc hiện tại của TÀI KHOẢN app.
- * Đọc backend trước (nguồn sự thật), fallback cache cục bộ nếu mạng lỗi.
+ * Compatibility wrapper: always returns { fbId, fbName }; uses cache on failure.
+ * Critical callers that need stale/source should use getBindingResult().
  * @returns {Promise<{fbId: string|null, fbName: string|null}>}
  */
 export async function getBinding() {
-  let fbId = null;
-  let fbName = null;
-  try {
-    fbId = normalizeFbId(await DB.getSetting(KEY_BOUND_ID, null));
-    const name = await DB.getSetting(KEY_BOUND_NAME, null);
-    fbName = name != null ? String(name) : null;
-  } catch (e) {
-    // bỏ qua — thử cache bên dưới
-  }
-  if (!fbId) {
-    const cached = await _readCache();
-    if (cached && cached.fbId) {
-      fbId = normalizeFbId(cached.fbId);
-      fbName = cached.fbName != null ? String(cached.fbName) : fbName;
-    }
-  } else {
-    // đồng bộ cache cho lần đọc nhanh sau này
-    await _writeCache({ fbId, fbName });
-  }
-  return { fbId, fbName };
+  const r = await getBindingResult();
+  return r.binding || { fbId: null, fbName: null };
 }
 
 /**

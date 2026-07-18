@@ -104,6 +104,104 @@ export function onUnauthorized(cb) {
 }
 
 /**
+ * Lỗi HTTP/mạng có metadata ổn định để caller phân loại (RISK-BE-04).
+ * message vẫn giữ dạng "API <status>: ..." để tương thích test/UI cũ.
+ */
+export class ApiError extends Error {
+  /**
+   * @param {string} message
+   * @param {{
+   *   kind?: string,
+   *   status?: number|null,
+   *   code?: string|null,
+   *   retryable?: boolean,
+   *   body?: any,
+   *   reason?: string|null,
+   * }} [meta]
+   */
+  constructor(message, meta = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.kind = meta.kind || "server_error";
+    this.status = meta.status == null ? null : meta.status;
+    this.code = meta.code == null ? null : meta.code;
+    this.retryable = !!meta.retryable;
+    // Body đã parse (có thể null). Caller không nên log raw body ra telemetry.
+    this.body = meta.body === undefined ? null : meta.body;
+    this.reason = meta.reason == null ? null : meta.reason;
+  }
+}
+
+/**
+ * Phân loại HTTP status -> kind ổn định (không parse message string).
+ * @param {number} status
+ * @param {any} body
+ */
+function classifyHttpFailure(status, body) {
+  if (status === 401) {
+    return {
+      kind: "unauthorized",
+      retryable: false,
+      code: body && body.code ? String(body.code) : null,
+      reason: "expired",
+    };
+  }
+  if (status === 403 && body && body.code === "ACCOUNT_INACTIVE") {
+    const reason =
+      body.status === "locked"
+        ? "locked"
+        : body.status === "pending"
+          ? "pending"
+          : "inactive";
+    return {
+      kind: "account_inactive",
+      retryable: false,
+      code: "ACCOUNT_INACTIVE",
+      reason,
+    };
+  }
+  if (status === 403) {
+    return {
+      kind: "forbidden",
+      retryable: false,
+      code: body && body.code ? String(body.code) : null,
+      reason: null,
+    };
+  }
+  if (status === 400 || status === 404 || status === 422) {
+    return {
+      kind: "invalid_request",
+      retryable: false,
+      code: body && body.code ? String(body.code) : null,
+      reason: null,
+    };
+  }
+  if (status >= 500 && status <= 599) {
+    return {
+      kind: "server_error",
+      retryable: true,
+      code: body && body.code ? String(body.code) : null,
+      reason: null,
+    };
+  }
+  // Các 4xx còn lại: coi là request/contract issue, không retry nền.
+  if (status >= 400 && status <= 499) {
+    return {
+      kind: "invalid_request",
+      retryable: false,
+      code: body && body.code ? String(body.code) : null,
+      reason: null,
+    };
+  }
+  return {
+    kind: "server_error",
+    retryable: true,
+    code: body && body.code ? String(body.code) : null,
+    reason: null,
+  };
+}
+
+/**
  * Gọi API: gắn bearer header (nếu có token), parse JSON, ném khi non-2xx.
  *
  * @param {string} path  Đường dẫn tương đối ("/api/groups") hoặc URL tuyệt đối.
@@ -137,7 +235,21 @@ export async function apiFetch(path, init = {}) {
     headers["Content-Type"] = "application/json";
   }
 
-  const res = await fetch(url, { ...init, headers });
+  let res;
+  try {
+    res = await fetch(url, { ...init, headers });
+  } catch (e) {
+    // DNS / offline / connection refused / aborted — không có HTTP status.
+    const msg = e && e.message ? String(e.message) : "network error";
+    throw new ApiError(msg, {
+      kind: "network_error",
+      status: null,
+      code: null,
+      retryable: true,
+      body: null,
+      reason: null,
+    });
+  }
 
   // Parse JSON best-effort (một số endpoint có thể trả rỗng).
   let body = null;
@@ -165,19 +277,14 @@ export async function apiFetch(path, init = {}) {
     const accountInactive =
       res.status === 403 && body && body.code === "ACCOUNT_INACTIVE";
     const sessionInvalid = res.status === 401 || accountInactive;
+    const classified = classifyHttpFailure(res.status, body);
     if (sessionInvalid && sentToken && !init.skipAuthHandler) {
       setToken(null);
       if (unauthorizedHandler) {
         try {
           // Truyền lý do để UI hiển thị thông báo phù hợp: "locked" (bị khóa),
           // "pending" (chờ duyệt), hoặc "expired" (phiên hết hạn/token hỏng).
-          const reason = accountInactive
-            ? body.status === "locked"
-              ? "locked"
-              : body.status === "pending"
-                ? "pending"
-                : "inactive"
-            : "expired";
+          const reason = classified.reason || "expired";
           unauthorizedHandler(reason);
         } catch (e) {
           // Không để lỗi handler che lỗi gốc.
@@ -185,7 +292,14 @@ export async function apiFetch(path, init = {}) {
       }
     }
     const serverMsg = body && body.error ? ": " + body.error : "";
-    throw new Error("API " + res.status + serverMsg);
+    throw new ApiError("API " + res.status + serverMsg, {
+      kind: classified.kind,
+      status: res.status,
+      code: classified.code,
+      retryable: classified.retryable,
+      body,
+      reason: classified.reason,
+    });
   }
 
   return body;

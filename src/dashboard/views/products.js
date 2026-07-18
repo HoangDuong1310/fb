@@ -26,7 +26,7 @@ export function canonCat(c) {
   return String(c).trim();
 }
 // State riêng cho view sản phẩm.
-export const productStore = { sources: [], products: [], allProducts: [], mode: "compare", page: 1, pageSize: 50 };
+export const productStore = { sources: [], products: [], all: [], mode: "compare", page: 1, pageSize: 50 };
 
 // Lấy & hiển thị các nguồn dữ liệu đã lưu.
 export async function loadSources() {
@@ -319,6 +319,8 @@ export function clusterProducts(products) {
 export function renderProducts() {
   const wrap = $("productList");
   if (!wrap) return;
+  // Event delegation survives innerHTML replacement on every render.
+  wrap.onclick = changeProductPage;
   if (!productStore.products.length) {
     wrap.innerHTML = emptyState("Kho trống", "Đồng bộ một nguồn để nạp sản phẩm vào kho.");
     return;
@@ -329,6 +331,37 @@ export function renderProducts() {
   } else {
     renderProductsCompare(wrap);
   }
+}
+
+/**
+ * Chuyển trang sản phẩm. Nhận trực tiếp "prev"/"next" hoặc một click event
+ * delegated từ #productList. Trước đây pager chỉ render HTML mà không có handler,
+ * nên bấm Trước/Sau không thay đổi dữ liệu.
+ */
+export function changeProductPage(directionOrEvent) {
+  let direction = directionOrEvent;
+  if (directionOrEvent && typeof directionOrEvent === "object") {
+    const button = directionOrEvent.target?.closest?.("[data-pg]");
+    if (!button || button.disabled) return false;
+    directionOrEvent.preventDefault?.();
+    direction = button.dataset?.pg;
+  }
+  if (direction !== "prev" && direction !== "next") return false;
+
+  const source =
+    productStore.mode === "list"
+      ? productStore.products
+      : clusterProducts(productStore.products).filter((c) => c.storeCount >= 2);
+  const pages = Math.max(1, Math.ceil(source.length / productStore.pageSize));
+  const nextPage = Math.max(
+    1,
+    Math.min(pages, productStore.page + (direction === "next" ? 1 : -1))
+  );
+  if (nextPage === productStore.page) return false;
+  productStore.page = nextPage;
+  renderProducts();
+  $("productList")?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+  return true;
 }
 
 // Cắt mảng theo trang hiện tại + dựng HTML thanh phân trang. Render hàng nghìn thẻ

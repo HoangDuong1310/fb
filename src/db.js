@@ -18,9 +18,28 @@
  * Module ES (import/export), khớp phong cách util.js / api.js.
  */
 
-import { apiFetch } from "./api.js";
+import { apiFetch, ApiError } from "./api.js";
+import { redactValue } from "./client-telemetry.js";
 
 /* ----------------------------- Helpers ---------------------------------- */
+
+const WARMING_ACTIVITY_STATUSES = new Set([
+  "done",
+  "success",
+  "error",
+  "blocked",
+  "stopped",
+  "no_op",
+  "unverified",
+  "skipped",
+  "deferred",
+]);
+
+function normalizeWarmingActivityStatus(value) {
+  if (value == null) return "done";
+  const status = String(value);
+  return WARMING_ACTIVITY_STATUSES.has(status) ? status : "error";
+}
 
 /**
  * Dựng query string từ object, BỎ QUA các giá trị null/undefined/"".
@@ -110,14 +129,20 @@ async function saveGroup(group) {
   return { ...group };
 }
 
-/** Lưu nhiều nhóm. Trả về { added, updated } từ server. */
-async function saveGroups(groups) {
-  if (!Array.isArray(groups) || !groups.length) return { added: 0, updated: 0 };
+/** Lưu nhiều nhóm. `replace:true` đồng bộ membership theo đúng lần quét mới,
+ * đồng thời gỡ các nhóm không còn xuất hiện. */
+async function saveGroups(groups, opts = {}) {
+  if (!Array.isArray(groups)) return { added: 0, updated: 0, removed: 0 };
+  if (!groups.length && opts.replace !== true) return { added: 0, updated: 0, removed: 0 };
   const body = await apiFetch("/api/groups", {
     method: "POST",
-    body: JSON.stringify({ groups }),
+    body: JSON.stringify({ groups, replace: opts.replace === true }),
   });
-  return { added: body?.added || 0, updated: body?.updated || 0 };
+  return {
+    added: body?.added || 0,
+    updated: body?.updated || 0,
+    removed: body?.removed || 0,
+  };
 }
 
 /** Lấy toàn bộ nhóm, kèm postCount (server tính sẵn). Trả về MẢNG. */
@@ -367,8 +392,8 @@ async function recordWarmingActivity(entry = {}) {
     method: "POST",
     body: JSON.stringify({
       type: entry.type != null ? String(entry.type) : "action",
-      status: entry.status != null ? String(entry.status) : "done",
-      data: entry.data ?? {},
+      status: normalizeWarmingActivityStatus(entry.status),
+      data: redactValue(entry.data ?? {}),
     }),
   });
 }
@@ -396,15 +421,177 @@ async function getWarmingActivity(opts = {}) {
 // Content script KHÔNG gọi trực tiếp — phải nhờ background qua message.
 
 /**
+ * Phân loại lỗi đọc settings thành taxonomy ổn định (RISK-BE-04).
+ * Ưu tiên metadata từ ApiError; fallback parse message cho lỗi cũ.
+ * @param {any} err
+ */
+function classifySettingError(err) {
+  if (err instanceof ApiError) {
+    return {
+      status: err.kind || "server_error",
+      httpStatus: err.status == null ? null : err.status,
+      retryable: !!err.retryable,
+      code: err.code || null,
+      reason: err.reason || null,
+      message: err.message || "Không đọc được cấu hình từ Backend",
+    };
+  }
+  const msg = err && err.message != null ? String(err.message) : String(err || "unknown error");
+  const m = /^API\s+(\d+)/i.exec(msg);
+  if (m) {
+    const httpStatus = parseInt(m[1], 10);
+    if (httpStatus === 401) {
+      return {
+        status: "unauthorized",
+        httpStatus,
+        retryable: false,
+        code: null,
+        reason: "expired",
+        message: msg,
+      };
+    }
+    if (httpStatus === 403) {
+      return {
+        status: "forbidden",
+        httpStatus,
+        retryable: false,
+        code: null,
+        reason: null,
+        message: msg,
+      };
+    }
+    if (httpStatus === 400 || httpStatus === 404 || httpStatus === 422) {
+      return {
+        status: "invalid_request",
+        httpStatus,
+        retryable: false,
+        code: null,
+        reason: null,
+        message: msg,
+      };
+    }
+    if (httpStatus >= 500 && httpStatus <= 599) {
+      return {
+        status: "server_error",
+        httpStatus,
+        retryable: true,
+        code: null,
+        reason: null,
+        message: msg,
+      };
+    }
+    return {
+      status: "invalid_request",
+      httpStatus,
+      retryable: false,
+      code: null,
+      reason: null,
+      message: msg,
+    };
+  }
+  return {
+    status: "network_error",
+    httpStatus: null,
+    retryable: true,
+    code: null,
+    reason: null,
+    message: msg || "Không kết nối được Backend",
+  };
+}
+
+/**
+ * Đọc một khoá cấu hình với kết quả có cấu trúc (RISK-BE-04).
+ * Phân biệt rõ:
+ *  - found: HTTP 2xx, body object, có field value, value !== null
+ *  - missing: HTTP 2xx, body object, có field value, value === null
+ *  - invalid_response: HTTP 2xx nhưng shape sai
+ *  - unauthorized / account_inactive / forbidden / invalid_request /
+ *    network_error / server_error: request thất bại
+ *
+ * @param {string} key
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   status: string,
+ *   found?: boolean,
+ *   value?: any,
+ *   httpStatus?: number|null,
+ *   retryable?: boolean,
+ *   code?: string|null,
+ *   reason?: string|null,
+ *   message?: string,
+ *   key?: string
+ * }>}
+ */
+async function getSettingResult(key) {
+  const settingKey = String(key == null ? "" : key);
+  try {
+    const r = await apiFetch("/api/settings/" + encodeURIComponent(settingKey));
+    // Chỉ coi là missing khi response object có own field "value" và value === null.
+    // Body null / {} / thiếu field value / kiểu sai -> invalid_response, KHÔNG missing.
+    if (r == null || typeof r !== "object" || Array.isArray(r)) {
+      return {
+        ok: false,
+        status: "invalid_response",
+        httpStatus: 200,
+        retryable: true,
+        code: null,
+        reason: null,
+        message: "Response settings không đúng shape",
+        key: settingKey,
+      };
+    }
+    if (!Object.prototype.hasOwnProperty.call(r, "value")) {
+      return {
+        ok: false,
+        status: "invalid_response",
+        httpStatus: 200,
+        retryable: true,
+        code: null,
+        reason: null,
+        message: "Response settings thiếu field value",
+        key: settingKey,
+      };
+    }
+    if (r.value === null) {
+      return {
+        ok: true,
+        status: "missing",
+        found: false,
+        value: null,
+        key: settingKey,
+      };
+    }
+    return {
+      ok: true,
+      status: "found",
+      found: true,
+      value: r.value,
+      key: settingKey,
+    };
+  } catch (e) {
+    const c = classifySettingError(e);
+    return {
+      ok: false,
+      status: c.status,
+      httpStatus: c.httpStatus,
+      retryable: c.retryable,
+      code: c.code,
+      reason: c.reason,
+      message: c.message,
+      key: settingKey,
+    };
+  }
+}
+
+/**
  * Đọc một khoá cấu hình. Trả về `value` (hoặc `def` nếu chưa có / lỗi mạng).
+ * Compatibility wrapper cho UI init: missing + mọi failure đều rơi về `def`.
+ * Caller critical (warming) phải dùng getSettingResult() thay vì hàm này.
  */
 async function getSetting(key, def = null) {
-  try {
-    const r = await apiFetch("/api/settings/" + encodeURIComponent(key));
-    return r && "value" in r && r.value != null ? r.value : def;
-  } catch (e) {
-    return def;
-  }
+  const result = await getSettingResult(key);
+  if (result && result.ok && result.found) return result.value;
+  return def;
 }
 
 /** Ghi (upsert) một khoá cấu hình. Trả về giá trị đã ghi. */
@@ -859,6 +1046,7 @@ export {
   getWarmingActivity,
   // settings (cấu hình nhỏ theo TÀI KHOẢN qua /api/settings)
   getSetting,
+  getSettingResult,
   setSetting,
   deleteSetting,
   // message templates (mẫu tin chào hàng — theo TÀI KHOẢN qua /api/message-templates)

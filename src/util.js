@@ -20,7 +20,8 @@ export function getActiveTab() {
 /** Chờ một tab tải xong (status=complete) hoặc hết thời gian. */
 export function waitTabComplete(tabId, timeoutMs) {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
+    let timer;
+    timer = setTimeout(() => {
       cleanup();
       resolve(false);
     }, timeoutMs || 30000);

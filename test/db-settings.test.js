@@ -18,8 +18,8 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { setBaseUrl, setToken } from "../src/api.js";
-import { getSetting, setSetting, deleteSetting } from "../src/db.js";
+import { setBaseUrl, setToken, getToken, onUnauthorized } from "../src/api.js";
+import { getSetting, getSettingResult, setSetting, deleteSetting } from "../src/db.js";
 
 function jsonResponse(status, body) {
   return {
@@ -131,4 +131,130 @@ test("deleteSetting DELETEs /api/settings/:key", async () => {
   assert.equal(lastCall.url, "http://localhost:3300/api/settings/fbSelectors");
   assert.equal(lastCall.init.method, "DELETE");
   assert.deepEqual(out, { ok: true });
+});
+
+/* -------------------- RISK-BE-04: getSettingResult taxonomy ------------- */
+
+test("getSettingResult found keeps the server value", async () => {
+  const cfg = { enabled: true, intervalMinutes: 60 };
+  mockFetch(200, { key: "warmingConfig", value: cfg });
+  const out = await getSettingResult("warmingConfig");
+  assert.equal(out.ok, true);
+  assert.equal(out.status, "found");
+  assert.equal(out.found, true);
+  assert.deepEqual(out.value, cfg);
+});
+
+test("getSettingResult missing when value is null (unset key)", async () => {
+  mockFetch(200, { key: "warmingState", value: null });
+  const out = await getSettingResult("warmingState");
+  assert.equal(out.ok, true);
+  assert.equal(out.status, "missing");
+  assert.equal(out.found, false);
+  assert.equal(out.value, null);
+});
+
+test("getSettingResult invalid_response when body lacks value field", async () => {
+  mockFetch(200, {});
+  const out = await getSettingResult("warmingConfig");
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "invalid_response");
+  assert.notEqual(out.status, "missing");
+  assert.equal(out.retryable, true);
+});
+
+test("getSettingResult invalid_response when body is null", async () => {
+  mockFetch(200, null);
+  const out = await getSettingResult("warmingConfig");
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "invalid_response");
+});
+
+test("getSettingResult unauthorized on 401 and auth handler still runs", async () => {
+  setToken("tok-expired");
+  let unauthorizedCalled = false;
+  onUnauthorized(() => {
+    unauthorizedCalled = true;
+  });
+  mockFetch(401, { error: "invalid token" });
+  const out = await getSettingResult("warmingConfig");
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "unauthorized");
+  assert.equal(out.httpStatus, 401);
+  assert.equal(out.retryable, false);
+  assert.equal(unauthorizedCalled, true);
+  assert.equal(getToken(), null);
+});
+
+test("getSettingResult account_inactive on 403 ACCOUNT_INACTIVE", async () => {
+  setToken("tok-locked");
+  let reason = "unset";
+  onUnauthorized((r) => {
+    reason = r;
+  });
+  mockFetch(403, { error: "locked", code: "ACCOUNT_INACTIVE", status: "locked" });
+  const out = await getSettingResult("warmingConfig");
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "account_inactive");
+  assert.equal(out.httpStatus, 403);
+  assert.equal(out.retryable, false);
+  assert.equal(reason, "locked");
+  assert.equal(getToken(), null);
+});
+
+test("getSettingResult forbidden on plain 403 does not clear token", async () => {
+  setToken("tok-forbidden");
+  let unauthorizedCalled = false;
+  onUnauthorized(() => {
+    unauthorizedCalled = true;
+  });
+  mockFetch(403, { error: "admin only" });
+  const out = await getSettingResult("warmingConfig");
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "forbidden");
+  assert.equal(out.httpStatus, 403);
+  assert.equal(unauthorizedCalled, false);
+  assert.equal(getToken(), "tok-forbidden");
+});
+
+test("getSettingResult invalid_request on 400", async () => {
+  mockFetch(400, { error: "invalid key" });
+  const out = await getSettingResult("bad key!!");
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "invalid_request");
+  assert.equal(out.httpStatus, 400);
+  assert.equal(out.retryable, false);
+});
+
+test("getSettingResult server_error on 500 is retryable", async () => {
+  mockFetch(500, { error: "boom" });
+  const out = await getSettingResult("warmingConfig");
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "server_error");
+  assert.equal(out.httpStatus, 500);
+  assert.equal(out.retryable, true);
+});
+
+test("getSettingResult network_error on fetch reject is retryable", async () => {
+  global.fetch = async () => {
+    throw new Error("network down");
+  };
+  const out = await getSettingResult("warmingConfig");
+  assert.equal(out.ok, false);
+  assert.equal(out.status, "network_error");
+  assert.equal(out.httpStatus, null);
+  assert.equal(out.retryable, true);
+});
+
+test("legacy getSetting still returns def for missing and failure", async () => {
+  mockFetch(200, { key: "uiPrefs", value: null });
+  assert.deepEqual(await getSetting("uiPrefs", { theme: "dark" }), { theme: "dark" });
+
+  mockFetch(500, { error: "boom" });
+  assert.deepEqual(await getSetting("crawlSettings", { safe: true }), { safe: true });
+
+  global.fetch = async () => {
+    throw new Error("offline");
+  };
+  assert.deepEqual(await getSetting("deletedPriceSeedIds", []), []);
 });

@@ -755,3 +755,398 @@ Phần warming hiện tại đã có nền tảng an toàn tương đối tốt:
 5. Báo cáo trung thực khi action không chạy hoặc không xác minh được.
 
 Các cải thiện trên giữ nguyên toàn bộ nhóm tính năng hiện có, nhưng làm cho hệ thống ít máy móc hơn, dễ kiểm soát hơn và đáng tin cậy hơn.
+
+---
+
+## 11. Rà soát kết nối Backend cho tính năng warming
+
+### 11.1. Kết luận kiến trúc đã kiểm tra
+
+Luồng kết nối thực tế:
+
+```text
+UI Tools.tsx
+  -> chrome.runtime message WARMING_*
+  -> src/background.js
+  -> src/crawl.js / src/db.js
+  -> src/api.js
+  -> Bearer token
+  -> server/web/server.js
+  -> authRequired
+  -> server/web/routes.js
+  -> MySQL
+```
+
+Các thành phần Backend cần thiết **đang tồn tại và được mount đúng**:
+
+- `server/web/server.js` mount `authRouter` tại `/api/auth`.
+- `server/web/server.js` mount `dataRouter` tại `/api` sau middleware `authRequired`.
+- `authRequired` cung cấp `req.userId` để cô lập dữ liệu theo tài khoản hệ thống.
+- Có route `GET`, `PUT`, `DELETE /api/settings/:key`.
+- Có route `POST`, `GET /api/warming/log`.
+- Migration có bảng `settings` với khóa chính `(user_id, key_name)`.
+- Migration có bảng `warming_activity_log`, foreign key theo `user_id` và index phục vụ truy vấn lịch sử.
+- Client `src/api.js` tự đính kèm `Authorization: Bearer <token>` và có cơ chế nạp token từ `chrome.storage.local`.
+
+Vì vậy, lỗi hiện tại không phải do thiếu route warming hoặc route chưa được mount. Lỗi chắc chắn nằm ở hợp đồng dữ liệu giữa lớp DB client, background message và UI.
+
+### 11.2. BUG-BE-01 — Response nhật ký bị bọc lồng hai lớp
+
+**Mức độ:** P0 — bug đã xác nhận.
+
+**Vị trí liên quan:**
+
+- `src/db.js`, hàm `getWarmingActivity`.
+- `src/background.js`, handler `GET_WARMING_ACTIVITY`.
+- `ui/src/views/Tools.tsx`, hàm `loadLog`.
+
+Backend trả đúng hợp đồng:
+
+```json
+{
+  "entries": [
+    {
+      "id": 1,
+      "type": "scrollFeed",
+      "status": "done",
+      "createdAt": 1710000000000,
+      "data": {}
+    }
+  ]
+}
+```
+
+`DB.getWarmingActivity()` trả nguyên object trên. Tuy nhiên background đang gán toàn bộ object vào biến `entries`, sau đó bọc thêm một lần:
+
+```js
+const entries = await DB.getWarmingActivity({ limit: msg.limit });
+sendResponse({ ok: true, entries });
+```
+
+Response thực tế gửi tới UI trở thành:
+
+```json
+{
+  "ok": true,
+  "entries": {
+    "entries": []
+  }
+}
+```
+
+Trong khi UI kiểm tra:
+
+```js
+Array.isArray(res.entries)
+```
+
+Kết quả luôn là `false` vì `res.entries` là object, không phải array.
+
+**Hậu quả:**
+
+- Nhật ký warming không hiển thị dù Backend đã lưu và trả dữ liệu.
+- Người dùng có cảm giác Backend không kết nối hoặc không ghi log.
+- Nút tải lại log không giải quyết được vấn đề.
+- Không có lỗi rõ ràng trên UI vì response vẫn có `ok: true`.
+
+**Hướng sửa (đã triển khai):**
+
+- Background lấy `result.entries` và chỉ gửi array tới UI.
+- Chuẩn hóa fallback thành array rỗng nếu response Backend không đúng shape.
+- Không đổi hợp đồng của `DB.getWarmingActivity()`, vì comment và route hiện đều thống nhất rằng hàm trả `{ entries: [...] }`.
+
+**Tiêu chí nghiệm thu sau khi sửa:**
+
+1. `GET /api/warming/log` trả `{ entries: [...] }`.
+2. `DB.getWarmingActivity()` vẫn trả `{ entries: [...] }`.
+3. Message `GET_WARMING_ACTIVITY` trả `{ ok: true, entries: [...] }`.
+4. `Array.isArray(res.entries)` ở UI bằng `true`.
+5. Log vừa ghi xuất hiện sau khi tải lại.
+
+### 11.3. RISK-BE-02 — JSON column chưa được chuẩn hóa nhất quán khi đọc
+
+**Mức độ:** P1 — rủi ro tương thích, chưa đủ bằng chứng để kết luận luôn xảy ra trên môi trường hiện tại.
+
+Trong `server/web/routes.js` đã có helper `parseJsonColumn` để xử lý trường hợp `mysql2` trả cột JSON dưới một trong hai dạng:
+
+- Object/array đã parse.
+- Chuỗi JSON thô.
+
+Helper này đang được dùng cho nhiều dữ liệu khác, nhưng chưa được dùng tại:
+
+- `GET /api/settings/:key`: trả trực tiếp `rows[0].value`.
+- `GET /api/warming/log`: trả trực tiếp `r.data`.
+
+Với cấu hình `mysql2` hiện tại, cột MySQL `JSON` thường được trả thành object và có thể hoạt động bình thường. Tuy nhiên việc phụ thuộc hoàn toàn vào hành vi driver làm hợp đồng response kém ổn định khi:
+
+- Đổi phiên bản driver.
+- Chạy qua DB proxy hoặc biến thể MySQL/MariaDB.
+- Schema cũ có column flavor khác.
+- Test dùng mock row chứa JSON dạng string.
+
+**Hậu quả tiềm ẩn:**
+
+- `warmingConfig` hoặc `warmingState` có thể trở thành chuỗi thay vì object.
+- `data` trong activity log có thể là chuỗi JSON, khiến UI hoặc code thống kê phải tự xử lý nhiều kiểu.
+- Config normalization nhận sai kiểu và quay về mặc định, tạo cảm giác cấu hình Backend không được lưu.
+
+**Hướng cải thiện (đã triển khai phần normalize + test round-trip):**
+
+- Dùng `parseJsonColumn(rows[0].value)` ở settings GET.
+- Dùng `parseJsonColumn(r.data) ?? {}` ở warming log GET.
+- Thêm test round-trip object lồng nhau, array, boolean, số `0` và `null`.
+
+### 11.4. RISK-BE-03 — Validation key settings không đồng nhất giữa các method
+
+**Mức độ:** P2 — hardening/API consistency.
+
+`PUT /api/settings/:key` kiểm tra key bằng `SETTING_KEY_RE`, nhưng `GET` và `DELETE` không áp dụng cùng validation.
+
+Trong luồng warming bình thường, các key `warmingConfig` và `warmingState` đều hợp lệ nên đây không phải nguyên nhân trực tiếp gây lỗi hiện tại. Tuy nhiên API đang có hành vi không đồng nhất:
+
+- PUT key sai trả `400`.
+- GET key sai vẫn query DB.
+- DELETE key sai vẫn query DB.
+
+Query vẫn dùng named placeholder nên không thấy dấu hiệu SQL injection từ điểm này. Vấn đề chính là tính nhất quán, log rác và khả năng client hiểu sai response.
+
+**Hướng cải thiện (đã triển khai):**
+
+- Dùng chung helper `rejectInvalidSettingKey` cho GET, PUT và DELETE.
+- Trả cùng cấu trúc lỗi `400 { error: "invalid key", message: ... }`.
+
+### 11.5. RISK-BE-04 — Phân biệt “setting chưa tồn tại” với lỗi Backend/client
+
+**Mức độ:** P1 — tính đúng đắn của automation, khả năng quan sát và chẩn đoán.
+
+#### 11.5.1. Vấn đề chính xác nằm ở đâu
+
+Backend hiện **đã phân biệt được** setting chưa tồn tại với request thất bại:
+
+- `GET /api/settings/:key` thành công nhưng chưa có row trả HTTP `200` với `{ key, value: null }`.
+- HTTP `4xx/5xx` làm `apiFetch()` ném lỗi `Error("API <status>: ...")`.
+- Lỗi DNS, mất mạng, Backend không chạy hoặc `fetch()` bị reject được truyền lên dưới dạng exception.
+- HTTP `401` có token và `403 ACCOUNT_INACTIVE` còn kích hoạt xử lý phiên toàn cục: xóa token và gọi `unauthorizedHandler`, sau đó vẫn ném lỗi cho caller.
+
+Điểm làm mất thông tin là lớp tiện ích `DB.getSetting(key, def)`:
+
+```js
+async function getSetting(key, def = null) {
+  try {
+    const r = await apiFetch("/api/settings/" + encodeURIComponent(key));
+    return r && "value" in r && r.value != null ? r.value : def;
+  } catch (e) {
+    return def;
+  }
+}
+```
+
+Hàm này trả cùng một `def` cho cả ba nhóm khác nhau:
+
+1. Response hợp lệ và setting chưa tồn tại: `{ value: null }`.
+2. Response HTTP `200` nhưng sai hợp đồng, ví dụ body rỗng, không có field `value`, hoặc body không phải object.
+3. Request thật sự thất bại: auth, mạng, timeout ở tầng gọi, HTTP `4xx/5xx`, Backend/DB lỗi.
+
+Vì vậy lớp gọi phía trên không còn biết giá trị đang dùng là dữ liệu server, default hợp lệ cho key mới, hay fallback do hệ thống lỗi. Test hiện tại còn chủ động khóa hành vi này để UI khởi tạo không bị throw khi Backend lỗi, nên đổi trực tiếp `getSetting()` thành hàm strict sẽ là thay đổi tương thích rộng, không chỉ riêng warming.
+
+#### 11.5.2. Taxonomy lỗi cần chuẩn hóa
+
+API đọc setting có cấu trúc cần phân loại tối thiểu các outcome sau:
+
+| Outcome | Tín hiệu hiện tại | Ý nghĩa | Retry | Hành vi warming đề xuất |
+|---|---|---|---|---|
+| `found` | HTTP `200`, có `value` khác `null` | Có dữ liệu đã lưu | Không | Normalize và dùng dữ liệu |
+| `missing` | HTTP `200`, có `value: null` | Key chưa từng lưu hoặc đã xóa | Không | Dùng default/khởi tạo state mới; không báo lỗi |
+| `unauthorized` | HTTP `401` | Chưa đăng nhập, token hết hạn hoặc token không hợp lệ | Sau khi đăng nhập lại | Không chạy; để auth handler yêu cầu đăng nhập |
+| `account_inactive` | HTTP `403`, `code: ACCOUNT_INACTIVE` | Tài khoản pending/locked/inactive | Không retry nền | Không chạy; hiển thị lý do tài khoản |
+| `forbidden` | HTTP `403` khác `ACCOUNT_INACTIVE` | Không đủ quyền, không phải lỗi phiên toàn cục | Thường không | Không chạy; ghi chẩn đoán quyền |
+| `invalid_request` | HTTP `400/404/422` | Key/request không hợp lệ hoặc client/server lệch route | Không retry tự động | Không chạy; ghi contract/client error |
+| `network_error` | `fetch()` reject, DNS, connection refused, offline | Không kết nối được Backend | Có | Hoãn session và retry có backoff |
+| `server_error` | HTTP `5xx` | Backend, DB hoặc dependency lỗi | Có | Hoãn session và retry có backoff |
+| `invalid_response` | HTTP `2xx` nhưng body/shape không hợp lệ | Vi phạm hợp đồng response | Có giới hạn | Không chạy; ghi telemetry mức warning/error |
+
+Lưu ý: `apiFetch()` hiện parse JSON theo kiểu best-effort và trả `null` nếu parse thất bại. Do đó response `2xx` rỗng hoặc JSON hỏng không ném lỗi; lớp settings có cấu trúc phải tự kiểm tra body là object và có own field `value`, nếu không phải trả `invalid_response`, tuyệt đối không coi là `missing`.
+
+#### 11.5.3. Ảnh hưởng thực tế tới warming
+
+`getWarmingConfig()` hiện lấy `(await DB.getSetting("warmingConfig")) || {}` rồi normalize. Default của `warmingConfig` có `enabled: false`. Khi Backend lỗi, auto warming vì thế có thể trả “Nuôi tài khoản đang tắt”, dù người dùng đã bật tính năng trên server. Đây là **false disabled**, không phải trạng thái cấu hình thật.
+
+`getWarmingState()` cũng lấy fallback `{}` rồi roll thành state mới. Nếu Backend lỗi, client có thể tạm quên:
+
+- `sessionsToday` đã dùng.
+- `writeCountToday` đã dùng.
+- `lastSessionAt` phục vụ khoảng nghỉ tối thiểu.
+- `lastWriteAt` phục vụ cooldown hành động ghi.
+- `recentActions` phục vụ giảm lặp hành vi.
+
+Hậu quả nghiêm trọng hơn việc UI hiển thị default: automation có thể ra quyết định quota/cooldown từ state thiếu dữ liệu, đặc biệt khi nhiều thiết bị dùng cùng tài khoản. Ngoài warming, cùng rủi ro còn xuất hiện ở account binding, auto crawl/sync, reply watch, selectors và deleted price seeds.
+
+Lớp message cũng đang che lỗi: `GET_SETTING` và `GET_WARMING_CONFIG` có thể trả `{ ok: true, ...default }` sau khi `getSetting()` đã nuốt exception. Nhánh `.catch()` ở background gần như không nhận được lỗi đọc Backend từ hàm legacy này.
+
+#### 11.5.4. Hợp đồng client đề xuất — thêm API có cấu trúc, không phá API cũ
+
+Không nên đổi ngay semantics của `getSetting(key, def)`. Nên thêm một primitive mới, ví dụ `getSettingResult(key)`, với discriminated result:
+
+```js
+// Có setting.
+{ ok: true, status: "found", found: true, value }
+
+// Chưa có setting; đây là kết quả hợp lệ, không phải lỗi.
+{ ok: true, status: "missing", found: false, value: null }
+
+// Request/response thất bại.
+{
+  ok: false,
+  status: "network_error", // hoặc taxonomy ở trên
+  httpStatus: null,
+  retryable: true,
+  message: "Không kết nối được Backend"
+}
+```
+
+Yêu cầu đối với primitive mới:
+
+- Chỉ trả `missing` khi response là HTTP `2xx`, body là object, có own field `value`, và `value === null`.
+- Giữ nguyên mọi side effect auth hiện có của `apiFetch()`; lớp phân loại không được ngăn xóa token hoặc `unauthorizedHandler`.
+- Không phân loại bằng cách parse chuỗi `Error.message` nếu có thể tránh. Nên mở rộng lỗi từ API client bằng metadata ổn định như `kind`, `status`, `code`, `retryable` và response body đã lọc.
+- Không đưa JWT, toàn bộ response body, stack trace hoặc giá trị setting nhạy cảm vào telemetry/UI.
+- `getSetting(key, def)` tiếp tục tồn tại như compatibility wrapper cho màn hình không critical: gọi API có cấu trúc, trả value khi `found`, còn `missing` hoặc failure thì trả `def`.
+- Caller critical như warming phải dùng API có cấu trúc hoặc một wrapper strict; không được dùng legacy fallback.
+
+#### 11.5.5. Chính sách fail-safe riêng cho warming
+
+| Luồng | `found` | `missing` | Auth/account lỗi | Network/`5xx` | Invalid response |
+|---|---|---|---|---|---|
+| Đọc `warmingConfig` | Dùng config server | Dùng default `enabled: false` | Không chạy | Không chạy, trả `deferred` | Không chạy, trả `deferred` |
+| Đọc `warmingState` | Dùng state server | Khởi tạo state mới | Không chạy | Không chạy, trả `deferred` | Không chạy, trả `deferred` |
+| Hiển thị UI | Hiển thị dữ liệu | Hiển thị default/chưa cấu hình | Hiển thị trạng thái auth | Có thể hiển thị cache/default kèm cảnh báo stale | Hiển thị cảnh báo contract |
+
+Các nguyên tắc bắt buộc:
+
+- Auto session chỉ bắt đầu sau khi xác nhận được cả config và state là `found` hoặc `missing` hợp lệ.
+- Lỗi đọc config không được chuyển thành thông báo “warming đang tắt”.
+- Lỗi đọc state không được tạo state mới rồi tiếp tục session.
+- Manual run cũng không được bỏ qua lỗi state/quota. `manual` chỉ bỏ qua cờ `enabled` theo thiết kế hiện tại, không được bỏ qua yêu cầu xác nhận policy/state.
+- Kết quả hoãn nên có shape ổn định, ví dụ `{ ok: false, deferred: true, code: "SETTINGS_NETWORK_ERROR", retryable: true }` để scheduler và UI không hiểu nhầm là disabled/blocked.
+- Retry dùng bounded exponential backoff có jitter; không tạo vòng lặp alarm dày khi Backend đang down.
+- Nếu muốn UI vẫn mở được khi offline, có thể hiển thị cache/default nhưng phải đánh dấu `source: "cache" | "default"` và `stale: true`; dữ liệu đó không đủ điều kiện cho automation critical.
+
+#### 11.5.6. Telemetry tối thiểu và giới hạn riêng tư
+
+Mỗi lần fallback/hoãn nên phát một event đã chuẩn hóa, ví dụ:
+
+```js
+{
+  subsystem: "warming",
+  operation: "getSetting",
+  key: "warmingState",
+  outcome: "network_error",
+  httpStatus: null,
+  retryable: true,
+  automatic: true,
+  at: Date.now()
+}
+```
+
+Nên bổ sung `requestId`/correlation ID nếu Backend hỗ trợ, số lần retry và nguồn dữ liệu (`server`, `cache`, `default`). Không log JWT, cookie Facebook, nội dung setting, raw response body hoặc dữ liệu nhận dạng không cần thiết. Cần chống spam bằng dedupe/rate limit theo `operation + key + outcome`.
+
+#### 11.5.7. Kế hoạch migration
+
+1. Mở rộng API error thành lỗi có metadata ổn định, vẫn giữ behavior auth hiện tại.
+2. Thêm `getSettingResult()` và unit test đầy đủ taxonomy/shape validation.
+3. Giữ `getSetting()` làm compatibility wrapper để không phá UI và caller hiện tại.
+4. Chuyển `warmingConfig` và `warmingState` sang structured read trước; đây là consumer ưu tiên cao nhất.
+5. Truyền outcome qua background message để UI phân biệt `missing`, `stale`, auth và Backend unavailable.
+6. Thêm telemetry có redaction, dedupe và bounded retention.
+7. Sau warming, đánh giá lần lượt account binding, auto crawl/sync, reply watch, selectors và price seed state.
+
+#### 11.5.8. Regression test bắt buộc khi triển khai
+
+1. HTTP `200 { value: object }` → `found` và giữ nguyên value.
+2. HTTP `200 { value: null }` → `missing`, không telemetry lỗi.
+3. HTTP `200 {}`, body `null`, JSON hỏng hoặc body sai kiểu → `invalid_response`, không phải `missing`.
+4. HTTP `401` → `unauthorized`, đồng thời token/auth handler vẫn hoạt động đúng.
+5. HTTP `403 ACCOUNT_INACTIVE` → `account_inactive` cùng reason `locked`/`pending`/`inactive`.
+6. Plain HTTP `403` → `forbidden`, không xóa token.
+7. HTTP `400/404/422` → `invalid_request`; HTTP `5xx` → `server_error` và retryable.
+8. `fetch()` reject/offline → `network_error` và retryable.
+9. Legacy `getSetting(key, def)` vẫn trả `def` cho missing/failure để giữ tương thích.
+10. Auto warming không chạy action khi config hoặc state gặp network/`5xx`/invalid response.
+11. Missing config dùng default disabled; missing state khởi tạo mới; hai trường hợp này không bị ghi thành lỗi Backend.
+12. Background/UI nhận được trạng thái structured và không trả `ok: true` giả cho lỗi critical.
+
+#### 11.5.9. Acceptance criteria
+
+RISK-BE-04 chỉ được coi là đã xử lý khi:
+
+- Client phân biệt chắc chắn `missing` với auth, network, server và invalid response.
+- Warming không chạy từ state fallback khi chưa xác nhận được dữ liệu server.
+- UI vẫn có thể khởi tạo an toàn theo policy fallback đã định, nhưng phải cho biết dữ liệu là default/cache/stale khi Backend lỗi.
+- Global auth behavior không bị regression.
+- Telemetry đủ để trả lời “setting chưa có hay Backend đang lỗi” mà không lộ dữ liệu nhạy cảm.
+- Các test taxonomy, compatibility và warming fail-safe ở trên đều pass.
+
+**Trạng thái hiện tại:** **đã triển khai runtime (client)** theo migration plan §11.5.7 bước 1–7 (practical):
+
+- `ApiError` metadata (`kind`, `status`, `code`, `retryable`, `reason`, `body`) trong [`src/api.js`](src/api.js).
+- [`getSettingResult(key)`](src/db.js) taxonomy đầy đủ; [`getSetting()`](src/db.js) giữ làm compatibility wrapper.
+- Warming structured loaders: [`getWarmingConfigResult()`](src/crawl.js) / [`getWarmingStateResult()`](src/crawl.js); [`processWarming()`](src/crawl.js) fail-closed/`deferred` khi Backend lỗi; missing vẫn là default/disabled hợp lệ.
+- Background [`GET_WARMING_CONFIG`](src/background.js) trả `ok`/`source`/`stale`/`status`/`found`/`retryable` + `nextRunAt`/`delayMinutes`/`state`.
+- UI Tools: banner stale/default; hiển thị `nextRunAt`, write caps, quiet hours, risk summary; binding status trước manual run (soft confirm khi mismatch).
+- **Bước 6 — client telemetry:** [`src/client-telemetry.js`](src/client-telemetry.js) (redact / dedupe / max events+age / storage.local + memory fallback); wiring defer/fail events từ warming + autoCrawl/autoSync/watch; background `GET_TELEMETRY` / `CLEAR_TELEMETRY`.
+- **Bước 7 — structured non-warming reads:** [`getAutoCrawlConfigResult`](src/crawl.js) / [`getAutoSyncConfigResult`](src/crawl.js) / [`getWatchConfigResult`](src/crawl.js); process paths defer + telemetry khi fail (không coi là “đã tắt”); [`getBindingResult`](src/fb-identity.js) server-first + cache stale fallback.
+- Quiet hours + risk throttle cấu hình được trong [`src/warming-policy.js`](src/warming-policy.js) (`quietHoursStart`/`End`, `riskFailThreshold`/`riskBackoffMultiplier`, `computeRiskLevel` / `applyRiskToWarmingState`).
+- Regression tests: [`test/api-error.test.js`](test/api-error.test.js), [`test/db-settings.test.js`](test/db-settings.test.js), [`test/warming-settings-failsafe.test.js`](test/warming-settings-failsafe.test.js), [`test/client-telemetry.test.js`](test/client-telemetry.test.js), [`test/structured-settings-read.test.js`](test/structured-settings-read.test.js), quiet/risk cases trong [`test/warming-policy.test.js`](test/warming-policy.test.js).
+
+**Còn lại / deferred (không chặn practical acceptance):** kiến trúc Phase 3–4 (tách module warming executor lớn), selectors structured-read (nếu còn consumer riêng), polish `initAutoCrawl`/`initReplyWatch` vẫn dùng compatibility wrapper (process path đã structured).
+
+### 11.6. RISK-BE-05 — Chưa có regression test cho hợp đồng warming xuyên suốt
+
+**Mức độ:** P1.
+
+Các test hiện có đã kiểm tra client settings, nhưng chưa có test chuyên biệt cho:
+
+- Payload của `recordWarmingActivity`.
+- Query string và response của `getWarmingActivity`.
+- Shape message `GET_WARMING_ACTIVITY` từ background tới UI.
+- Settings `warmingConfig`/`warmingState` round-trip qua MySQL.
+- Warming log POST rồi GET.
+- Cô lập log giữa hai user.
+- Thứ tự mới nhất trước và giới hạn `limit`.
+- Kiểu dữ liệu JSON của `value` và `data`.
+
+Đây là lý do bug bọc lồng `entries` có thể tồn tại dù từng lớp riêng lẻ trông đúng.
+
+**Test (đã triển khai):**
+
+1. Client test xác nhận `recordWarmingActivity` gửi đúng method/body/token — `test/db-warming.test.js`.
+2. Client test xác nhận `getWarmingActivity({ limit: 30 })` gọi đúng URL và giữ response `{ entries }` — `test/db-warming.test.js`.
+3. Background contract test xác nhận UI nhận `entries` là array, không phải object lồng — `test/db-warming.test.js`.
+4. Backend integration test xác nhận route yêu cầu authentication — `server/web/test/warming-settings-routes.test.js`.
+5. Settings round-trip giữ nguyên object lồng và các giá trị `0`, `false`, `null` — cùng file backend test.
+6. Warming log round-trip giữ nguyên `type`, `status`, `createdAt` và `data` — cùng file backend test.
+7. User B không đọc được log hoặc settings của user A — cùng file backend test.
+8. `limit` được clamp và kết quả được sắp xếp mới nhất trước — cùng file backend test.
+
+> Ghi chú: integration test backend sẽ `skip` khi MySQL không reachable, giống các test data-routes khác.
+
+### 11.7. Thứ tự ưu tiên xử lý Backend đề xuất
+
+1. **P0:** sửa shape message `GET_WARMING_ACTIVITY` để UI nhận array.
+2. **P1:** bổ sung test hợp đồng background → UI cho activity log.
+3. **P1:** chuẩn hóa JSON column khi đọc settings và warming log.
+4. **P1:** phân biệt lỗi Backend với settings chưa tồn tại.
+5. **P1:** thêm integration test round-trip và per-user isolation.
+6. **P2:** đồng nhất validation settings key ở GET/PUT/DELETE.
+
+### 11.8. Kết luận riêng về kết nối Backend
+
+Kết nối warming tới Backend không bị thiếu endpoint và không bị sai mount. Authentication, schema và route nền tảng đều đã có. Bug chắc chắn gây biểu hiện “không thấy dữ liệu Backend” là response activity log bị background bọc lồng hai lớp trước khi gửi tới UI.
+
+**Trạng thái sau triển khai theo §11.7 + practical leftover:**
+
+- **Đã sửa:** BUG-BE-01 (unwrap `entries` trong background).
+- **Đã sửa:** RISK-BE-02 (parse JSON column cho settings GET + warming log GET).
+- **Đã sửa:** RISK-BE-03 (validate key đồng nhất GET/PUT/DELETE).
+- **Đã thêm test:** RISK-BE-05 (client + backend regression).
+- **Đã triển khai runtime RISK-BE-04 (đủ practical):** `ApiError` + `getSettingResult`, warming fail-safe deferred, background/UI stale signaling; **client telemetry** (redact/dedupe/retention); **structured-read** autoCrawl/autoSync/watch/binding; quiet hours + risk throttle cấu hình được; UI nextRunAt / write caps / binding banner; tests telemetry + structured non-warming. Phase 3–4 module split và selectors structured-read vẫn deferred.
