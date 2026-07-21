@@ -825,16 +825,13 @@ async function crawlGroupApiTabless(groupId, options) {
 
 /* ----------------------- QUÉT NHÓM ĐÃ THAM GIA -------------------------- */
 
-/** Hàm tự-chứa chạy trong trang "Nhóm của bạn" để thu thập (groupId, groupName).
- * `opts` chỉ phục vụ kiểm thử; khi inject vào Facebook hàm được gọi không đối số. */
-export async function scanJoinedGroupsInPage(opts = {}) {
+/** Hàm tự-chứa chạy trong trang "Nhóm của bạn" để thu thập (groupId, groupName). */
+async function scanJoinedGroupsInPage() {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const scrollRounds = Number.isFinite(opts.scrollRounds) ? opts.scrollRounds : 10;
-  const scrollDelayMs = Number.isFinite(opts.scrollDelayMs) ? opts.scrollDelayMs : 800;
   // Cuộn để tải hết danh sách nhóm.
-  for (let i = 0; i < scrollRounds; i++) {
+  for (let i = 0; i < 10; i++) {
     window.scrollTo(0, document.body.scrollHeight);
-    await sleep(scrollDelayMs);
+    await sleep(800);
   }
   const RESERVED = new Set([
     "joins", "feed", "discover", "create", "your_groups", "category", "search", "notifications",
@@ -854,151 +851,27 @@ export async function scanJoinedGroupsInPage(opts = {}) {
     "đã trả lời",
     "đã thích",
     "bài viết của bạn",
-    "Giờ bạn có thể đăng bài",
-    "kết nối với các thành viên khác",
-    "Now you can post",
-    "connect with other members",
   ];
-  // Trang /groups/joins có thể chứa cả nhóm được đề xuất. Kiểm tra action thật
-  // (text/aria-label của button), không chỉ textContent của link.
-  const JOIN_ACTION_RE = /(?:tham\s+gia(?:\s+nhóm)?|join\s+group|request\s+to\s+join)/i;
-  const NOTIFICATION_ACTION_RE = /^(?:đánh\s+dấu\s+là\s+đã\s+đọc|mark\s+as\s+read|chưa\s+đọc|unread)\b/i;
-  const POST_PREVIEW_RE = /:\s*["“”'‘’].+(?:["“”'‘’]|…|\.\.\.)?\s*$/;
-  const GENERIC_LINK_RE = /^(?:truy\s+cập|xem|mở|visit|view|open)\s+(?:nhóm|group)\s*/i;
-
-  // Làm sạch MỌI dạng label Facebook đang dùng. Không phụ thuộc tên nhóm cụ thể.
+  // Làm sạch tên nhóm: bỏ tiền tố "Chưa đọc", cắt phần phụ đề hoạt động, bỏ mốc thời gian ở đuôi.
   const cleanName = (raw) => {
-    let s = String(raw || "").replace(/\s+/g, " ").trim();
+    let s = (raw || "").trim();
     if (!s) return "";
     s = s.replace(/^Chưa đọc\s*/i, "").trim();
-    s = s.replace(GENERIC_LINK_RE, "").trim();
-
-    // Dạng thông báo bài mới: tên nằm sau "bạn truy cập vào nhóm".
-    const visitMatch = /(?:từ\s+)?lần(?:\s+gần\s+đây)?\s+nhất\s+bạn\s+truy\s+cập(?:\s+vào)?\s+nhóm\s+/i.exec(s);
-    if (visitMatch && /bài\s+viết\s+mới/i.test(s.slice(0, visitMatch.index))) {
-      s = s.slice(visitMatch.index + visitMatch[0].length).trim();
-    }
-
-    // Dạng thẻ chào mừng thành viên mới:
-    // "Chào mừng bạn đến với TÊN NHÓM Giờ bạn có thể đăng bài, ...".
-    const welcome = /^(?:chào\s+mừng\s+bạn\s+đến\s+với|welcome\s+to)\s+(.+?)(?=\s+(?:giờ\s+bạn\s+có\s+thể|now\s+you\s+can)\b|$)/i.exec(s);
-    if (welcome) s = welcome[1].trim();
-
     let cut = s.length;
-    const lower = s.toLocaleLowerCase("vi");
     for (const mk of NOISE_MARKERS) {
-      const idx = lower.indexOf(mk.toLocaleLowerCase("vi"));
+      const idx = s.indexOf(mk);
       if (idx >= 0 && idx < cut) cut = idx;
     }
     s = s.slice(0, cut).trim();
     // Bỏ mốc thời gian tương đối ở đuôi, vd ".3 giờ", ".41 phút", "1 tuần".
     s = s.replace(/[.\s]*\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm)(\s*trước)?$/i, "").trim();
-    // Bỏ dấu câu thừa do phần phụ đề bị cắt; giữ dấu hợp lệ bên trong tên.
-    s = s.replace(/[:.\-–—\s]+$/, "").trim();
+    // Bỏ dấu câu thừa ở đuôi.
+    s = s.replace(/[:.\-\s]+$/, "").trim();
     return s;
-  };
-
-  const isJoinSuggestion = (a) => {
-    let scope = a;
-    for (let depth = 0; depth < 8 && scope; depth++, scope = scope.parentElement) {
-      const ownLabel = [
-        scope.getAttribute && scope.getAttribute("aria-label"),
-        scope.getAttribute && scope.getAttribute("title"),
-      ].filter(Boolean).join(" ");
-      if (JOIN_ACTION_RE.test(ownLabel)) return true;
-
-      // Dừng trước khi đọc action của một container chung chứa nhiều card; nếu
-      // không, nút "Tham gia nhóm" của card khác sẽ làm loại nhầm nhóm đã tham gia.
-      if (
-        scope !== a &&
-        scope.querySelectorAll &&
-        scope.querySelectorAll('a[href*="/groups/"]').length > 3
-      ) break;
-
-      if (scope.querySelectorAll) {
-        const actions = scope.querySelectorAll('button,[role="button"]');
-        for (const action of actions) {
-          const label = [
-            action.innerText,
-            action.textContent,
-            action.getAttribute && action.getAttribute("aria-label"),
-            action.getAttribute && action.getAttribute("title"),
-          ].filter(Boolean).join(" ");
-          if (JOIN_ACTION_RE.test(label)) return true;
-        }
-      }
-    }
-    return false;
-  };
-
-  const nameCandidates = (a) => {
-    const out = [];
-    const seen = new Set();
-    const linkLabel = [
-      a.getAttribute && a.getAttribute("aria-label"),
-      a.getAttribute && a.getAttribute("title"),
-    ].filter(Boolean).join(" ");
-    const linkIsNotification = NOTIFICATION_ACTION_RE.test(linkLabel);
-    const push = (value, priority, allowKnownNotificationFormat = false) => {
-      const raw = String(value || "").replace(/\s+/g, " ").trim();
-      if (!raw) return;
-
-      // aria-label/textContent của card thông báo thường là một câu hành động +
-      // tên nhóm + preview bài viết. Đây không phải node tên nhóm và tuyệt đối
-      // không được thắng heading/title chỉ chứa tên.
-      const isNotificationLabel = NOTIFICATION_ACTION_RE.test(raw) || POST_PREVIEW_RE.test(raw);
-      const hasKnownExtractableFormat =
-        /bài\s+viết\s+mới[\s\S]*bạn\s+truy\s+cập(?:\s+vào)?\s+nhóm\s+/i.test(raw) ||
-        /^(?:chào\s+mừng\s+bạn\s+đến\s+với|welcome\s+to)\s+/i.test(raw);
-      if (isNotificationLabel && !(allowKnownNotificationFormat && hasKnownExtractableFormat)) return;
-
-      const name = cleanName(raw);
-      if (
-        !name ||
-        name.length < 2 ||
-        name.length >= 160 ||
-        /^https?:/i.test(name) ||
-        NOTIFICATION_ACTION_RE.test(name) ||
-        POST_PREVIEW_RE.test(name) ||
-        seen.has(name)
-      ) return;
-
-      seen.add(name);
-      // Chuỗi bị ellipsis là nhãn hiển thị đã cắt; chỉ dùng khi không có nguồn đầy đủ.
-      const truncated = /(?:\.\.\.|…)$/.test(name);
-      out.push({ name, score: priority - (truncated ? 100 : 0) });
-    };
-
-    // Nguồn semantic nằm bên trong link/card là nguồn chính. Facebook thường đặt
-    // riêng tên nhóm trong heading, còn aria-label của chính link có thể chứa cả
-    // trạng thái đọc và preview bài viết.
-    if (a.querySelectorAll) {
-      for (const el of a.querySelectorAll('h1,h2,h3,h4,[role="heading"],[title],[aria-label]')) {
-        push(el.innerText || el.textContent, 500);
-        push(el.getAttribute && el.getAttribute("title"), 480);
-        push(el.getAttribute && el.getAttribute("aria-label"), 460);
-      }
-    }
-
-    // title/aria-label của link chỉ được dùng nếu không mang cấu trúc notification.
-    push(a.getAttribute && a.getAttribute("title"), 400);
-    push(a.getAttribute && a.getAttribute("aria-label"), 380);
-    // Text toàn link là fallback cuối cho layout cũ. Khi chính link có nhãn action
-    // notification, không dùng text này vì preview có thể không có ngoặc kép; chỉ
-    // các định dạng cũ có quy tắc tách tên rõ ràng mới được phép đi qua.
-    const wholeLinkText = a.innerText || a.textContent;
-    const hasKnownWholeLinkFormat =
-      /bài\s+viết\s+mới[\s\S]*bạn\s+truy\s+cập(?:\s+vào)?\s+nhóm\s+/i.test(String(wholeLinkText || "")) ||
-      /^(?:chào\s+mừng\s+bạn\s+đến\s+với|welcome\s+to)\s+/i.test(String(wholeLinkText || "").trim());
-    if (!linkIsNotification || hasKnownWholeLinkFormat) {
-      push(wholeLinkText, 200, true);
-    }
-    return out.sort((x, y) => y.score - x.score);
   };
   const map = {};
   document.querySelectorAll('a[href*="/groups/"]').forEach((a) => {
     const href = a.href || "";
-    if (isJoinSuggestion(a)) return;
     const path = href.split(/[?#]/)[0];
     const m = path.match(/\/groups\/([^/]+)(\/[^?#]*)?$/);
     if (!m) return;
@@ -1007,154 +880,28 @@ export async function scanJoinedGroupsInPage(opts = {}) {
     // Bỏ qua link trỏ tới bài viết/thông báo cụ thể (vd /groups/{id}/posts/...).
     const rest = (m[2] || "").replace(/^\/+|\/+$/g, "");
     if (rest && POST_SEGMENTS.has(rest.split("/")[0])) return;
-    const best = nameCandidates(a)[0];
-    if (best && !map[id]) map[id] = best.name;
+    const name = cleanName(a.textContent || "");
+    if (
+      name &&
+      name.length > 1 &&
+      name.length < 120 &&
+      !/^https?:/i.test(name) &&
+      !NOISE_MARKERS.some((mk) => name.includes(mk)) &&
+      !map[id]
+    ) {
+      map[id] = name;
+    }
   });
   return Object.keys(map).map((id) => ({ groupId: id, groupName: map[id] }));
 }
 
-/** Dùng chung đúng một Promise cho mọi caller trong khi tác vụ còn đang chạy. */
-function runSingleFlight(getInFlight, setInFlight, operation) {
-  const current = getInFlight();
-  if (current) return current;
-
-  let promise;
-  try {
-    promise = Promise.resolve(operation());
-  } catch (error) {
-    promise = Promise.reject(error);
-  }
-  setInFlight(promise);
-  promise.then(
-    () => {
-      if (getInFlight() === promise) setInFlight(null);
-    },
-    () => {
-      if (getInFlight() === promise) setInFlight(null);
-    },
-  );
-  return promise;
-}
-
-let joinedGroupsScanInFlight = null;
-
-function formatJoinedGroupsDiagnostic(diagnostic = {}) {
-  const list = (value, fallback = "-") => {
-    const values = Array.isArray(value)
-      ? value.map((item) => String(item || "").trim()).filter(Boolean)
-      : [];
-    return values.length ? values.slice(0, 24).join(",") : fallback;
-  };
-
-  return [
-    `friendly=${diagnostic.friendly || "-"}`,
-    `reason=${diagnostic.reason || "-"}`,
-    `requests=${Number(diagnostic.capturedRequests) || 0}`,
-    `chunks=${Number(diagnostic.capturedChunks) || 0}`,
-    `connections=${Number(diagnostic.candidateConnections) || 0}`,
-    `selected=${diagnostic.selectedConnection || "-"}`,
-    `path=${diagnostic.selectedPath || "-"}`,
-    `pageInfo=${diagnostic.hasPageInfo === true ? "yes" : "no"}`,
-    `next=${typeof diagnostic.hasNextPage === "boolean" ? String(diagnostic.hasNextPage) : "null"}`,
-    `top=${list(diagnostic.topLevelKeys)}`,
-    `objects=${list(diagnostic.objectPaths)}`,
-    `hookSeen=${Number(diagnostic.hookSeen) || 0}`,
-    // This includes route-fallback inspection traffic; it is not proof of an
-    // authoritative joined-groups operation, so label it as candidates.
-    `hookCandidates=${Number(diagnostic.hookJoinedGroupsSeen) || 0}`,
-    `observed=${list(diagnostic.hookFriendlyNames)}`,
-  ].join("; ");
-}
-
-function isTrustedJoinedGroupsSnapshot(api) {
-  return !!(
-    api &&
-    api.ok &&
-    api.trusted &&
-    api.complete === true &&
-    Array.isArray(api.groups)
-  );
-}
-
-/**
- * Trang joined-groups phải foreground để Facebook Comet chạy lazy page-data.
- * Không dùng preference focusTabs tại đây: khác feed đã có replay template,
- * joined-groups chưa có khuôn an toàn để seed khi tab nền bị throttle.
- */
-function openJoinedGroupsTab(url) {
-  return new Promise((resolve) => chrome.tabs.create({ url, active: true }, resolve));
-}
-
-/** Mở trang "Nhóm của bạn", ưu tiên GraphQL; DOM chỉ là fallback không phá dữ liệu. */
-async function scanJoinedGroupsOnce() {
+/** Mở trang "Nhóm của bạn", quét rồi lưu danh sách nhóm vào IndexedDB. */
+async function scanJoinedGroups() {
   const url = "https://www.facebook.com/groups/joins/";
-  const tab = await openJoinedGroupsTab(url);
+  const active = await shouldFocusTabs();
+  const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
   await waitTabComplete(tab.id, 30000);
-  await sleep(1800);
-
-  // GraphQL là nguồn chính: id/tên lấy từ Group node trong joined connection,
-  // không đọc notification text hoặc card đề xuất trong DOM.
-  try {
-    const api = await chrome.tabs.sendMessage(tab.id, {
-      type: "GET_JOINED_GROUPS_API",
-      timeoutMs: 12000,
-    });
-    if (api && Array.isArray(api.groups)) {
-      // Chỉ response đã đi tới page_info.has_next_page=false mới được phép xóa
-      // membership cũ. Query nhận diện đúng nhưng thiếu/trễ pagination phải fail-safe.
-      // Danh sách rỗng vẫn là snapshot hợp lệ: tài khoản có thể đã rời mọi nhóm.
-      if (isTrustedJoinedGroupsSnapshot(api)) {
-        const saved = await DB.saveGroups(api.groups, { replace: true });
-        return {
-          ok: true,
-          source: "graphql",
-          scanned: api.groups.length,
-          added: saved.added,
-          updated: saved.updated,
-          removed: saved.removed,
-        };
-      }
-
-      // GraphQL đã được nhận diện nhưng chưa đủ bằng chứng hoàn tất: không được
-      // rơi xuống DOM rồi upsert, vì như vậy sẽ che giấu lỗi pagination và khiến
-      // UI báo thành công giả. Chỉ fallback DOM khi GraphQL hoàn toàn không bắt.
-      if (api.friendly || api.reason || Number(api.hookSeen) > 0) {
-        const diagnostic = {
-          friendly: api.friendly,
-          reason: api.reason,
-          complete: api.complete === true,
-          pages: api.pages || 0,
-          capturedRequests: api.capturedRequests || 0,
-          capturedChunks: api.capturedChunks || 0,
-          candidateConnections: api.candidateConnections || 0,
-          selectedConnection: api.selectedConnection || "",
-          selectedPath: api.selectedPath || "",
-          topLevelKeys: Array.isArray(api.topLevelKeys) ? api.topLevelKeys : [],
-          objectPaths: Array.isArray(api.objectPaths) ? api.objectPaths : [],
-          hasPageInfo: api.hasPageInfo === true,
-          hasNextPage:
-            typeof api.hasNextPage === "boolean" ? api.hasNextPage : null,
-          hookSeen: api.hookSeen || 0,
-          hookJoinedGroupsSeen: api.hookJoinedGroupsSeen || 0,
-          hookFriendlyNames: Array.isArray(api.hookFriendlyNames)
-            ? api.hookFriendlyNames
-            : [],
-        };
-        return {
-          ok: false,
-          error: (
-            api.groups.length
-              ? "GraphQL danh sách nhóm chưa quét hết phân trang; không thay đổi dữ liệu hiện có."
-              : "Đã bắt GraphQL danh sách nhóm nhưng chưa đọc được Group node; không thay đổi dữ liệu hiện có."
-          ) + " Chi tiết: " + formatJoinedGroupsDiagnostic(diagnostic),
-          diagnostic,
-        };
-      }
-    }
-  } catch (e) {
-    // Chuyển sang DOM fallback ở dưới. Fallback không được replace membership.
-  }
-
+  await sleep(2500);
   let res;
   try {
     res = await chrome.scripting.executeScript({
@@ -1168,30 +915,11 @@ async function scanJoinedGroupsOnce() {
   if (!groups.length) {
     return {
       ok: false,
-      error: "Không bắt được GraphQL và DOM cũng không tìm thấy nhóm. Hãy kiểm tra đăng nhập Facebook.",
+      error: "Không tìm thấy nhóm nào. Hãy chắc chắn đã đăng nhập và mở trang 'Nhóm của bạn'.",
     };
   }
-
-  // DOM không chứng minh được membership tuyệt đối, nên chỉ upsert; không xóa
-  // nhóm hiện có. Lần GraphQL thành công tiếp theo mới được phép replace.
-  const saved = await DB.saveGroups(groups, { replace: false });
-  return {
-    ok: true,
-    source: "dom-fallback",
-    warning: "GraphQL chưa được bắt; đã dùng DOM fallback và không loại nhóm cũ để tránh xóa nhầm.",
-    scanned: groups.length,
-    added: saved.added,
-    updated: saved.updated,
-    removed: 0,
-  };
-}
-
-function scanJoinedGroups() {
-  return runSingleFlight(
-    () => joinedGroupsScanInFlight,
-    (value) => { joinedGroupsScanInFlight = value; },
-    scanJoinedGroupsOnce,
-  );
+  const saved = await DB.saveGroups(groups);
+  return { ok: true, scanned: groups.length, added: saved.added, updated: saved.updated };
 }
 
 /* ----------------------- AUTOMATION: ĐĂNG BÀI --------------------------- */
@@ -5884,10 +5612,6 @@ export {
   crawlGroupApiInTab,
   crawlGroupApiTabless,
   crawlGroupApiSmart,
-  isTrustedJoinedGroupsSnapshot,
-  formatJoinedGroupsDiagnostic,
-  openJoinedGroupsTab,
-  runSingleFlight,
   scanJoinedGroups,
   runJob,
   executeDeletePost,

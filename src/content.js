@@ -1123,16 +1123,6 @@
     // threadId gắn với inboxMsgTemplate gần nhất (để biết mẫu thuộc hội thoại nào).
     inboxMsgThreadId: null,
     inboxRunning: false,
-    // ---- JOINED GROUPS (/groups/joins/) ----
-    joinedGroupsTemplate: null,
-    joinedGroupsFamily: null,
-    joinedGroupsChunks: [],
-    joinedGroupsCount: 0,
-    joinedGroupsDiagnostic: null,
-    joinedGroupsHookStat: null,
-    joinedGroupsBufferPulled: false,
-    joinedGroupsScanRunning: false,
-    joinedGroupsScanAttempted: false,
   };
 
   // Import động gql-comments.js (bộ phân tích bình luận PURE). Cache sau lần đầu.
@@ -1151,15 +1141,6 @@
     const url = chrome.runtime.getURL("src/gql-parse.js");
     _gqlMod = await import(url);
     return _gqlMod;
-  }
-
-  // Import động gql-groups.js (bộ phân tích danh sách nhóm đã tham gia PURE).
-  let _groupsMod = null;
-  async function loadGroupsModule() {
-    if (_groupsMod) return _groupsMod;
-    const url = chrome.runtime.getURL("src/gql-groups.js");
-    _groupsMod = await import(url);
-    return _groupsMod;
   }
 
   // Import động gql-messenger.js (bộ phân tích hộp thư PURE). Cache sau lần đầu.
@@ -1193,51 +1174,10 @@
   // document_idle => gói feed đầu tiên có thể đã bắn TRƯỚC khi listener này gắn.
   // Gọi pull để "kéo" lại các gói đó thay vì chờ FB tự bắn lại (không xảy ra
   // trong tab nền/ẩn bị throttle).
-  function pullBufferedGql(kind = "all") {
+  function pullBufferedGql() {
     try {
-      window.postMessage(
-        kind === "joined-groups"
-          ? { __FBC_GQL_PULL_JOINED: 1 }
-          : { __FBC_GQL_PULL: 1 },
-        "*",
-      );
+      window.postMessage({ __FBC_GQL_PULL: 1 }, "*");
     } catch (e) {}
-  }
-
-  function joinedGroupsRequestFamily(req) {
-    const normalize = (value) => {
-      if (Array.isArray(value)) return value.map(normalize);
-      if (!value || typeof value !== "object") return value;
-      const out = {};
-      for (const key of Object.keys(value).sort()) {
-        if (["cursor", "after", "before"].includes(key.toLowerCase())) continue;
-        out[key] = normalize(value[key]);
-      }
-      return out;
-    };
-    return JSON.stringify({
-      docId: String(req?.doc_id || ""),
-      friendly: String(req?.friendly || ""),
-      variables: normalize(req?.variables || {}),
-    });
-  }
-
-  function joinedGroupsDiagnosticScore(candidate) {
-    const diagnostics = candidate?.diagnostics || {};
-    const paths = [
-      ...(Array.isArray(diagnostics.objectPaths) ? diagnostics.objectPaths : []),
-      ...(Array.isArray(diagnostics.topLevelKeys) ? diagnostics.topLevelKeys : []),
-      String(diagnostics.selectedKey || ""),
-      String(diagnostics.selectedPath || ""),
-    ].join(" ").toLowerCase();
-    let score = 0;
-    if (Number(diagnostics.connectionCount) > 0) score += 100;
-    if (diagnostics.selectedKey) score += 40;
-    if (diagnostics.selectedPath) score += 20;
-    if (/group|join|member|edge|page.?info/.test(paths)) score += 10;
-    if (Array.isArray(candidate?.groups) && candidate.groups.length) score += 200;
-    if (candidate?.authoritative) score += 50;
-    return score;
   }
 
   // Dựng body replay: GIỮ NGUYÊN body gốc (mọi field FB cần), chỉ thay
@@ -1267,15 +1207,6 @@
     const d = ev.data;
     if (!d || typeof d !== "object") return;
 
-    if (d.__FBC_GQL_STAT_SNAPSHOT === 1 && d.stat && apiSniff.joinedGroupsScanRunning) {
-      apiSniff.joinedGroupsHookStat = {
-        seen: Number(d.stat.seen) || 0,
-        joinedGroupsSeen: Number(d.stat.joinedGroupsSeen) || 0,
-        friendlyNames: Array.isArray(d.stat.friendlyNames) ? d.stat.friendlyNames.slice(-24) : [],
-      };
-      return;
-    }
-
     // (1) Gói GraphQL bắt thụ động từ trang.
     if (d.__FBC_GQL === 1) {
       try {
@@ -1286,71 +1217,7 @@
           mod2 = await loadCommentModule();
         } catch (_) {}
         const req = mod.parseGqlRequestBody(d.reqBody);
-        let groupsMod = null;
-        try {
-          groupsMod = await loadGroupsModule();
-        } catch (_) {}
-        if (
-          groupsMod &&
-          apiSniff.joinedGroupsScanRunning &&
-          groupsMod.isJoinedGroupsRequest(req.friendly, req.variables, location.pathname)
-        ) {
-          const chunks = Array.isArray(d.chunks) ? d.chunks : [];
-          const candidate = groupsMod.analyzeJoinedGroupsChunks(chunks, {
-            allowGenericGroups: true,
-          });
-          const family = joinedGroupsRequestFamily(req);
-          const initialRequest = groupsMod.isInitialJoinedGroupsRequest(req.variables);
-
-          // Preserve the most structurally relevant bounded evidence. The first
-          // GraphQL response on /groups/joins/ can be an unrelated background
-          // query (for example time-limit or promotion configuration). Never
-          // let that response become the diagnostic baseline, and never merge
-          // its chunks into the joined-groups parser buffer.
-          if (initialRequest) {
-            const score = joinedGroupsDiagnosticScore(candidate);
-            const previousScore = Number(
-              apiSniff.joinedGroupsDiagnostic?._score,
-            ) || -1;
-            if (score > previousScore) {
-              apiSniff.joinedGroupsDiagnostic = {
-                friendly: req.friendly,
-                chunkCount: candidate.diagnostics?.chunkCount || 0,
-                connectionCount: candidate.diagnostics?.connectionCount || 0,
-                selectedKey: candidate.diagnostics?.selectedKey || "",
-                selectedPath: candidate.diagnostics?.selectedPath || "",
-                topLevelKeys: candidate.diagnostics?.topLevelKeys || [],
-                objectPaths: candidate.diagnostics?.objectPaths || [],
-                _score: score,
-              };
-            }
-          }
-
-          // Passive capture establishes exactly one first-page baseline. Cursor
-          // pages are accepted only through our own replay loop below, so a
-          // buffered terminal page or an independent same-family refetch cannot
-          // authorize destructive replacement.
-          if (!candidate.authoritative) return;
-          if (!initialRequest) return;
-          if (apiSniff.joinedGroupsTemplate) return;
-
-          apiSniff.joinedGroupsFamily = family;
-          apiSniff.joinedGroupsCount += 1;
-          apiSniff.joinedGroupsTemplate = {
-            url: d.url,
-            raw: req.raw,
-            friendly: req.friendly,
-            fb_dtsg: req.fb_dtsg,
-            doc_id: req.doc_id,
-            lsd: req.lsd,
-            variables: req.variables,
-          };
-          if (chunks.length) apiSniff.joinedGroupsChunks.push(...chunks);
-          dlog(
-            `[API] bắt danh sách nhóm đã tham gia #${apiSniff.joinedGroupsCount}` +
-              ` | friendly=${req.friendly} chunks=${Array.isArray(d.chunks) ? d.chunks.length : 0}`
-          );
-        } else if (mod.isGroupFeedRequest(req.friendly, req.variables)) {
+        if (mod.isGroupFeedRequest(req.friendly, req.variables)) {
           apiSniff.feedCount += 1;
           // Chỉ giữ mẫu MỚI NHẤT (fb_dtsg/cursor xoay vòng theo thời gian).
           apiSniff.template = {
@@ -2260,168 +2127,6 @@
         }
       })();
       return true; // async
-    }
-
-    // Trả danh sách nhóm đã tham gia từ GraphQL, replay tiếp mọi trang còn lại
-    // trước khi cho background dùng replace=true.
-    if (msg.type === "GET_JOINED_GROUPS_API") {
-      if (apiSniff.joinedGroupsScanRunning || apiSniff.joinedGroupsScanAttempted) {
-        sendResponse({
-          ok: false,
-          trusted: false,
-          complete: false,
-          groups: [],
-          reason: apiSniff.joinedGroupsScanRunning
-            ? "joined-groups scan already running"
-            : "joined-groups scan requires a fresh page",
-        });
-        return false;
-      }
-      apiSniff.joinedGroupsScanRunning = true;
-      apiSniff.joinedGroupsScanAttempted = true;
-      // Mỗi lần quét phải có một baseline riêng. Không được dùng lại chunks,
-      // template hay trạng thái complete của lần quét trước trong cùng document.
-      apiSniff.joinedGroupsTemplate = null;
-      apiSniff.joinedGroupsFamily = null;
-      apiSniff.joinedGroupsChunks = [];
-      apiSniff.joinedGroupsCount = 0;
-      apiSniff.joinedGroupsDiagnostic = null;
-      apiSniff.joinedGroupsHookStat = null;
-      apiSniff.joinedGroupsBufferPulled = false;
-
-      (async () => {
-        try {
-          const groupsMod = await loadGroupsModule();
-          const deadline = Date.now() + Math.max(1000, Number(msg.timeoutMs) || 10000);
-          const maxPages = Math.max(1, Number(msg.maxPages) || 50);
-          const attemptedCursors = new Set();
-
-          // Chỉ kéo buffer một lần để lấy response trang đầu. MAIN-world hook
-          // phát lại cả buffer cũ; gọi lại trong vòng pagination sẽ chèn page 1
-          // sau page 2 và làm page_info quay ngược về has_next_page=true.
-          if (!apiSniff.joinedGroupsBufferPulled) {
-            apiSniff.joinedGroupsBufferPulled = true;
-            pullBufferedGql("joined-groups");
-            await sleep(300);
-          }
-
-          // Chờ request/chunks trang đầu đang được listener nhận, nhưng không
-          // pull lại buffer cũ. Sau điểm này chỉ chunks từ replay mới được thêm.
-          while (
-            !apiSniff.joinedGroupsTemplate &&
-            !apiSniff.joinedGroupsChunks.length &&
-            Date.now() < deadline
-          ) {
-            await sleep(150);
-          }
-
-          const joinedGroupsParserOptions = { allowGenericGroups: true };
-          let analysis = groupsMod.analyzeJoinedGroupsChunks(
-            apiSniff.joinedGroupsChunks,
-            joinedGroupsParserOptions,
-          );
-          let pages = analysis.groups.length || analysis.hasPageInfo ? 1 : 0;
-          let cursor = analysis.endCursor;
-
-          while (apiSniff.joinedGroupsTemplate && Date.now() < deadline) {
-            analysis = groupsMod.analyzeJoinedGroupsChunks(
-              apiSniff.joinedGroupsChunks,
-              joinedGroupsParserOptions,
-            );
-            cursor = analysis.endCursor;
-            if (analysis.complete) break;
-            if (!analysis.hasPageInfo || !analysis.hasNextPage || !cursor || pages >= maxPages) break;
-
-            if (attemptedCursors.has(String(cursor))) break;
-            attemptedCursors.add(String(cursor));
-
-            const tpl = apiSniff.joinedGroupsTemplate;
-            const vars = JSON.parse(JSON.stringify(tpl.variables || {}));
-            setCursorInVariables(vars, cursor);
-            const replay = await replayViaPage({
-              url: tpl.url,
-              body: buildReplayBody(tpl, vars),
-              friendly: tpl.friendly,
-            }, Math.min(15000, Math.max(3000, deadline - Date.now())));
-            if (!replay.ok) break;
-            if (Array.isArray(replay.chunks) && replay.chunks.length) {
-              apiSniff.joinedGroupsChunks.push(...replay.chunks);
-            }
-            pages += 1;
-          }
-
-          analysis = groupsMod.analyzeJoinedGroupsChunks(
-            apiSniff.joinedGroupsChunks,
-            joinedGroupsParserOptions,
-          );
-          const captured = !!apiSniff.joinedGroupsTemplate;
-          const structuralDiagnostic =
-            apiSniff.joinedGroupsDiagnostic &&
-            Number(apiSniff.joinedGroupsDiagnostic._score) > 0
-              ? apiSniff.joinedGroupsDiagnostic
-              : null;
-          sendResponse({
-            ok: captured && analysis.complete && analysis.authoritative,
-            trusted:
-              captured &&
-              analysis.complete &&
-              analysis.authoritative &&
-              !analysis.hasNonAuthoritativeIds,
-            complete: analysis.complete,
-            groups: analysis.groups,
-            pages,
-            capturedRequests:
-              apiSniff.joinedGroupsCount || (structuralDiagnostic ? 1 : 0),
-            capturedChunks:
-              analysis.diagnostics?.chunkCount ||
-              structuralDiagnostic?.chunkCount ||
-              0,
-            candidateConnections:
-              analysis.diagnostics?.connectionCount ||
-              structuralDiagnostic?.connectionCount ||
-              0,
-            selectedConnection:
-              analysis.diagnostics?.selectedKey ||
-              structuralDiagnostic?.selectedKey ||
-              "",
-            selectedPath:
-              analysis.diagnostics?.selectedPath ||
-              structuralDiagnostic?.selectedPath ||
-              "",
-            topLevelKeys:
-              analysis.diagnostics?.topLevelKeys?.length
-                ? analysis.diagnostics.topLevelKeys
-                : structuralDiagnostic?.topLevelKeys || [],
-            objectPaths:
-              analysis.diagnostics?.objectPaths?.length
-                ? analysis.diagnostics.objectPaths
-                : structuralDiagnostic?.objectPaths || [],
-            hasPageInfo: analysis.hasPageInfo,
-            hasNextPage: analysis.hasNextPage,
-            friendly:
-              apiSniff.joinedGroupsTemplate?.friendly ||
-              structuralDiagnostic?.friendly ||
-              "",
-            hookSeen: apiSniff.joinedGroupsHookStat?.seen || 0,
-            hookJoinedGroupsSeen: apiSniff.joinedGroupsHookStat?.joinedGroupsSeen || 0,
-            hookFriendlyNames: apiSniff.joinedGroupsHookStat?.friendlyNames || [],
-            reason: !captured
-              ? "joined-groups GraphQL request not captured"
-              : analysis.complete
-                ? "captured-complete"
-                : analysis.hasNextPage
-                  ? "joined-groups pagination incomplete"
-                  : analysis.hasPageInfo
-                    ? "joined-groups response incomplete"
-                    : "joined-groups page_info not captured",
-          });
-        } catch (e) {
-          sendResponse({ ok: false, trusted: false, complete: false, groups: [], reason: String(e) });
-        } finally {
-          apiSniff.joinedGroupsScanRunning = false;
-        }
-      })();
-      return true;
     }
 
     // Quét danh sách hội thoại Messenger qua API (tier-2 replay-trong-trang).

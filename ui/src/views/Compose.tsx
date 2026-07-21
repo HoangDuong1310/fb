@@ -291,8 +291,11 @@ export function Compose() {
       setAiBusy(false);
       if (res && res.ok && Array.isArray(res.variants) && res.variants.length) {
         variants = res.variants;
-        if (res.source === "fallback") {
-          note = { kind: "warn", text: res.note || "Chưa xào nấu được bằng AI, tạm dùng nội dung gốc." };
+        if (res.source === "fallback" || res.source === "partial-ai") {
+          note = {
+            kind: "warn",
+            text: res.note || "Một phần nội dung chưa xào nấu được bằng AI và đang dùng bản gốc.",
+          };
         }
       } else {
         variants = targets.map(() => text);

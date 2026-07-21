@@ -145,47 +145,6 @@
     }
   };
 
-  // ĐỆM RIÊNG cho request danh sách NHÓM ĐÃ THAM GIA trên /groups/joins/.
-  // Query này thường bắn rất sớm, trước khi content.js ở document_idle sẵn sàng.
-  const JOINED_GROUPS_BUFFER_MAX = 24;
-  const joinedGroupsBuffer = [];
-  const JOINED_GROUP_SIGNS = [
-    "viewer_joined_groups",
-    "joined_groups",
-    "joinedgroups",
-    "groupscometgroupstabcontent",
-  ];
-  const isJoinedGroupsBody = (bodyStr) => {
-    try {
-      const raw = String(bodyStr || "");
-      const low = raw.toLowerCase();
-      let friendly = "";
-      try {
-        friendly = String(
-          new URLSearchParams(raw).get("fb_api_req_friendly_name") || "",
-        ).toLowerCase();
-      } catch (_) {}
-
-      const rejectedFamily =
-        /(?:notification|suggest|recommend|discover|search|keyword|bootstrap|feed|stories|comment|post|messenger|chat|thread|inbox|message|promotion|eligible|timelimit|time.?limit|enforcement|regulatory|youth|safety|policy|config|settings|eligibility|backup|device|encrypted|encryption|eb_)/;
-      if (rejectedFamily.test(friendly)) return false;
-      if (JOINED_GROUP_SIGNS.some((sign) => low.indexOf(sign) !== -1)) return true;
-
-      // The persisted-query friendly name is not stable. On the dedicated
-      // joined-groups document, retain otherwise unclassified GraphQL responses
-      // so the isolated-world parser can inspect their real response shape after
-      // the document_idle listener is ready. This is capture-only; authority is
-      // still proved by gql-groups.js before any database replacement.
-      return (
-        typeof location !== "undefined" &&
-        /\/groups\/joins(?:\/|$)/i.test(String(location.pathname || "")) &&
-        !rejectedFamily.test(friendly)
-      );
-    } catch (e) {
-      return false;
-    }
-  };
-
   // ĐỆM RIÊNG cho gói MESSENGER (hộp thư + nội dung hội thoại).
   //
   // VÌ SAO: giống feed nhóm, Messenger bắn gói GraphQL danh sách hội thoại
@@ -240,11 +199,9 @@
     friendlyNames: [],
     feedSeen: 0,   // số gói được nhận diện là feed nhóm
     inboxSeen: 0,  // số gói được nhận diện là Messenger (inbox/hội thoại)
-    joinedGroupsSeen: 0,
     buffered: 0,
     feedBuffered: 0,
     inboxBuffered: 0,
-    joinedGroupsBuffered: 0,
     lastUrl: "",
     lastAt: 0,
   };
@@ -274,12 +231,6 @@
         feedBuffer.push(msg);
         if (feedBuffer.length > FEED_BUFFER_MAX) feedBuffer.shift();
       }
-      // DANH SÁCH NHÓM ĐÃ THAM GIA: giữ trong đệm riêng để không mất trang đầu.
-      const isJoinedGroups = isJoinedGroupsBody(msg.reqBody);
-      if (isJoinedGroups) {
-        joinedGroupsBuffer.push(msg);
-        if (joinedGroupsBuffer.length > JOINED_GROUPS_BUFFER_MAX) joinedGroupsBuffer.shift();
-      }
       // GÓI MESSENGER: giữ trong đệm RIÊNG (thread list + nội dung hội thoại).
       const isInbox = isInboxBody(msg.reqBody);
       if (isInbox) {
@@ -294,10 +245,8 @@
           s.buffered = buffer.length;
           s.feedBuffered = feedBuffer.length;
           s.inboxBuffered = inboxBuffer.length;
-          s.joinedGroupsBuffered = joinedGroupsBuffer.length;
           if (isFeed) s.feedSeen++;
           if (isInbox) s.inboxSeen++;
-          if (isJoinedGroups) s.joinedGroupsSeen++;
           try {
             const friendly = String(
               new URLSearchParams(msg.reqBody || "").get("fb_api_req_friendly_name") || "",
@@ -390,28 +339,6 @@
   window.addEventListener("message", (ev) => {
     const d = ev.data;
     if (!d || typeof d !== "object") return;
-
-    // Joined-groups dùng pull riêng, consumptive: mỗi document chỉ nhận snapshot
-    // đầu tiên một lần, tránh response cũ được tái sử dụng cho destructive sync.
-    if (d.__FBC_GQL_PULL_JOINED === 1) {
-      try {
-        const pending = joinedGroupsBuffer.splice(0, joinedGroupsBuffer.length);
-        for (const msg of pending) window.postMessage(msg, "*");
-        const s = window.__FBC_GQL_STAT__;
-        if (s) {
-          s.joinedGroupsBuffered = joinedGroupsBuffer.length;
-          window.postMessage({
-            __FBC_GQL_STAT_SNAPSHOT: 1,
-            stat: {
-              seen: Number(s.seen) || 0,
-              joinedGroupsSeen: Number(s.joinedGroupsSeen) || 0,
-              friendlyNames: Array.isArray(s.friendlyNames) ? s.friendlyNames.slice(-24) : [],
-            },
-          }, "*");
-        }
-      } catch (e) {}
-      return;
-    }
 
     // (0) content.js vừa sẵn sàng => PHÁT LẠI mọi gói GraphQL đã đệm. Đây là
     // cách khắc phục đua thời điểm document_start (hook) vs document_idle

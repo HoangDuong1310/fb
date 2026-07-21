@@ -303,6 +303,152 @@ export async function listModels() {
 /* AI XÀO NẤU NỘI DUNG ĐĂNG BÀI (chống trùng lặp khi đăng nhiều nhóm)        */
 /* ======================================================================== */
 
+/** Số biến thể mỗi lô gọi provider (server/client mirror). */
+export const SPIN_BATCH_SIZE = 6;
+/**
+ * Số biến thể tối đa mỗi HTTP request tới `/api/ai/spin-post`.
+ * Phải ≤ proxy idle timeout (~60s): mỗi request chỉ chứa 1 lô AI (~30s),
+ * không giữ một kết nối cho 20–50 nhóm (trước đây gây API 500/504).
+ */
+export const SPIN_HTTP_CHUNK_SIZE = 6;
+const SPIN_RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * Chia `count` thành các kích thước HTTP chunk tuần tự (không gọi mạng).
+ * @param {number} count
+ * @param {number} [chunkSize]
+ * @returns {number[]}
+ */
+export function planSpinHttpChunks(count, chunkSize = SPIN_HTTP_CHUNK_SIZE) {
+  const n = Math.max(1, Math.min(50, Number(count) || 1));
+  const size = Math.max(1, Math.min(10, Number(chunkSize) || SPIN_HTTP_CHUNK_SIZE));
+  const chunks = [];
+  for (let offset = 0; offset < n; offset += size) {
+    chunks.push(Math.min(size, n - offset));
+  }
+  return chunks;
+}
+
+/**
+ * Gộp kết quả từng HTTP chunk spin thành một response thống nhất cho UI.
+ * `chunkResults[i]` = body JSON từ server hoặc `null` khi request ném lỗi.
+ *
+ * @param {string} content
+ * @param {number} count
+ * @param {Array<{ok?: boolean, variants?: string[], source?: string, note?: string}|null|undefined>} chunkResults
+ * @param {number[]} chunkSizes
+ */
+export function mergeSpinHttpChunks(content, count, chunkResults, chunkSizes) {
+  const safeCount = Math.max(1, Math.min(50, Number(count) || 1));
+  const base = String(content || "").trim();
+  const variants = [];
+  let failedChunks = 0;
+  let anyAi = false;
+  let anyPartial = false;
+  /** @type {string[]} */
+  const notes = [];
+
+  const sizes = Array.isArray(chunkSizes) && chunkSizes.length
+    ? chunkSizes
+    : planSpinHttpChunks(safeCount);
+
+  for (let i = 0; i < sizes.length; i += 1) {
+    const size = sizes[i];
+    const result = chunkResults && chunkResults[i];
+    if (result && result.ok && Array.isArray(result.variants) && result.variants.length) {
+      for (let j = 0; j < size; j += 1) {
+        variants.push(String(result.variants[j] || base).trim() || base);
+      }
+      if (result.source === "ai") anyAi = true;
+      else if (result.source === "partial-ai") {
+        anyAi = true;
+        anyPartial = true;
+      } else if (result.source === "fallback") {
+        failedChunks += 1;
+        anyPartial = true;
+      } else if (result.source === "original") {
+        // count=1 path; treat as success without AI
+      } else {
+        anyAi = true;
+      }
+      if (result.note) notes.push(String(result.note));
+    } else {
+      failedChunks += 1;
+      for (let j = 0; j < size; j += 1) variants.push(base);
+    }
+  }
+
+  while (variants.length < safeCount) variants.push(base);
+
+  const allFailed = failedChunks > 0 && !anyAi;
+  const source = allFailed
+    ? "fallback"
+    : anyPartial || failedChunks
+      ? "partial-ai"
+      : anyAi
+        ? "ai"
+        : "original";
+
+  return {
+    ok: true,
+    variants: variants.slice(0, safeCount),
+    source,
+    note:
+      source === "fallback"
+        ? "Không thể gọi AI — trả về bản gốc."
+        : source === "partial-ai"
+          ? notes[0] ||
+            "Một phần nội dung chưa xào nấu được bằng AI và đang dùng bản gốc."
+          : undefined,
+  };
+}
+
+/**
+ * Chạy tuần tự các lô nhỏ để không ép provider sinh hàng chục bài trong một
+ * response. Mỗi lô lỗi tạm thời được thử lại một lần; lô vẫn lỗi mới fallback.
+ */
+export async function runSpinBatches({
+  content,
+  count,
+  batchSize = SPIN_BATCH_SIZE,
+  generateBatch,
+  sleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  const variants = [];
+  let failedBatches = 0;
+  const safeBatchSize = Math.max(1, Math.min(10, Number(batchSize) || SPIN_BATCH_SIZE));
+
+  for (let offset = 0; offset < count; offset += safeBatchSize) {
+    const size = Math.min(safeBatchSize, count - offset);
+    let generated = null;
+    for (let attempt = 0; attempt < 2 && !generated; attempt += 1) {
+      try {
+        const batch = await generateBatch(size, offset);
+        if (Array.isArray(batch) && batch.length) generated = batch;
+      } catch (error) {
+        const status = Number(error && error.status) || 0;
+        const retryable = !status || SPIN_RETRYABLE_STATUSES.has(status);
+        if (attempt === 0 && retryable) {
+          await sleepFn(500);
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (!generated) {
+      failedBatches += 1;
+      generated = Array.from({ length: size }, () => content);
+    }
+    for (let i = 0; i < size; i += 1) {
+      variants.push(String(generated[i] || content).trim() || content);
+    }
+    if (offset + size < count) await sleepFn(250);
+  }
+
+  return { variants, failedBatches };
+}
+
 /**
  * Sinh N biến thể của một nội dung gốc để đăng lên nhiều nhóm khác nhau, tránh
  * bị Facebook gắn cờ trùng nội dung. YÊU CẦU CỐT LÕI: giữ nguyên Ý ĐỊNH / THÔNG
@@ -345,10 +491,11 @@ export async function spinPostContent(payload) {
     return fb;
   }
 
-  const sys =
+  const buildPrompts = (batchCount, offset) => {
+    const sys =
     "Bạn là TRỢ LÝ VIẾT NỘI DUNG MẠNG XÃ HỘI tiếng Việt. Người dùng có MỘT bài đăng gốc " +
     "và muốn đăng lên NHIỀU nhóm Facebook khác nhau. Để tránh bị Facebook gắn cờ trùng " +
-    "nội dung, hãy viết lại thành " + count + " BIẾN THỂ KHÁC NHAU.\n" +
+    "nội dung, hãy viết lại thành " + batchCount + " BIẾN THỂ KHÁC NHAU.\n" +
     "QUY TẮC BẮT BUỘC:\n" +
     "1) GIỮ NGUYÊN Ý ĐỊNH, THÔNG ĐIỆP, THÔNG TIN cốt lõi của bài gốc (sản phẩm, giá, " +
     "khuyến mãi, số điện thoại, link, lời kêu gọi hành động... không được bịa thêm hay bỏ sót).\n" +
@@ -357,15 +504,21 @@ export async function spinPostContent(payload) {
     "3) Giữ giọng văn tự nhiên, phù hợp người Việt, độ dài tương đương bài gốc.\n" +
     "4) TUYỆT ĐỐI không thêm tiêu đề kiểu 'Biến thể 1', không giải thích.\n" +
     'CHỈ trả JSON hợp lệ, KHÔNG bọc code fence. Cấu trúc: {"variants":["nội dung 1","nội dung 2", ...]} ' +
-    "với đúng " + count + " phần tử.";
+    "với đúng " + batchCount + " phần tử.";
 
-  const user =
-    "SỐ BIẾN THỂ CẦN: " + count + "\n" +
-    "BÀI ĐĂNG GỐC:\n\"\"\"\n" + content + "\n\"\"\"\n" +
-    "Hãy trả JSON đúng cấu trúc, mảng variants có đúng " + count + " biến thể khác nhau.";
+    const user =
+      "ĐÂY LÀ LÔ " + (Math.floor(offset / SPIN_BATCH_SIZE) + 1) + ".\n" +
+      "SỐ BIẾN THỂ CẦN: " + batchCount + "\n" +
+      "BÀI ĐĂNG GỐC:\n\"\"\"\n" + content + "\n\"\"\"\n" +
+      "Hãy trả JSON đúng cấu trúc, mảng variants có đúng " + batchCount + " biến thể khác nhau.";
+    return { sys, user };
+  };
 
   const AI_TIMEOUT_MS = 30000;
-  const callOnce = async (useJsonFormat) => {
+  // Đồng bộ server: 6 biến thể bài dài dễ vượt 4000 token output.
+  const SPIN_MAX_TOKENS = 8000;
+  const callOnce = async (batchCount, offset, useJsonFormat) => {
+    const { sys, user } = buildPrompts(batchCount, offset);
     const body = {
       model,
       messages: [
@@ -373,7 +526,7 @@ export async function spinPostContent(payload) {
         { role: "user", content: user },
       ],
       temperature: 0.9,
-      max_tokens: 4000,
+      max_tokens: SPIN_MAX_TOKENS,
       stream: false,
     };
     if (useJsonFormat) body.response_format = { type: "json_object" };
@@ -388,46 +541,40 @@ export async function spinPostContent(payload) {
     );
   };
 
-  let resp;
-  try {
-    resp = await callOnce(true);
+  const generateBatch = async (batchCount, offset) => {
+    let resp = await callOnce(batchCount, offset, true);
     if (resp && (resp.status === 400 || resp.status === 422)) {
       // Một số endpoint không hỗ trợ response_format -> thử lại không có.
-      resp = await callOnce(false);
+      resp = await callOnce(batchCount, offset, false);
     }
-  } catch (e) {
-    return fallback();
-  }
-
-  if (!resp || !resp.ok) return fallback();
-
-  let data;
-  try {
-    data = await resp.json();
-  } catch (e) {
-    return fallback();
-  }
-  const text = data && data.choices && data.choices[0] && data.choices[0].message
-    ? data.choices[0].message.content
-    : "";
-  const obj = parseSelectorJson(text);
-  let variants =
-    obj && Array.isArray(obj.variants)
-      ? obj.variants.map((v) => String(v || "").trim()).filter(Boolean)
-      : [];
-
-  if (!variants.length) return fallback();
-
-  // Chuẩn hoá về đúng count: thiếu thì bù bằng nội dung gốc, thừa thì cắt bớt.
-  if (variants.length < count) {
-    for (let i = variants.length; i < count; i++) {
-      variants.push(variants[i % variants.length] || content);
+    if (!resp || !resp.ok) {
+      const error = new Error("AI trả lỗi HTTP " + (resp ? resp.status : "?"));
+      error.status = resp ? resp.status : 0;
+      throw error;
     }
-  } else if (variants.length > count) {
-    variants = variants.slice(0, count);
-  }
 
-  return { ok: true, variants, source: "ai" };
+    const data = await resp.json();
+    const text = data && data.choices && data.choices[0] && data.choices[0].message
+      ? data.choices[0].message.content
+      : "";
+    const obj = parseSelectorJson(text);
+    const variants =
+      obj && Array.isArray(obj.variants)
+        ? obj.variants.map((v) => String(v || "").trim()).filter(Boolean)
+        : [];
+    if (!variants.length) throw new Error("AI trả mảng variants rỗng");
+    return variants;
+  };
+
+  const result = await runSpinBatches({ content, count, generateBatch });
+  return {
+    ok: true,
+    variants: result.variants,
+    source: result.failedBatches ? "partial-ai" : "ai",
+    note: result.failedBatches
+      ? `${result.failedBatches} lô AI bị lỗi; chỉ các bài thuộc lô đó tạm dùng nội dung gốc.`
+      : undefined,
+  };
 }
 
 /* ======================================================================== */

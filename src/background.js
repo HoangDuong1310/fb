@@ -31,7 +31,15 @@ import {
   seedPriceSources,
 } from "./prices.js";
 import { listSheetTabs, previewSheet, importSheetTabs } from "./sheets.js";
-import { discoverSelectors, listModels, spinPostContent, generatePostContent } from "./ai.js";
+import {
+  discoverSelectors,
+  listModels,
+  spinPostContent,
+  generatePostContent,
+  planSpinHttpChunks,
+  mergeSpinHttpChunks,
+  SPIN_HTTP_CHUNK_SIZE,
+} from "./ai.js";
 import { clearProfileCache } from "./prompts.js";
 import {
   startCrawlInActiveTab,
@@ -199,19 +207,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // không rời server. LƯU Ý: spinPostContent (server) đọc payload.content, còn
     // route nhận {text, options} rồi trải options ra -> phải nhét content vào
     // options. UI (Compose) gửi payload {content, count}.
+    //
+    // QUAN TRỌNG (nhiều nhóm → API 500): không gửi một HTTP request với count lớn.
+    // Server xử lý tuần tự từng lô 6 biến thể (~30s/lô + retry) nên 20–30 nhóm
+    // giữ kết nối vài phút → reverse-proxy/gateway cắt và client thấy 500/504.
+    // Chia thành nhiều request nhỏ (SPIN_HTTP_CHUNK_SIZE), gộp kết quả; lô lỗi
+    // fallback nội dung gốc thay vì fail cả preview.
     case "AI_SPIN_CONTENT": {
       (async () => {
         await readyPromise;
         const p = msg.payload || {};
         const content = String(p.content || "").trim();
-        const result = await API.apiFetch("/api/ai/spin-post", {
-          method: "POST",
-          body: JSON.stringify({
-            text: content,
-            options: { content, count: p.count },
-          }),
-        });
-        sendResponse(result);
+        const count = Math.max(1, Math.min(50, Number(p.count) || 1));
+        if (!content) {
+          sendResponse({ ok: false, error: "No content provided." });
+          return;
+        }
+        if (count === 1) {
+          sendResponse({ ok: true, variants: [content], source: "original" });
+          return;
+        }
+
+        // Static import only — dynamic import() is disallowed in ServiceWorkerGlobalScope.
+        const chunkSizes = planSpinHttpChunks(count, SPIN_HTTP_CHUNK_SIZE);
+        const chunkResults = [];
+        for (let i = 0; i < chunkSizes.length; i += 1) {
+          const size = chunkSizes[i];
+          try {
+            const result = await API.apiFetch("/api/ai/spin-post", {
+              method: "POST",
+              body: JSON.stringify({
+                text: content,
+                options: { content, count: size },
+              }),
+            });
+            chunkResults.push(result);
+          } catch (_e) {
+            chunkResults.push(null);
+          }
+          if (i + 1 < chunkSizes.length) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          }
+        }
+        sendResponse(mergeSpinHttpChunks(content, count, chunkResults, chunkSizes));
       })().catch((e) => {
         const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
         sendResponse({ ok: false, error: clean });
