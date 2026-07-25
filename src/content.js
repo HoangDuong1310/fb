@@ -1033,6 +1033,11 @@
         scrolls += 1;
         await sleep(jitterDelay(opts.scrollDelay));
 
+        // Tick UI SAU mỗi nhịp cuộn. Trước đây CRAWL_PROGRESS chỉ gửi khi có bài
+        // MỚI => dashboard đứng yên ở "+N bài (cuộn 0)" trong lúc content vẫn
+        // quét/cuộn bài đã biết (console vẫn log). Tick này giữ UI khớp console.
+        reportProgress({ status: "scanning" });
+
         // Thỉnh thoảng nghỉ lâu hơn như người thật dừng đọc => giảm rủi ro spam/checkpoint.
         if (opts.safeMode && scrolls >= nextRestAt) {
           reportProgress({ status: "resting" });

@@ -338,3 +338,58 @@ test("disconnectRealtime closes the socket and clears reconnect timer", () => {
 
   delete global.WebSocket;
 });
+
+// Regression: đăng xuất rồi đăng nhập lại trong CÙNG một vòng đời service
+// worker. connectRealtime() có nhánh thoát sớm khi socket đang OPEN/CONNECTING,
+// nên nếu disconnectRealtime() không dọn `ws` về null thì lần đăng nhập sau sẽ
+// không mở socket mới và lệnh từ xa chỉ về theo alarm "cmdPoll" (trễ tới 30s).
+// Test này chốt: sau disconnect, connect lại PHẢI tạo socket mới mang token MỚI.
+test("logout → login reconnects with the new token (no stale socket reuse)", () => {
+  setBaseUrl("http://localhost:3300");
+  setToken("tok-old");
+
+  const wsInstances = [];
+  class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = 1; // OPEN ngay để chạm đúng nhánh thoát sớm.
+      this.onopen = null;
+      this.onmessage = null;
+      this.onclose = null;
+      this.onerror = null;
+      wsInstances.push(this);
+    }
+    close() {
+      this.readyState = 3;
+    }
+  }
+  global.WebSocket = FakeWebSocket;
+
+  // Phiên đăng nhập thứ nhất.
+  connectRealtime();
+  assert.equal(wsInstances.length, 1, "phiên đầu phải mở 1 socket");
+  assert.ok(wsInstances[0].url.includes("token=tok-old"), "socket đầu dùng token cũ");
+
+  // Đăng xuất: đóng socket + xoá token.
+  disconnectRealtime();
+  setToken(null);
+  assert.equal(wsInstances[0].readyState, 3, "socket phiên cũ phải đóng hẳn");
+
+  // Đăng nhập lại với token khác.
+  setToken("tok-new");
+  connectRealtime();
+
+  assert.equal(wsInstances.length, 2, "đăng nhập lại phải mở socket MỚI");
+  assert.ok(
+    wsInstances[1].url.includes("token=tok-new"),
+    "socket mới phải mang token mới, không dùng lại token đã đăng xuất"
+  );
+
+  disconnectRealtime();
+  delete global.WebSocket;
+});

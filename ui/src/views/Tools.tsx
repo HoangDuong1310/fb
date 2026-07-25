@@ -29,6 +29,14 @@ import {
   warmingDiagnosticText,
   type WarmingDiagnosticEntry,
 } from "@/lib/warming-diagnostics";
+import {
+  getBulkCrawlSnapshot,
+  isBulkCrawlActive,
+  startBulkCrawl,
+  stopBulkCrawl,
+  subscribeBulkCrawl,
+  type BulkCrawlSnapshot,
+} from "@/lib/bulkCrawl";
 
 /* -------------------------------------------------------------------------
    Tools — the closed-loop control room. Three logical stages, one per tab:
@@ -730,6 +738,7 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
+  // Single-group crawl (nút Crawl trên 1 dòng) — local UI state only.
   const [crawlingId, setCrawlingId] = useState<string | null>(null);
   const [progress, setProgress] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -737,40 +746,15 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
   const [newGroupName, setNewGroupName] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  // Bulk crawl state. The queue lives in a ref so the CRAWL_DONE broadcast
-  // listener (registered once) can advance it without stale closures.
-  const [bulk, setBulk] = useState<{ total: number; done: number } | null>(null);
-  const queueRef = useRef<Group[]>([]);
-  const bulkActiveRef = useRef(false);
-  const bulkTotalRef = useRef(0);
-  const bulkDoneRef = useRef(0);
-  // advanceRef always points to the freshest advanceQueue so the once-registered
-  // CRAWL_DONE listener can drive the queue without a stale closure.
-  const advanceRef = useRef<(() => void) | null>(null);
-  // Latest settings, readable from inside the queue advance loop.
-  const settingsRef = useRef(settings);
-  useEffect(() => {
-    settingsRef.current = settings;
-  }, [settings]);
-
-  function randInt(min: number, max: number) {
-    return Math.floor(min + Math.random() * (max - min + 1));
-  }
-  // Heuristic: does a CRAWL_DONE reason indicate Facebook blocked us? If so we
-  // must halt the whole bulk run instead of hammering the next group.
-  function looksBlocked(reason?: string) {
-    if (!reason) return false;
-    const s = reason.toLowerCase();
-    return [
-      "block",
-      "checkpoint",
-      "429",
-      "chặn",
-      "tạm khóa",
-      "đăng nhập",
-      "login",
-    ].some((k) => s.includes(k));
-  }
+  // Bulk crawl: queue + CRAWL_DONE listener sống NGOÀI React (bulkCrawl.ts)
+  // để unmount CrawlTab (đổi tab Tools / rời view Công cụ) KHÔNG giết hàng đợi.
+  const [bulkSnap, setBulkSnap] = useState<BulkCrawlSnapshot>(() => getBulkCrawlSnapshot());
+  const bulk =
+    bulkSnap.active || bulkSnap.phase === "done" || bulkSnap.phase === "aborted" || bulkSnap.phase === "stopped"
+      ? { total: bulkSnap.total, done: bulkSnap.done }
+      : null;
+  // Tránh load() trùng khi remount giữa lúc bulk còn chạy.
+  const lastBulkPhaseRef = useRef(bulkSnap.phase);
 
   async function load() {
     setLoading(true);
@@ -805,57 +789,97 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Realtime crawl progress from the service worker broadcast.
+  // Subscribe driver snapshot — remount vẫn thấy đúng tiến độ bulk đang chạy.
+  useEffect(() => {
+    return subscribeBulkCrawl((snap) => {
+      setBulkSnap(snap);
+      if (snap.active) {
+        setCrawlingId(snap.currentGroupId);
+        if (snap.progress) setProgress(snap.progress);
+      } else if (
+        snap.phase === "done" ||
+        snap.phase === "aborted" ||
+        snap.phase === "stopped"
+      ) {
+        setCrawlingId(null);
+        if (snap.progress) setProgress(snap.progress);
+      } else if (snap.phase === "idle") {
+        // Chỉ clear progress bulk sau khi driver idle; single crawl tự quản lý.
+        if (
+          lastBulkPhaseRef.current === "done" ||
+          lastBulkPhaseRef.current === "aborted" ||
+          lastBulkPhaseRef.current === "stopped"
+        ) {
+          setProgress(null);
+        }
+      }
+      // Reload danh sách khi bulk kết thúc / abort / stop (một lần mỗi chuyển phase).
+      if (
+        (snap.phase === "done" || snap.phase === "aborted" || snap.phase === "stopped") &&
+        lastBulkPhaseRef.current !== snap.phase
+      ) {
+        void load();
+      }
+      lastBulkPhaseRef.current = snap.phase;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Single-group crawl progress only (bulk UI đọc từ bulkSnap).
   useEffect(() => {
     interface ProgressMsg {
       type?: string;
       progress?: {
         status?: string;
+        groupId?: string;
         groupName?: string;
         newCount?: number;
         scrolls?: number;
+        pages?: number;
+        seen?: number;
+        knownHits?: number;
       };
       result?: { newCount?: number; reason?: string };
     }
     const handler = (msg: ProgressMsg) => {
       if (!msg || typeof msg.type !== "string") return;
+      // Khi bulk driver đang active, nó đã mirror progress — bỏ qua để tránh đè text.
+      if (isBulkCrawlActive()) return;
       if (msg.type === "CRAWL_PROGRESS" && msg.progress) {
         const p = msg.progress;
         const name = p.groupName || "nhóm";
         if (p.status === "started") setProgress(`Bắt đầu crawl ${name}…`);
         else if (p.status === "stopped_known")
           setProgress(`${name}: dừng vì gặp bài đã biết.`);
-        else setProgress(`${name}: +${p.newCount || 0} bài (cuộn ${p.scrolls || 0})`);
+        else if (p.status === "stopped_old")
+          setProgress(`${name}: dừng theo bộ lọc ngày.`);
+        else if (p.status === "resting")
+          setProgress(
+            `${name}: nghỉ ngắn… (+${p.newCount || 0} bài, cuộn ${p.scrolls || 0})`,
+          );
+        else if (p.status === "page")
+          setProgress(`${name}: +${p.newCount || 0} bài (trang ${p.pages || 0})`);
+        else if (p.status === "done")
+          setProgress(
+            `${name}: xong +${p.newCount || 0} bài (cuộn ${p.scrolls || 0})`,
+          );
+        else {
+          // crawling / scanning — hiện cả "đã quét" để UI không đứng yên khi
+          // content đang lướt bài cũ (console vẫn log bình thường).
+          const seenPart =
+            typeof p.seen === "number" && p.seen > 0 ? ` · quét ${p.seen}` : "";
+          setProgress(
+            `${name}: +${p.newCount || 0} bài${seenPart} (cuộn ${p.scrolls || 0})`,
+          );
+        }
       } else if (msg.type === "CRAWL_DONE") {
         const r = msg.result || {};
         setCrawlingId(null);
-        // During a bulk run, hand control to the queue driver: it updates the
-        // progress text, refreshes data, applies anti-block jitter, and starts
-        // the next group (strictly one at a time). Outside a bulk run, behave
-        // exactly as before: show a one-off "done" line and reload.
-        if (bulkActiveRef.current) {
-          bulkDoneRef.current += 1;
-          setBulk({ total: bulkTotalRef.current, done: bulkDoneRef.current });
-          if (looksBlocked(r.reason)) {
-            // Facebook pushed back — abort the rest of the run to stay safe.
-            queueRef.current = [];
-            bulkActiveRef.current = false;
-            setBulk(null);
-            setProgress(
-              `Đã dừng crawl hàng loạt: có dấu hiệu bị chặn${r.reason ? ` (${r.reason})` : ""}.`,
-            );
-            load();
-            window.setTimeout(() => setProgress(null), 8000);
-          } else {
-            advanceRef.current?.();
-          }
-        } else {
-          setProgress(
-            `Xong: +${r.newCount || 0} bài${r.reason ? ` (${r.reason})` : ""}`,
-          );
-          load();
-          window.setTimeout(() => setProgress(null), 6000);
-        }
+        setProgress(
+          `Xong: +${r.newCount || 0} bài${r.reason ? ` (${r.reason})` : ""}`,
+        );
+        void load();
+        window.setTimeout(() => setProgress(null), 6000);
       }
     };
     try {
@@ -893,9 +917,9 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
   async function scan() {
     setScanning(true);
     flash("info", "Đang mở trang “Nhóm của bạn” và quét…", 4000);
-    const res = await bg<BgResponse & { scanned?: number; added?: number; updated?: number }>(
-      "SCAN_JOINED_GROUPS",
-    );
+    const res = await bg<
+      BgResponse & { scanned?: number; added?: number; updated?: number; removed?: number }
+    >("SCAN_JOINED_GROUPS");
     setScanning(false);
     if (!res.ok) {
       flash("err", res.error || "Quét nhóm thất bại.");
@@ -930,6 +954,10 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
   }
 
   async function crawl(g: Group) {
+    if (isBulkCrawlActive()) {
+      flash("err", "Đang crawl hàng loạt, hãy đợi xong hoặc bấm Dừng.");
+      return;
+    }
     const opts = buildCrawlOptions(settings);
     const handler = opts.method === "dom" ? "CRAWL_GROUP" : "CRAWL_GROUP_API";
     setCrawlingId(g.groupId);
@@ -947,89 +975,31 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
   }
 
   // ── Bulk crawl ──────────────────────────────────────────────────────────
-  // Facebook virtualizes the group feed and treats foreground focus as a
-  // singleton resource, so crawling MUST run one group at a time. We enforce
-  // that by draining a queue: fire one group, wait for its CRAWL_DONE, apply a
-  // randomized human-like gap, then fire the next. This mirrors the proven
-  // auto-crawl worker but is driven on demand from the dashboard.
-  async function crawlOne(g: Group) {
-    const opts = buildCrawlOptions(settingsRef.current);
-    const handler = opts.method === "dom" ? "CRAWL_GROUP" : "CRAWL_GROUP_API";
-    setCrawlingId(g.groupId);
-    const idx = bulkDoneRef.current + 1;
-    setProgress(`(${idx}/${bulkTotalRef.current}) Đang crawl ${g.groupName || g.groupId}…`);
-    const res = await bg<BgResponse & { tabId?: number }>(handler, {
-      groupId: g.groupId,
-      options: opts,
-    });
-    if (!res.ok) {
-      // Treat a failed dispatch like a finished group so the queue keeps moving
-      // instead of stalling forever waiting for a CRAWL_DONE that never comes.
-      flash("err", `${g.groupName || g.groupId}: ${res.error || "không crawl được"}.`);
-      setCrawlingId(null);
-      bulkDoneRef.current += 1;
-      setBulk({ total: bulkTotalRef.current, done: bulkDoneRef.current });
-      advanceQueue();
-    }
-    // On success, CRAWL_DONE drives the next step via advanceRef.
-  }
-
-  function advanceQueue() {
-    const next = queueRef.current.shift();
-    if (!next) {
-      // Drained — refresh data once and report the final tally.
-      const done = bulkDoneRef.current;
-      const total = bulkTotalRef.current;
-      bulkActiveRef.current = false;
-      setBulk(null);
-      setCrawlingId(null);
-      setProgress(`Đã crawl xong ${done}/${total} nhóm.`);
-      load();
-      window.setTimeout(() => setProgress(null), 8000);
-      return;
-    }
-    // Human-like gap between groups to avoid tripping rate limits.
-    const gap = randInt(20000, 90000);
-    setProgress(
-      `Nghỉ ${Math.round(gap / 1000)}s trước nhóm kế tiếp… (${bulkDoneRef.current}/${bulkTotalRef.current})`,
-    );
-    window.setTimeout(() => {
-      if (!bulkActiveRef.current) return;
-      void crawlOne(next);
-    }, gap);
-  }
-  // Keep the once-registered CRAWL_DONE listener pointing at the latest driver.
-  advanceRef.current = advanceQueue;
-
+  // Driver thật ở ui/src/lib/bulkCrawl.ts (module singleton). CrawlTab chỉ
+  // start/stop + hiển thị snapshot. Unmount tab không còn giết hàng đợi.
   function startBulk(list: Group[]) {
-    if (bulkActiveRef.current) return;
-    const queue = list.filter((g) => g && g.groupId);
-    if (queue.length === 0) {
-      flash("err", "Không có nhóm nào để crawl.");
+    if (isBulkCrawlActive()) {
+      flash("err", "Đang có phiên crawl hàng loạt.");
       return;
     }
     if (crawlingId) {
       flash("err", "Đang có một nhóm đang crawl, hãy đợi xong đã.");
       return;
     }
-    queueRef.current = queue.slice();
-    bulkTotalRef.current = queue.length;
-    bulkDoneRef.current = 0;
-    bulkActiveRef.current = true;
-    setBulk({ total: queue.length, done: 0 });
+    const queue = list.filter((g) => g && g.groupId);
+    const res = startBulkCrawl(
+      queue.map((g) => ({ groupId: g.groupId, groupName: g.groupName })),
+      buildCrawlOptions(settings),
+    );
+    if (!res.ok) {
+      flash("err", res.error || "Không bắt đầu được crawl hàng loạt.");
+      return;
+    }
     flash("info", `Bắt đầu crawl ${queue.length} nhóm (tuần tự).`, 4000);
-    const first = queueRef.current.shift();
-    if (first) void crawlOne(first);
   }
 
   function stopBulk() {
-    queueRef.current = [];
-    bulkActiveRef.current = false;
-    setBulk(null);
-    setProgress(
-      `Đã yêu cầu dừng sau nhóm hiện tại (${bulkDoneRef.current}/${bulkTotalRef.current}).`,
-    );
-    window.setTimeout(() => setProgress(null), 6000);
+    stopBulkCrawl();
   }
 
   function toggleSelect(groupId: string) {

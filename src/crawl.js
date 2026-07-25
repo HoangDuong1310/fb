@@ -825,101 +825,323 @@ async function crawlGroupApiTabless(groupId, options) {
 
 /* ----------------------- QUÉT NHÓM ĐÃ THAM GIA -------------------------- */
 
-/** Hàm tự-chứa chạy trong trang "Nhóm của bạn" để thu thập (groupId, groupName). */
+/**
+ * Hàm tự-chứa chạy trong trang "Nhóm của bạn" để thu thập (groupId, groupName).
+ *
+ * Tên nhóm lấy từ nguồn DOM chuẩn của FB, KHÔNG cắt/chế chuỗi bằng regex:
+ *  1) img[alt] / image[alt] avatar nhóm (FB thường gắn đúng tên)
+ *  2) aria-label trên link nhóm (nếu là tên sạch, không phải dòng activity)
+ *  3) text của ô tiêu đề (span[dir=auto] / strong / h2 / h3) — chọn ứng viên
+ *     hợp lệ điểm cao nhất, KHÔNG lấy shortest (shortest hay là "13 giờ")
+ *
+ * Chỉ validate/reject nhãn RÕ RÀNG không phải tên (mốc giờ, dòng "Lần hoạt
+ * động gần nhất"...). Không slice/cắt text thô để "làm sạch".
+ */
 async function scanJoinedGroupsInPage() {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  // Cuộn để tải hết danh sách nhóm.
-  for (let i = 0; i < 10; i++) {
+  // Cuộn để tải hết danh sách nhóm (lazy-load).
+  for (let i = 0; i < 12; i++) {
     window.scrollTo(0, document.body.scrollHeight);
     await sleep(800);
   }
+
   const RESERVED = new Set([
-    "joins", "feed", "discover", "create", "your_groups", "category", "search", "notifications",
+    "joins",
+    "feed",
+    "discover",
+    "create",
+    "your_groups",
+    "category",
+    "search",
+    "notifications",
   ]);
-  // Các đoạn path cho biết link trỏ tới bài viết/thông báo cụ thể chứ không phải trang chủ nhóm.
+  // Path phụ sau /groups/{id}/ => không phải trang chủ nhóm.
   const POST_SEGMENTS = new Set([
-    "posts", "permalink", "permalinks", "photo", "photos", "videos", "media",
-    "user", "members", "notif",
+    "posts",
+    "permalink",
+    "permalinks",
+    "photo",
+    "photos",
+    "videos",
+    "media",
+    "user",
+    "members",
+    "notif",
+    "about",
+    "files",
+    "events",
+    "rooms",
+    "announcements",
+    "member-requests",
+    "requests",
+    "rules",
+    "settings",
+    "pending_posts",
+    "scheduled_posts",
+    "live",
+    "search",
   ]);
-  // Các cụm cho biết text là dòng hoạt động/thông báo, không phải tên nhóm sạch.
-  const NOISE_MARKERS = [
-    "Lần hoạt động gần nhất",
-    "đã bình luận",
-    "đã đăng",
-    "đã chia sẻ",
-    "đã phản hồi",
-    "đã trả lời",
-    "đã thích",
-    "bài viết của bạn",
-  ];
-  // Làm sạch tên nhóm: bỏ tiền tố "Chưa đọc", cắt phần phụ đề hoạt động, bỏ mốc thời gian ở đuôi.
-  const cleanName = (raw) => {
-    let s = (raw || "").trim();
-    if (!s) return "";
-    s = s.replace(/^Chưa đọc\s*/i, "").trim();
-    let cut = s.length;
-    for (const mk of NOISE_MARKERS) {
-      const idx = s.indexOf(mk);
-      if (idx >= 0 && idx < cut) cut = idx;
+
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+
+  /**
+   * Tên nhóm "sạch" theo DOM dump /groups/joins/ (2026-07-21):
+   * - OK: span[dir=auto] chỉ chứa tên ("Chợ PC Cũ Mới Hà Nội")
+   * - BAD: "Xem nhóm", "56 phút", "Lần hoạt động gần nhất…",
+   *        "Chưa đọcName: \"post\"…", emoji avatar alt (🌈/🔥)
+   * Không slice/regex "làm sạch" chuỗi dính — reject cả chuỗi nếu không phải tên.
+   */
+  const isPureGroupName = (raw) => {
+    const t = norm(raw);
+    if (t.length < 2 || t.length > 160) return false;
+    if (/^https?:/i.test(t)) return false;
+    // CTA / chrome UI (dump: rowTitle "Xem nhóm")
+    if (/^xem nhóm$/i.test(t)) return false;
+    if (/^(see group|view group)$/i.test(t)) return false;
+    // Notification / unread composite (dump: aText bắt đầu "Chưa đọc…")
+    if (/^chưa đọc/i.test(t)) return false;
+    if (/^unread\b/i.test(t)) return false;
+    // Activity / last-visit lines (dump titleNodes[1])
+    if (/lần hoạt động gần nhất/i.test(t)) return false;
+    if (/lần truy cập gần đây/i.test(t)) return false;
+    if (/last active|last activity|last visit/i.test(t)) return false;
+    // Relative time only
+    if (
+      /^\d+([.,]\d+)?\s*(giây|phút|giờ|ngày|tuần|tháng|năm)(\s*trước)?$/i.test(t)
+    ) {
+      return false;
     }
-    s = s.slice(0, cut).trim();
-    // Bỏ mốc thời gian tương đối ở đuôi, vd ".3 giờ", ".41 phút", "1 tuần".
-    s = s.replace(/[.\s]*\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm)(\s*trước)?$/i, "").trim();
-    // Bỏ dấu câu thừa ở đuôi.
-    s = s.replace(/[:.\-\s]+$/, "").trim();
-    return s;
+    if (
+      /^\d+([.,]\d+)?\s*(sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)(\s*ago)?$/i.test(
+        t
+      )
+    ) {
+      return false;
+    }
+    if (
+      /^(vừa xong|just now|hôm qua|yesterday|vài giây(\s*trước)?)$/i.test(t)
+    ) {
+      return false;
+    }
+    // Notification post preview embeds quotes (dump: Name: "FULL BỘ PC…")
+    if (/["“”]/.test(t)) return false;
+    // Emoji-only avatar alt (dump img alt "🌈" / "🔥") — không phải tên
+    if (!/\p{L}/u.test(t)) return false;
+    return true;
   };
-  const map = {};
+
+  /** Unescape chuỗi JSON-ish trong script tag (cùng logic dump). */
+  const unescJsonStr = (s) => {
+    try {
+      return JSON.parse('"' + s + '"');
+    } catch (e) {
+      return String(s)
+        .replace(/\\"/g, '"')
+        .replace(/\\u([\dA-Fa-f]{4})/g, (_, h) =>
+          String.fromCharCode(parseInt(h, 16))
+        );
+    }
+  };
+
+  /**
+   * Nguồn tên chuẩn #1 (dump.scriptGroups): payload nhúng trong <script>
+   * cặp "id":"<digits>" ↔ "name":"<group name>" trong ~240 ký tự.
+   * Trên dump thực tế: 7/7 nhóm có id→name đúng (kể cả SPICY BOX GROUP).
+   */
+  const scriptNameById = Object.create(null);
+  const scriptIdsByName = Object.create(null);
+  const reNameId =
+    /"name"\s*:\s*"((?:\\.|[^"\\]){2,160})"[\s\S]{0,240}?"id"\s*:\s*"(\d{5,})"/g;
+  const reIdName =
+    /"id"\s*:\s*"(\d{5,})"[\s\S]{0,240}?"name"\s*:\s*"((?:\\.|[^"\\]){2,160})"/g;
+
+  for (const sc of document.querySelectorAll("script")) {
+    const text = sc.textContent || "";
+    if (text.length < 50) continue;
+    if (!/\/groups\//.test(text) && !/Group/.test(text)) continue;
+
+    let m;
+    reNameId.lastIndex = 0;
+    while ((m = reNameId.exec(text))) {
+      const name = norm(unescJsonStr(m[1]));
+      const id = m[2];
+      if (!id || !isPureGroupName(name)) continue;
+      if (!scriptNameById[id]) scriptNameById[id] = name;
+      if (!scriptIdsByName[name]) scriptIdsByName[name] = [];
+      if (!scriptIdsByName[name].includes(id)) scriptIdsByName[name].push(id);
+    }
+    reIdName.lastIndex = 0;
+    while ((m = reIdName.exec(text))) {
+      const id = m[1];
+      const name = norm(unescJsonStr(m[2]));
+      if (!id || !isPureGroupName(name)) continue;
+      if (!scriptNameById[id]) scriptNameById[id] = name;
+      if (!scriptIdsByName[name]) scriptIdsByName[name] = [];
+      if (!scriptIdsByName[name].includes(id)) scriptIdsByName[name].push(id);
+    }
+  }
+
+  /**
+   * Lấy tên thuần từ 1 anchor trang chủ nhóm (fallback khi không có script).
+   * Dump: activity card có titleNodes = [tên thuần, "Lần hoạt động…"];
+   * list "Tất cả các nhóm…" có leaf name / row span tên thuần; KHÔNG dùng img alt.
+   */
+  const pureNameFromAnchor = (a) => {
+    const titles = a.querySelectorAll(
+      'span[dir="auto"], strong, h1, h2, h3, span[role="link"]'
+    );
+    for (const el of titles) {
+      const t = norm(el.textContent);
+      if (isPureGroupName(t)) return t;
+    }
+    // Leaf link: aText === pure name only (dump: "Chợ PC Cũ Mới Hà Nội")
+    const aText = norm(a.textContent);
+    if (isPureGroupName(aText)) return aText;
+
+    // Card cha (list item): span tên sibling khi <a> avatar rỗng text
+    const row =
+      a.closest('[role="listitem"], [role="article"], [data-pagelet], li') ||
+      a.parentElement;
+    if (row && row !== a) {
+      const rowSpans = row.querySelectorAll('span[dir="auto"], strong, h1, h2, h3');
+      for (const el of rowSpans) {
+        const t = norm(el.textContent);
+        if (isPureGroupName(t)) return t;
+      }
+    }
+    return "";
+  };
+
+  // Membership = home links trên trang joins (dump: 7 groupId).
+  // entry: { domId, name, nameSource: 'script'|'dom' }
+  const byDomId = Object.create(null);
+
   document.querySelectorAll('a[href*="/groups/"]').forEach((a) => {
-    const href = a.href || "";
-    const path = href.split(/[?#]/)[0];
-    const m = path.match(/\/groups\/([^/]+)(\/[^?#]*)?$/);
+    const href = a.href || a.getAttribute("href") || "";
+    if (!href) return;
+    let path = "";
+    try {
+      path = new URL(href, location.origin).pathname;
+    } catch (e) {
+      path = String(href).split(/[?#]/)[0];
+    }
+    const m = path.match(/\/groups\/([^/]+)(\/.*)?$/);
     if (!m) return;
     const id = m[1];
-    if (RESERVED.has(id)) return;
-    // Bỏ qua link trỏ tới bài viết/thông báo cụ thể (vd /groups/{id}/posts/...).
+    if (!id || RESERVED.has(id)) return;
     const rest = (m[2] || "").replace(/^\/+|\/+$/g, "");
+    // Chỉ trang chủ nhóm: /groups/{id} hoặc /groups/{id}/
     if (rest && POST_SEGMENTS.has(rest.split("/")[0])) return;
-    const name = cleanName(a.textContent || "");
-    if (
-      name &&
-      name.length > 1 &&
-      name.length < 120 &&
-      !/^https?:/i.test(name) &&
-      !NOISE_MARKERS.some((mk) => name.includes(mk)) &&
-      !map[id]
-    ) {
-      map[id] = name;
+
+    const scriptName = scriptNameById[id] ? norm(scriptNameById[id]) : "";
+    const domName = pureNameFromAnchor(a);
+    const name = scriptName || domName;
+    if (!name) return;
+
+    const prev = byDomId[id];
+    // Ưu tiên tên từ script; nếu đã có script thì giữ.
+    if (!prev) {
+      byDomId[id] = {
+        domId: id,
+        name,
+        nameSource: scriptName ? "script" : "dom",
+      };
+      return;
+    }
+    if (prev.nameSource !== "script" && scriptName) {
+      byDomId[id] = { domId: id, name: scriptName, nameSource: "script" };
+    } else if (prev.nameSource !== "script" && domName && domName.length > prev.name.length) {
+      // Cùng nguồn DOM: giữ tên thuần dài hơn (tránh mảnh UI ngắn lọt).
+      byDomId[id] = { domId: id, name: domName, nameSource: "dom" };
     }
   });
-  return Object.keys(map).map((id) => ({ groupId: id, groupName: map[id] }));
+
+  /**
+   * Slug ↔ numeric: dump có DOM id "spicybox.vn" (scriptName null) nhưng
+   * script id "890568078717431" = "SPICY BOX GROUP" trùng tên DOM thuần.
+   * Chỉ remap khi đúng 1 script id khớp tên (tránh 2 nhóm cùng tên).
+   */
+  const out = Object.create(null);
+  for (const domId of Object.keys(byDomId)) {
+    const entry = byDomId[domId];
+    let groupId = domId;
+    let groupName = entry.name;
+
+    if (!/^\d{5,}$/.test(domId)) {
+      const matches = scriptIdsByName[groupName] || [];
+      if (matches.length === 1) {
+        groupId = matches[0];
+        groupName = scriptNameById[groupId] || groupName;
+      }
+    } else if (scriptNameById[domId]) {
+      groupName = scriptNameById[domId];
+    }
+
+    // Nếu vừa slug vừa numeric cùng nhóm → giữ bản numeric (đã remap).
+    const prev = out[groupId];
+    if (!prev || (prev.fromSlug && /^\d{5,}$/.test(groupId))) {
+      out[groupId] = {
+        groupId,
+        groupName,
+        fromSlug: !/^\d{5,}$/.test(domId) && groupId !== domId,
+      };
+    }
+  }
+
+  return Object.keys(out).map((id) => ({
+    groupId: out[id].groupId,
+    groupName: out[id].groupName,
+  }));
 }
 
-/** Mở trang "Nhóm của bạn", quét rồi lưu danh sách nhóm vào IndexedDB. */
+/**
+ * Mở trang "Nhóm của bạn", quét membership hiện tại rồi đồng bộ lên server.
+ * Dùng replace:true để GỠ các nhóm user đã rời (không còn trong lần quét mới).
+ */
 async function scanJoinedGroups() {
   const url = "https://www.facebook.com/groups/joins/";
   const active = await shouldFocusTabs();
   const tab = await new Promise((r) => chrome.tabs.create({ url, active }, r));
-  await waitTabComplete(tab.id, 30000);
-  await sleep(2500);
-  let res;
+  let groups = [];
   try {
-    res = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: scanJoinedGroupsInPage,
-    });
-  } catch (e) {
-    return { ok: false, error: "Không quét được nhóm: " + String(e) };
+    await waitTabComplete(tab.id, 30000);
+    await sleep(2500);
+    let res;
+    try {
+      res = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: scanJoinedGroupsInPage,
+      });
+    } catch (e) {
+      return { ok: false, error: "Không quét được nhóm: " + String(e) };
+    }
+    groups = (res && res[0] && res[0].result) || [];
+  } finally {
+    // Đóng tab quét để không để sót tab (giống các flow job khác).
+    try {
+      await chrome.tabs.remove(tab.id);
+    } catch (e) {}
   }
-  const groups = (res && res[0] && res[0].result) || [];
+
   if (!groups.length) {
     return {
       ok: false,
-      error: "Không tìm thấy nhóm nào. Hãy chắc chắn đã đăng nhập và mở trang 'Nhóm của bạn'.",
+      error:
+        "Không tìm thấy nhóm nào. Hãy chắc chắn đã đăng nhập và mở trang 'Nhóm của bạn'.",
     };
   }
-  const saved = await DB.saveGroups(groups);
-  return { ok: true, scanned: groups.length, added: saved.added, updated: saved.updated };
+
+  // replace:true = đồng bộ membership: thêm/cập nhật nhóm quét được + gỡ nhóm
+  // không còn trong lần quét (user đã rời). Server xoá user_groups, không xoá
+  // bản ghi groups/posts dùng chung.
+  const saved = await DB.saveGroups(groups, { replace: true });
+  return {
+    ok: true,
+    scanned: groups.length,
+    added: saved.added,
+    updated: saved.updated,
+    removed: saved.removed,
+  };
 }
 
 /* ----------------------- AUTOMATION: ĐĂNG BÀI --------------------------- */

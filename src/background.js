@@ -31,11 +31,12 @@ import {
   seedPriceSources,
 } from "./prices.js";
 import { listSheetTabs, previewSheet, importSheetTabs } from "./sheets.js";
+// CHỈ import những gì background thực sự dùng. listModels/spinPostContent/
+// generatePostContent đã chuyển sang SERVER-SIDE (/api/ai/models, /api/ai/spin-post,
+// /api/ai/generate-content) nên không còn gọi bản client trong ai.js nữa — giữ lại
+// trong danh sách import chỉ làm người đọc tưởng luồng AI vẫn chạy bằng key ở máy.
 import {
   discoverSelectors,
-  listModels,
-  spinPostContent,
-  generatePostContent,
   planSpinHttpChunks,
   mergeSpinHttpChunks,
   SPIN_HTTP_CHUNK_SIZE,
@@ -1529,18 +1530,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case "RUN_GROUP_PRICE_EXTRACTION": {
       (async () => {
         await readyPromise;
-        // SERVER-SIDE AI: tiêm aiCall gọi /api/ai/extract-group-prices để key AI
-        // không rời server; phần nạp keyword/posts + lưu vẫn ở SW như cũ.
-        const result = await runGroupPriceExtraction({
-          aiCall: async (batch, sellKeywords) => {
-            const resp = await API.apiFetch("/api/ai/extract-group-prices", {
-              method: "POST",
-              body: JSON.stringify({ batch, sellKeywords }),
-            });
-            return (resp && resp.results) || [];
-          },
-        });
-        sendResponse({ ok: true, ...result });
+        // Giữ service worker thức y như RUN_LEAD_CLASSIFICATION: phễu này cũng là
+        // job DÀI (extractBatch gọi AI tuần tự theo lô 15 bài, rồi POST /api/keywords
+        // lần lượt cho từng keyword mới). MV3 cho SW ngủ khi "im" 30s -> ngủ giữa
+        // chừng thì sendResponse không bao giờ bắn và UI kẹt ở trạng thái "đang chạy".
+        const keepAlive = setInterval(() => {
+          try {
+            chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError);
+          } catch (_) {}
+        }, 20000);
+        try {
+          // SERVER-SIDE AI: tiêm aiCall gọi /api/ai/extract-group-prices để key AI
+          // không rời server; phần nạp keyword/posts + lưu vẫn ở SW như cũ.
+          const result = await runGroupPriceExtraction({
+            aiCall: async (batch, sellKeywords) => {
+              const resp = await API.apiFetch("/api/ai/extract-group-prices", {
+                method: "POST",
+                body: JSON.stringify({ batch, sellKeywords }),
+              });
+              return (resp && resp.results) || [];
+            },
+          });
+          sendResponse({ ok: true, ...result });
+        } finally {
+          clearInterval(keepAlive);
+        }
       })().catch((e) => {
         const clean = String((e && e.message) || e).replace(/^API\s+\d+:\s*/, "");
         sendResponse({ ok: false, error: clean });
@@ -1757,6 +1771,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const user = (data && data.user) || null;
         await setAuthUser(user);
         sendResponse({ ok: true, user });
+        // Mở WebSocket lệnh từ xa với token MỚI. Khối khởi tạo chỉ gọi
+        // connectRealtime() một lần lúc SW thức dậy: nếu lúc đó chưa đăng nhập
+        // thì socket không bao giờ mở trong cả vòng đời SW này -> lệnh từ xa chỉ
+        // về theo alarm "cmdPoll" (trễ tới 30s). Gọi lại ở đây để có push ngay.
+        try { connectRealtime(); } catch (_) {}
         // Seed lại nguồn giá ngay sau khi có token hợp lệ. Nếu SW khởi động lúc
         // CHƯA đăng nhập thì seed lúc khởi tạo đã 401 và bị bỏ qua -> mục "Nguồn
         // dữ liệu giá" trống. Chạy lại ở đây để 4 nguồn mặc định xuất hiện ngay
@@ -1789,6 +1808,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const user = (data && data.user) || null;
         await setAuthUser(user);
         sendResponse({ ok: true, user });
+        // Mở WebSocket lệnh từ xa với token mới (xem ghi chú ở AUTH_LOGIN).
+        try { connectRealtime(); } catch (_) {}
         // Seed nguồn giá ngay sau khi đăng ký xong (token mới, hợp lệ) để user
         // mới thấy 4 nguồn mặc định ngay, không phải đợi SW khởi động lại.
         pruneLegacySources().then(() => seedPriceSources()).catch(() => {});
@@ -1797,7 +1818,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     // Đăng xuất: xoá token (cả cache in-memory lẫn chrome.storage.local) + user.
+    // PHẢI đóng WebSocket lệnh từ xa trước: socket đã xác thực bằng token cũ vẫn
+    // sống sau khi xoá token, nên server vẫn đẩy lệnh của tài khoản vừa đăng xuất
+    // xuống máy này và extension vẫn thực thi (đăng bài / bình luận). Ngoài ra
+    // onclose sẽ tự scheduleReconnect() thành vòng lặp kết nối lại vô ích khi đã
+    // không còn token. disconnectRealtime() đóng code 1000 (không reconnect) và
+    // dọn luôn reconnectTimer đang chờ.
     case "AUTH_LOGOUT": {
+      try { disconnectRealtime(); } catch (_) {}
       API.setToken(null);
       setAuthUser(null).finally(() => sendResponse({ ok: true }));
       return true;
