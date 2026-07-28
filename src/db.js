@@ -129,11 +129,13 @@ async function saveGroup(group) {
   return { ...group };
 }
 
-/** Lưu nhiều nhóm. `replace:true` đồng bộ membership theo đúng lần quét mới,
- * đồng thời gỡ các nhóm không còn xuất hiện. */
+/** Lưu nhiều nhóm. `replace:true` đồng bộ membership theo đúng lần quét mới:
+ * gỡ các nhóm không còn xuất hiện VÀ xoá hẳn dòng nhóm nếu không còn ai tham
+ * gia (server trả về `groupsDeleted`). Bài viết/giá đã crawl được giữ lại. */
 async function saveGroups(groups, opts = {}) {
-  if (!Array.isArray(groups)) return { added: 0, updated: 0, removed: 0 };
-  if (!groups.length && opts.replace !== true) return { added: 0, updated: 0, removed: 0 };
+  const EMPTY = { added: 0, updated: 0, removed: 0, groupsDeleted: 0 };
+  if (!Array.isArray(groups)) return { ...EMPTY };
+  if (!groups.length && opts.replace !== true) return { ...EMPTY };
   const body = await apiFetch("/api/groups", {
     method: "POST",
     body: JSON.stringify({ groups, replace: opts.replace === true }),
@@ -142,6 +144,7 @@ async function saveGroups(groups, opts = {}) {
     added: body?.added || 0,
     updated: body?.updated || 0,
     removed: body?.removed || 0,
+    groupsDeleted: body?.groupsDeleted || 0,
   };
 }
 
@@ -151,7 +154,9 @@ async function getGroups() {
   return Array.isArray(body?.groups) ? body.groups : [];
 }
 
-/** Xóa một nhóm (không xóa bài đã crawl của nhóm đó). Trả về true. */
+/** Xoá một nhóm khỏi danh sách của tài khoản. Server gỡ membership và xoá hẳn
+ * dòng nhóm nếu không còn ai tham gia; bài đã crawl của nhóm đó được GIỮ LẠI.
+ * Trả về true. */
 async function deleteGroup(groupId) {
   await apiFetch("/api/groups/" + encodeURIComponent(groupId), {
     method: "DELETE",

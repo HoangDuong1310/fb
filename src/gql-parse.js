@@ -34,11 +34,23 @@ export function hashStr(s) {
   return h.toString(36);
 }
 
-/** Vân tay nội dung cho bài ẩn permalink. Cùng công thức với content.js.fingerprintId. */
+/** Vân tay nội dung cho bài ẩn permalink. Cùng công thức với content.js.fingerprintId.
+ *
+ *  ĐIỀU KIỆN TỐI THIỂU (chống sinh bài rác — đã xác minh trên DB thật):
+ *  phải có TÁC GIẢ **hoặc** có TEXT. Chỉ có ảnh là KHÔNG đủ để định danh, vì khi
+ *  authorName="" và text="" thì basis thoái hoá thành ĐÚNG url ảnh. Hệ quả đã
+ *  quan sát được: các story video/reel (thumbnail t15.5256-10) bị FB trả về không
+ *  kèm actor lẫn message -> sinh bài "Không rõ / thiếu link gốc", và cùng một
+ *  thumbnail xuất hiện ở 2 nhóm khác nhau lại cho CÙNG hash (đã thấy sgyc24,
+ *  y8howe, ov0a4n lặp ở 2 groupId), tức vân tay mất luôn tính phân biệt. */
 export function fingerprintId(groupId, authorName, text, images) {
   const norm = String(text || "").replace(/\s+/g, " ").trim().slice(0, 240);
   const img0 = images && images[0] ? String(images[0]).split("?")[0] : "";
+  // Không có tác giả VÀ không có text => không đủ định danh (ảnh đơn độc không tính).
+  if (!String(authorName || "").trim() && !norm) return null;
   if (!norm && !img0) return null;
+  // GIỮ NGUYÊN công thức basis (không trim authorName) để id vân tay của các bài
+  // đã lưu trước đây không đổi -> dedup giữa các phiên crawl vẫn đúng.
   const basis = String(authorName || "") + "|" + norm + "|" + img0;
   return "fp:" + groupId + ":" + hashStr(basis);
 }
@@ -368,6 +380,14 @@ export function mapEdgeToPost(node, ctx) {
   const images = extractImagesFromNode(node);
 
   let postId = extractPostIdFromNode(node);
+
+  // ĐIỀU KIỆN TỐI THIỂU (đối xứng với extractPost trong src/content.js):
+  // thiếu CẢ permalink/postId thật LẪN tác giả => không phải bài dùng được, bỏ.
+  // Đây chính là chữ ký của rác đã quan sát trên DB thật: postId "fp:", tác giả
+  // rỗng, text rỗng, timestamp null, đúng 1 ảnh thumbnail video/reel — hiển thị
+  // ra Feed thành "Không rõ" + "thiếu link gốc nên chưa bình luận được".
+  if (!postId && !String(author.authorName || "").trim()) return null;
+
   if (!postId) {
     postId = fingerprintId(groupId, author.authorName, text, images);
   }

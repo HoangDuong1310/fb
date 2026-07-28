@@ -581,16 +581,33 @@ export async function spinPostContent(payload) {
 /* AI TỰ VIẾT NỘI DUNG ĐĂNG BÀI (sinh mới từ YÊU CẦU của người dùng)         */
 /* ======================================================================== */
 
+/* GIỌNG VĂN — mô tả CÁCH NÓI của người bán thật, không phải "phong cách content".
+ * Mỗi spec nói rõ: xưng hô, độ dài câu, và thói quen viết đặc trưng. Mục tiêu là
+ * bài đọc lên giống người gõ tay trên điện thoại, không giống bài do AI dựng khung.
+ * PHẢI GIỮ ĐỒNG BỘ với POST_TONE_SPECS trong server/web/ai.js (bản chạy thật). */
 const POST_TONE_SPECS = {
   "than-thien":
-    "thân thiện, gần gũi như đang trò chuyện với bạn bè.",
+    "như nhắn tin cho người quen: xưng 'mình', gọi 'bạn'/'cả nhà'. Câu ngắn, có thể " +
+    "dùng khẩu ngữ ('để lại', 'ai cần thì', 'nay mình có'). Không trịnh trọng.",
   "chuyen-nghiep":
-    "chuyên nghiệp, chỉn chu, tập trung vào lợi ích và uy tín.",
+    "như chủ shop nói việc: xưng 'bên mình', gọi 'anh/chị'. Nói thẳng thông tin, " +
+    "gọn, không hoa mỹ, không cam kết quá lời. Kiểu báo giá rõ ràng chứ không quảng cáo.",
   "nang-dong":
-    "trẻ trung, năng động, bắt trend, câu ngắn tạo năng lượng.",
+    "trẻ, nói nhanh, câu rất ngắn (3-8 từ), có thể tách dòng liên tục. Dùng từ đời " +
+    "thường của người bán online, tránh từ sách vở.",
   "khan-truong":
-    "thúc đẩy chốt đơn, nhấn mạnh khuyến mãi/giới hạn thời gian, kêu gọi hành động mạnh.",
+    "gấp gáp có lý do THẬT (còn ít hàng, hết đợt khuyến mãi, cần bán nhanh). Nói " +
+    "thẳng số lượng/thời hạn nếu người dùng có cung cấp. TUYỆT ĐỐI không hô hào " +
+    "sáo rỗng kiểu 'nhanh tay kẻo hết', 'số lượng có hạn' khi không có số thật.",
 };
+
+/* Các dấu hiệu "văn AI" thường gặp trong content bán hàng tiếng Việt. Liệt kê thẳng
+ * vào prompt vì mô hình chỉ tránh được khi biết CỤ THỂ cần tránh cái gì. */
+const AI_CLICHES =
+  "'Bạn đang tìm kiếm...?', 'Đừng bỏ lỡ', 'Nhanh tay kẻo hết', 'Số lượng có hạn', " +
+  "'Cơ hội duy nhất', 'Sản phẩm chất lượng cao', 'Uy tín hàng đầu', 'Giải pháp hoàn hảo', " +
+  "'Trải nghiệm tuyệt vời', 'Đẳng cấp', 'Sự lựa chọn thông minh', 'Liên hệ ngay để được " +
+  "tư vấn miễn phí', 'Hãy để chúng tôi đồng hành', 'không thể tuyệt vời hơn'";
 
 /**
  * Dựng ĐOẠN NGỮ CẢNH NGÀNH từ hồ sơ đang kích hoạt, để nhét vào system prompt của
@@ -650,23 +667,34 @@ export async function generatePostContent(payload) {
   const multi =
     count > 1
       ? "Vì sẽ đăng lên " + count + " nhóm khác nhau, hãy viết " + count +
-        " BIẾN THỂ KHÁC NHAU RÕ RỆT (đổi câu chữ, cách mở đầu/kết, thứ tự ý) " +
-        "để tránh bị Facebook gắn cờ trùng nội dung — nhưng CÙNG bán một sản phẩm/thông điệp.\n"
-      : "Hãy viết 1 bài đăng hoàn chỉnh.\n";
+        " BIẾN THỂ KHÁC NHAU RÕ RỆT — khác cả CÁCH MỞ ĐẦU, độ dài và thứ tự ý (bài mở " +
+        "bằng tên món, bài mở bằng giá, bài mở bằng lý do bán...) để tránh bị Facebook " +
+        "gắn cờ trùng nội dung. Cùng bán một sản phẩm/thông điệp nhưng KHÔNG dùng lại " +
+        "cùng một khung câu.\n"
+      : "Hãy viết 1 bài đăng.\n";
 
   const sys =
-    "Bạn là CHUYÊN GIA VIẾT CONTENT BÁN HÀNG trên Facebook, tiếng Việt. Người dùng " +
-    "mô tả YÊU CẦU (sản phẩm, ưu đãi, thông tin cần có) và bạn TỰ VIẾT bài đăng bán " +
-    "hàng hoàn chỉnh, sẵn sàng đăng lên nhóm.\n" +
+    "Bạn LÀ người bán hàng thật ở Việt Nam đang tự tay gõ bài đăng lên Facebook — " +
+    "không phải AI, không phải nhân viên marketing. Viết như người thật gõ trên điện thoại.\n" +
     industry +
-    "QUY TẮC BẮT BUỘC:\n" +
-    "1) Bám sát YÊU CẦU: đầy đủ thông tin người dùng nêu (sản phẩm, giá, khuyến mãi, " +
-    "số điện thoại, link...). KHÔNG bịa số liệu/giá/liên hệ nếu người dùng không cung cấp.\n" +
+    "QUY TẮC:\n" +
+    "1) Bám sát yêu cầu, đủ thông tin người dùng nêu (sản phẩm, giá, khuyến mãi, liên hệ...). " +
+    "KHÔNG bịa số liệu/giá/liên hệ/cam kết nếu không được cung cấp. Yêu cầu có gì nói nấy, " +
+    "KHÔNG thêm ý cho bài dài ra.\n" +
     "2) Giọng văn: " + toneSpec + "\n" +
-    "3) Cấu trúc hấp dẫn: mở đầu thu hút → lợi ích/điểm nổi bật → lời kêu gọi hành động (CTA). " +
-    "Dùng xuống dòng để dễ đọc trên Facebook.\n" +
-    "4) TUYỆT ĐỐI KHÔNG dùng emoji/icon/ký tự đặc biệt trang trí. Chỉ dùng chữ, số và dấu câu thông thường.\n" +
-    "5) TUYỆT ĐỐI không thêm tiêu đề kiểu 'Biến thể 1', không giải thích ngoài lề.\n" +
+    "3) NGẮN. Tối đa 5 dòng ngắn (khoảng 40-90 từ), trừ khi yêu cầu có nhiều thông tin bắt " +
+    "buộc phải nêu. Mỗi dòng một ý. Người mua đọc trên điện thoại và bỏ qua bài dài.\n" +
+    "4) KHÔNG viết theo khung quảng cáo (mở đầu câu hỏi thu hút → liệt kê lợi ích → kêu gọi " +
+    "hành động). Vào thẳng việc: đang bán gì, giá bao nhiêu, liên hệ sao. Cuối bài chỉ cần " +
+    'một câu chốt bình thường ("cần thì inbox mình", "ai lấy để lại số"), KHÔNG hô hào.\n' +
+    "5) CẤM các cụm sáo rỗng kiểu AI sau (và các biến thể tương tự): " + AI_CLICHES + ". " +
+    "Cấm tính từ thổi phồng không có căn cứ (tuyệt vời, hoàn hảo, đỉnh cao, số 1). " +
+    "Nói cụ thể thay vì khen chung.\n" +
+    "6) KHÔNG emoji/icon/ký tự trang trí, KHÔNG gạch đầu dòng máy móc, KHÔNG viết HOA cả câu, " +
+    "KHÔNG hashtag trừ khi yêu cầu có. Chỉ chữ, số, dấu câu thường.\n" +
+    "7) Tiếng Việt đúng chính tả, đủ dấu. Được phép viết câu không đủ chủ ngữ - vị ngữ cho " +
+    'tự nhiên (kiểu "Còn 2 cái cuối.").\n' +
+    "8) Không thêm tiêu đề kiểu 'Biến thể 1', không giải thích, không ghi chú ngoài bài.\n" +
     multi +
     'CHỈ trả JSON hợp lệ, KHÔNG bọc code fence. Cấu trúc: {"variants":["nội dung 1","nội dung 2", ...]} ' +
     "với đúng " + count + " phần tử.";
@@ -706,11 +734,29 @@ export async function generatePostContent(payload) {
     if (resp && (resp.status === 400 || resp.status === 422)) {
       resp = await callOnce(false);
     }
+    // 502/503/504 thường là lỗi tạm của nhà cung cấp — thử lại một lần.
+    if (resp && (resp.status === 502 || resp.status === 503 || resp.status === 504)) {
+      await new Promise((r) => setTimeout(r, 1500));
+      resp = await callOnce(true);
+    }
   } catch (e) {
     return { ok: false, error: "Gọi AI thất bại: " + String(e) };
   }
   if (!resp || !resp.ok) {
-    return { ok: false, error: "AI trả lỗi (HTTP " + (resp ? resp.status : "?") + ")." };
+    const status = resp ? resp.status : 0;
+    const detail = resp ? await resp.text().catch(() => "") : "";
+    const hint =
+      status === 401 || status === 403
+        ? " — API key sai hoặc hết hạn."
+        : status === 429
+          ? " — vượt giới hạn gọi, thử lại sau ít phút."
+          : status >= 500
+            ? " — máy chủ AI đang lỗi, thử lại sau hoặc đổi model."
+            : "";
+    return {
+      ok: false,
+      error: "AI " + (status || "?") + hint + (detail ? " " + detail.slice(0, 200) : ""),
+    };
   }
 
   let data;

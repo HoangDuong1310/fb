@@ -253,7 +253,11 @@ async function crawlOne(g: BulkGroup) {
   state.progress = `(${idx}/${state.total}) Đang crawl ${name}…`;
   emit();
 
-  const opts = state.options || { method: "api" };
+  // NHÃN TRUY NGUYÊN (B2): gắn Ở ĐÂY (crawlOne) chứ không gắn ở startBulkCrawl,
+  // vì đây là điểm duy nhất mọi nhóm trong hàng đợi đều đi qua — kể cả nhóm được
+  // thêm vào sau, hay lần thử lại sau khi dispatch lỗi. Ghi ĐÈ sau khi rải
+  // state.options để cấu hình đã lưu không thể mạo nhãn khác.
+  const opts = { ...(state.options || { method: "api" }), trigger: "bulk" };
   const handler = opts.method === "dom" ? "CRAWL_GROUP" : "CRAWL_GROUP_API";
   const res = await bg<BgResponse & { tabId?: number }>(handler, {
     groupId: g.groupId,

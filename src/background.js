@@ -30,7 +30,17 @@ import {
   pruneLegacySources,
   seedPriceSources,
 } from "./prices.js";
-import { listSheetTabs, previewSheet, importSheetTabs } from "./sheets.js";
+import {
+  listSheetTabs,
+  previewSheet,
+  importSheetTabs,
+  SHEET_ALARM,
+  getSheetConfigResult,
+  applySheetConfig,
+  syncMyStoreSheet,
+  processSheetSync,
+  initSheetSync,
+} from "./sheets.js";
 // CHỈ import những gì background thực sự dùng. listModels/spinPostContent/
 // generatePostContent đã chuyển sang SERVER-SIDE (/api/ai/models, /api/ai/spin-post,
 // /api/ai/generate-content) nên không còn gọi bản client trong ai.js nữa — giữ lại
@@ -627,9 +637,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case "IMPORT_SHEET": {
-      importSheetTabs(msg.spreadsheetId, msg.tabs || [])
+      // prune: xoá sản phẩm mystore không còn trong Sheet (đồng bộ 2 chiều).
+      // Mặc định TẮT cho lệnh nhập tay để lần nhập thêm 1 tab không xoá tab khác.
+      importSheetTabs(msg.spreadsheetId, msg.tabs || [], { prune: !!msg.prune })
         .then((r) => sendResponse({ ok: true, ...r }))
         .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Đọc cấu hình sheet đã lưu (link + tab + chu kỳ + kết quả lần cuối).
+    case "GET_SHEET_CONFIG": {
+      (async () => {
+        await readyPromise;
+        const r = await getSheetConfigResult();
+        sendResponse({
+          ok: !!r.ok,
+          config: r.config,
+          source: r.source || (r.ok ? "server" : "default"),
+          stale: !!r.stale || !r.ok,
+          status: r.status || (r.ok ? "found" : "server_error"),
+          found: !!r.found,
+          error: r.ok ? undefined : r.message,
+        });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Lưu cấu hình + đặt lại alarm tự đồng bộ.
+    case "SET_SHEET_CONFIG": {
+      (async () => {
+        await readyPromise;
+        const cfg = await applySheetConfig(msg.config || {});
+        sendResponse({ ok: true, config: cfg });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    // Đồng bộ ngay theo cấu hình đã lưu (bấm tay -> force, bỏ qua cờ enabled).
+    case "SYNC_SHEET_NOW": {
+      (async () => {
+        await readyPromise;
+        const r = await syncMyStoreSheet({ force: true });
+        sendResponse(r && r.ok ? { ...r } : { ok: false, ...(r || {}) });
+      })().catch((e) => sendResponse({ ok: false, error: String(e) }));
       return true;
     }
 
@@ -2011,6 +2061,11 @@ try {
     else if (a.name === "cmdPoll") pollRemoteCommands();
     else if (a.name === AUTOCRAWL_ALARM) processAutoCrawl();
     else if (a.name === AUTOSYNC_ALARM) processAutoSync();
+    else if (a.name === SHEET_ALARM) {
+      // Đọc settings qua Backend -> phải chờ token nạp xong, nếu không lần chạy
+      // này thấy cấu hình rỗng và tự bỏ qua.
+      readyPromise.then(() => processSheetSync()).catch(() => {});
+    }
     else if (a.name === WATCH_ALARM) processReplyWatch();
     else if (a.name === WARMING_ALARM) {
       // Alarm một-lần: chờ token sẵn sàng, chạy lượt rồi TỰ lên lịch lượt kế tiếp.
@@ -2025,6 +2080,7 @@ try {
   initAutoCrawl();
   initAutoSync();
   initReplyWatch();
+  readyPromise.then(() => initSheetSync()).catch(() => {});
   // Các init đọc settings qua Backend nên phải chờ token được nạp. Nếu gọi ngay
   // khi MV3 service worker vừa thức dậy, chúng có thể thấy auth/network failure và
   // bỏ qua việc khôi phục alarm dù cấu hình nuôi đang bật.

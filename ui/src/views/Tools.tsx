@@ -918,16 +918,26 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
     setScanning(true);
     flash("info", "Đang mở trang “Nhóm của bạn” và quét…", 4000);
     const res = await bg<
-      BgResponse & { scanned?: number; added?: number; updated?: number; removed?: number }
+      BgResponse & {
+        scanned?: number;
+        added?: number;
+        updated?: number;
+        removed?: number;
+        groupsDeleted?: number;
+      }
     >("SCAN_JOINED_GROUPS");
     setScanning(false);
     if (!res.ok) {
       flash("err", res.error || "Quét nhóm thất bại.");
       return;
     }
+    // `removed` = số nhóm bị gỡ khỏi danh sách của bạn; `groupsDeleted` = số dòng
+    // nhóm bị xoá HẲN khỏi DB (không còn tài khoản nào tham gia). Chỉ nêu phần xoá
+    // hẳn khi thực sự có, để câu thông báo không dài vô ích.
+    const purged = res.groupsDeleted ?? 0;
     flash(
       "ok",
-      `Đã quét ${res.scanned ?? 0} nhóm (mới: ${res.added ?? 0}, cập nhật: ${res.updated ?? 0}, đã loại: ${res.removed ?? 0}).`,
+      `Đã quét ${res.scanned ?? 0} nhóm (mới: ${res.added ?? 0}, cập nhật: ${res.updated ?? 0}, đã loại: ${res.removed ?? 0}${purged ? `, xoá khỏi DB: ${purged}` : ""}).`,
     );
     load();
   }
@@ -958,7 +968,10 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
       flash("err", "Đang crawl hàng loạt, hãy đợi xong hoặc bấm Dừng.");
       return;
     }
-    const opts = buildCrawlOptions(settings);
+    // NHÃN TRUY NGUYÊN (B2): gắn ở NƠI GỌI, không gắn trong buildCrawlOptions,
+    // vì cùng một helper đó cũng dùng cho crawl hàng loạt — gắn vào helper thì
+    // hai đường vào sẽ mang cùng nhãn và mất khả năng phân biệt.
+    const opts = { ...buildCrawlOptions(settings), trigger: "manual" };
     const handler = opts.method === "dom" ? "CRAWL_GROUP" : "CRAWL_GROUP_API";
     setCrawlingId(g.groupId);
     setProgress(`Đang mở & crawl ${g.groupName || g.groupId}…`);
@@ -1024,8 +1037,24 @@ function CrawlTab({ flash }: { flash: FlashFn }) {
 
   async function saveAuto(enabled: boolean, interval: number) {
     setAutoCrawl({ enabled, intervalMinutes: interval });
+    // PHẢI gửi kèm `options`: service worker crawl mỗi nhóm bằng CHÍNH options
+    // trong autoCrawlConfig (xem processAutoCrawl trong src/crawl.js). Trước đây
+    // chỉ gửi { enabled, intervalMinutes } => options lưu là {} => lịch tự động
+    // chạy KHÁC crawl tay (mất method/maxNewPosts/stopAfterKnown/fromTs...).
+    //
+    // Đọc LẠI crawlSettings từ storage thay vì dùng state `settings`: state chỉ
+    // được nạp một lần lúc mount CrawlTab, nên nếu người dùng vừa sửa & "Lưu tùy
+    // chọn" ở tab Cấu hình rồi quay lại bật lịch, state ở đây đã cũ.
+    const store = await storageGet(["crawlSettings"]);
+    const saved = store.crawlSettings as Partial<CrawlSettings> | undefined;
+    const effective: CrawlSettings = { ...CRAWL_DEFAULTS, ...(saved || {}) };
+    setSettings(effective);
     const res = await bg<AutoCrawlResponse>("SET_AUTOCRAWL", {
-      config: { enabled, intervalMinutes: interval },
+      config: {
+        enabled,
+        intervalMinutes: interval,
+        options: buildCrawlOptions(effective),
+      },
     });
     if (!res.ok) {
       flash("err", res.error || "Không lưu được lịch tự động.");

@@ -140,8 +140,39 @@
    *  còn bị FB ẩn (chưa hover). Nhờ vậy không bỏ sót bài chỉ-chữ. */
   function isPostContainer(el) {
     if (!el || !el.querySelector) return false;
+    // Có postId thật => CHẮC CHẮN là bài viết.
     if (getPostIdFrom(el)) return true;
-    return !!el.querySelector('a[href*="/groups/"][href*="/user/"]');
+
+    // KHÔNG có postId: phải có link tác giả /groups/{gid}/user/{uid}/.
+    // Điều kiện này MỘT MÌNH là CHƯA ĐỦ — đã xác minh bằng dữ liệu thật:
+    // thẻ NHÓM GỢI Ý / rail "Khám phá" trong feed cũng chứa link kiểu đó,
+    // nên lọt vào đây rồi bị bóc tách thành bài rác (authorName rỗng =>
+    // "Không rõ", text = metadata thẻ nhóm "Có 3,4K người theo dõi" /
+    // "40K thành viên • 10+ bài viết/ngày", id rơi xuống vân tay "fp:" =>
+    // permalink null => "thiếu link gốc nên chưa bình luận được").
+    if (!el.querySelector('a[href*="/groups/"][href*="/user/"]')) return false;
+
+    // LOẠI thẻ nhóm: ô chứa link TỚI NHÓM KHÁC (/groups/{id} mà không phải
+    // /posts/, /user/) kèm chữ đặc trưng của thẻ nhóm. Bài viết THẬT không
+    // bao giờ có các nhãn này ở cấp ô.
+    const t = (el.innerText || el.textContent || "").toLowerCase();
+    const GROUP_CARD_MARKERS = [
+      "người theo dõi",
+      "thành viên",
+      "bài viết/ngày",
+      "followers",
+      "members",
+      "posts/day",
+      "tham gia nhóm",
+      "join group",
+      "nhóm gợi ý",
+      "suggested for you",
+      "gợi ý cho bạn",
+    ];
+    // Chỉ loại khi ô NGẮN (thẻ nhóm) — bài dài có thể tình cờ chứa các chữ này.
+    if (t.length < 400 && GROUP_CARD_MARKERS.some((k) => t.includes(k))) return false;
+
+    return true;
   }
 
   /** Bài CHỈ-CHỮ (không ảnh) không lộ set=gm nên permalink bị FB ẩn: href ở thẻ
@@ -204,11 +235,21 @@
    *  hover). Cơ sở = tác giả + text + ảnh đầu, ĐÃ LOẠI timeText (vì thời gian
    *  tương đối trôi theo lúc quét, đưa vào sẽ làm id đổi mỗi lần). Nhờ vậy bài
    *  không có permalink vẫn được LƯU và DEDUP đúng giữa các phiên crawl. Trả
-   *  null nếu không đủ dữ liệu (không text, không ảnh) để định danh. */
+   *  null nếu không đủ dữ liệu (không text, không ảnh) để định danh.
+   *
+   *  ĐIỀU KIỆN TỐI THIỂU (chống sinh bài rác — đã xác minh trên DB thật): phải
+   *  có TÁC GIẢ **hoặc** có TEXT. Chỉ có ảnh là KHÔNG đủ, vì khi authorName=""
+   *  và text="" thì basis thoái hoá thành ĐÚNG url ảnh: story video/reel
+   *  (thumbnail t15.5256-10) sinh bài "Không rõ / thiếu link gốc", và cùng một
+   *  thumbnail ở 2 nhóm khác nhau cho CÙNG hash nên vân tay mất tính phân biệt.
+   *  Bản này phải KHỚP TUYỆT ĐỐI với fingerprintId trong src/gql-parse.js. */
   function fingerprintId(groupId, authorName, text, images) {
     const norm = String(text || "").replace(/\s+/g, " ").trim().slice(0, 240);
     const img0 = images && images[0] ? String(images[0]).split("?")[0] : "";
+    // Không có tác giả VÀ không có text => không đủ định danh (ảnh đơn độc không tính).
+    if (!String(authorName || "").trim() && !norm) return null;
     if (!norm && !img0) return null; // không có gì để định danh ổn định
+    // GIỮ NGUYÊN công thức basis để id vân tay của bài đã lưu không đổi.
     const basis = String(authorName || "") + "|" + norm + "|" + img0;
     return "fp:" + groupId + ":" + hashStr(basis);
   }
@@ -398,6 +439,27 @@
     // CHỮ NGẮN vào <h3><strong> chứ không phải div[dir="auto"] => phải bắt cả 2 kiểu.
     // KHÔNG lọc theo role="button": FB bọc nội dung bài trong phần tử clickable,
     // lọc nhầm sẽ làm RỖNG toàn bộ text (chính là lỗi trước đó).
+    // KHÔNG dùng lại chiến lược "lấy khối text DÀI NHẤT" ở đây.
+    // Đã xác minh bằng dữ liệu thật: với ô KHÔNG phải bài viết, khối dài nhất
+    // chính là metadata thẻ nhóm ("Có 3,4K người theo dõi") => sinh bài rác.
+    // Thay vào đó chỉ nhận khối nằm trong vùng nội dung bài: bỏ phần header
+    // (tên tác giả + thời gian + "Đã chia sẻ với") và các nhãn UI ngắn.
+    const UI_NOISE = [
+      "theo dõi",
+      "đã chia sẻ với",
+      "người theo dõi",
+      "thành viên",
+      "bài viết/ngày",
+      "thích",
+      "bình luận",
+      "chia sẻ",
+      "xem thêm",
+    ];
+    const isNoise = (s) => {
+      const low = s.toLowerCase();
+      if (low.length < 25 && UI_NOISE.some((k) => low.includes(k))) return true;
+      return false;
+    };
     let best = "";
     const blocks = article.querySelectorAll(
       'div[dir="auto"], span[dir="auto"], h1, h2, h3, [role="heading"]'
@@ -405,6 +467,7 @@
     for (const b of blocks) {
       if (belongsToComment(b, article)) continue; // bỏ text thuộc bình luận
       const t = (b.innerText || b.textContent || "").trim();
+      if (!t || isNoise(t)) continue;
       if (t.length > best.length) best = t;
     }
     if (best) return best;
@@ -720,6 +783,19 @@
     const finalText = pick(ai.text, base.text);
     const finalImages = pickArr(ai.images, base.images);
 
+    // ĐIỀU KIỆN TỐI THIỂU (chống sinh bài rác):
+    // Ô không phải bài viết (thẻ NHÓM GỢI Ý trong feed, rail "Khám phá"...) vẫn
+    // lọt qua isPostContainer vì có link /groups/{gid}/user/{uid}/. Với ô đó:
+    // extractAuthor() không tìm được tên -> null, extractText() rơi xuống nhánh
+    // "khối text DÀI NHẤT" nên trúng metadata thẻ nhóm ("Có 3,4K người theo dõi",
+    // "40K thành viên • 10+ bài viết/ngày"), và không có permalink nên postId rơi
+    // xuống vân tay "fp:" => permalink=null => UI hiện "Không rõ" + "thiếu link
+    // gốc nên chưa bình luận được". Đã XÁC MINH bằng DB: 14/20 record rác đúng
+    // dạng này (fp: + authorName rỗng + text là metadata nhóm).
+    // Bài THẬT luôn có ÍT NHẤT một trong hai: postId thật, hoặc tên tác giả.
+    // Thiếu CẢ HAI => không phải bài viết => bỏ, KHÔNG lưu.
+    if (!postId && !finalAuthor) return null;
+
     // CHỐT ĐỊNH DANH: ưu tiên postId THẬT; nếu bài chỉ-chữ ẩn permalink (không
     // lấy được id), dùng VÂN TAY nội dung -> KHÔNG bỏ sót bài và dedup ổn định.
     if (!postId) {
@@ -745,6 +821,10 @@
       reactions: pick(ai.reactions, base.reactions),
       comments: pick(ai.comments, base.comments),
       crawledAt: Date.now(),
+      // Đánh dấu NGUỒN bóc tách để chẩn đoán (đối xứng với mapEdgeToPost trong
+      // gql-parse.js gắn source:"api"). Trước đây nhánh DOM KHÔNG gắn field này
+      // nên không thể phân biệt record do DOM hay API sinh khi soi DB.
+      source: "dom",
     };
   }
 

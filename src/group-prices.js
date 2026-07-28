@@ -14,11 +14,19 @@
  *   Tầng 2 — selectForAI(posts, sellKeywords): chỉ bài CHƯA parse (không có
  *     parsedAt) VÀ qua tier1 mới được đưa lên AI. Parse xong đánh dấu parsedAt
  *     để lần sau không gửi lại (khử trùng + tăng dần).
+ *   Tầng 2.5 — localExtract(post): BỘ TRÍCH CỤC BỘ (0 token, 0 network). Đọc
+ *     text theo TỪNG DÒNG: quét con số tiền kèm VỊ TRÍ (scanMoney), lấy phần
+ *     text TRƯỚC con số làm tên (gọt tiền tố rao bán "bán/pass/thanh lý/giá"),
+ *     suy ra tình trạng (detectCondition) + bảo hành (detectWarranty). Nếu bộ
+ *     cục bộ đọc TRỌN VẸN một bài (mọi con số tiền đều được gán vào item, không
+ *     có mẫu nhập nhằng kiểu "2tr8" hay "5-6tr") thì bài đó KHÔNG cần lên AI.
+ *     Nhập nhằng/không đọc được -> nhường cho tầng 3 chứ KHÔNG đoán bừa.
  *   Tầng 3 — extractBatch(posts, aiCall): gọi AI MỘT lần cho mỗi ~10-15 bài;
  *     AI trả per-post { items:[{name,price,condition,warranty,category}],
  *     new_keywords:[...] }. AI KHÔNG tự chế regex, chỉ trích từ text được cấp.
  *   Hậu kiểm — verifyExtraction(post, items): bỏ item nào có price KHÔNG xuất
- *     hiện trong text bài (so khớp sau khi chuẩn hóa) — chống bịa giá.
+ *     hiện trong text bài (so khớp sau khi chuẩn hóa) — chống bịa giá. Áp dụng
+ *     cho CẢ item cục bộ lẫn item AI (một cửa duy nhất để vào DB).
  *
  * Orchestration — runGroupPriceExtraction(deps): nạp sell keywords từ
  *   GET /api/keywords?type=sell, lấy posts, selectForAI, extractBatch, verify,
@@ -33,7 +41,7 @@
  */
 
 import { extractMoneyFigures } from "./advisory.js";
-import { hasAnyKeyword } from "./keyword-match.js";
+import { hasAnyKeyword, deaccent } from "./keyword-match.js";
 import { apiFetch as realApiFetch } from "./api.js";
 import * as DB from "./db.js";
 import { getAIConfig, fetchWithTimeout, parseSelectorJson } from "./util.js";
@@ -150,6 +158,255 @@ export function verifyExtraction(post, items) {
     }
   }
   return out;
+}
+
+/* ========================= TẦNG 2.5 — CỤC BỘ ============================= */
+
+// Ngưỡng giá hợp lý cho một dòng hàng (VND). Dưới ngưỡng thường là phí ship/
+// cọc/giá phụ kiện lẻ nhắc ngang; trên ngưỡng là số điện thoại/năm/nhầm đơn vị.
+const LOCAL_MIN_PRICE = 10000;
+const LOCAL_MAX_PRICE = 2000000000;
+
+// Tiền tố "rao bán" cần GỌT khỏi tên hàng (đã bỏ dấu, chỉ còn chữ/số).
+const LEAD_NOISE = new Set([
+  "ban", "can", "pass", "xa", "kho", "gl", "giao", "luu", "thanh", "ly",
+  "gia", "con", "hang", "new", "sale", "up", "hot", "fs", "freeship", "cod",
+  "sang", "nhuong", "ship", "co", "ai", "em", "minh", "shop", "nay", "them",
+]);
+
+// Hậu tố cần GỌT (phần đứng ngay trước con số tiền): "... giá", "... bao test".
+const TAIL_NOISE = new Set([
+  "gia", "chi", "con", "only", "fix", "nhe", "cuoi", "chot", "thoi", "la",
+  "luon", "nhanh", "bao", "test", "cho", "ai", "can", "gion", "net", "ban",
+]);
+
+// Mẫu NHẬP NHẰNG: bộ regex tiền dùng chung (extractMoneyFigures) đọc "2tr8"
+// thành 2.000.000 — SAI (đúng là 2.800.000). Thà nhường AI còn hơn ghi sai số.
+const RE_MIXED_UNIT = /\d\s*(?:tr|trieu|cu)\s*\d/;
+// Khoảng giá "5-6tr", "3~4 triệu": không có MỘT giá xác định -> nhường AI.
+const RE_PRICE_RANGE = /\d\s*[-–~]\s*\d+\s*(?:tr|trieu|k|d|vnd)\b/;
+
+/**
+ * scanMoney(text) — quét các CON SỐ TIỀN kèm VỊ TRÍ trong text.
+ *
+ * Dùng ĐÚNG hai regex của extractMoneyFigures (advisory.js) nên mọi giá trị
+ * scanMoney trả về là TẬP CON của extractMoneyFigures -> item do bộ trích cục
+ * bộ dựng LUÔN đi qua được hậu kiểm verifyExtraction (một cửa vào DB).
+ *
+ * Trả [{ start, end, raw, value }] đã sắp theo vị trí và KHÔNG chồng lấn
+ * (giữ khớp dài hơn khi hai regex cùng bắt một đoạn).
+ */
+export function scanMoney(text) {
+  const s = String(text || "");
+  const hits = [];
+  let m;
+
+  // (a) có dấu phân nhóm nghìn: 3.599.000 / 3,599,000
+  const reGrouped = /\d{1,3}(?:[.,]\d{3}){1,4}/g;
+  while ((m = reGrouped.exec(s))) {
+    const n = Number(m[0].replace(/[.,]/g, ""));
+    if (Number.isFinite(n) && n >= 1000) {
+      hits.push({ start: m.index, end: m.index + m[0].length, raw: m[0], value: n });
+    }
+  }
+  // (b) có đuôi tiền tệ: 3500k, 12tr, 999000đ, 5 triệu
+  const reUnit = /(\d+(?:[.,]\d+)?)\s*(triệu|tr|k|nghìn|ngàn|đ|vnd|₫)\b/gi;
+  while ((m = reUnit.exec(s))) {
+    let n = parseFloat(m[1].replace(",", "."));
+    if (!Number.isFinite(n)) continue;
+    const unit = m[2].toLowerCase();
+    if (unit === "triệu" || unit === "tr") n *= 1e6;
+    else if (unit === "k" || unit === "nghìn" || unit === "ngàn") n *= 1000;
+    if (n >= 1000) {
+      hits.push({
+        start: m.index,
+        end: m.index + m[0].length,
+        raw: m[0],
+        value: Math.round(n),
+      });
+    }
+  }
+
+  hits.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const out = [];
+  for (const h of hits) {
+    if (out.some((k) => h.start < k.end && k.start < h.end)) continue; // chồng lấn
+    out.push(h);
+  }
+  return out;
+}
+
+/** Chuẩn hóa một token về dạng so khớp noise: bỏ dấu + chỉ giữ chữ/số. */
+function normToken(t) {
+  return deaccent(String(t || ""))
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+/**
+ * cleanItemName(raw) — gọt một đoạn text thành TÊN HÀNG dùng được, hoặc "" nếu
+ * không đủ tin cậy. Gọt token nhiễu ở HAI ĐẦU (giữ nguyên dấu/chữ hoa của phần
+ * còn lại), bỏ dấu câu rìa, và từ chối đoạn quá dài (giống một câu văn) hoặc
+ * không còn chữ cái nào.
+ */
+export function cleanItemName(raw) {
+  const tokens = String(raw || "").split(/\s+/).filter(Boolean);
+  let a = 0;
+  let b = tokens.length;
+  while (a < b) {
+    const t = normToken(tokens[a]);
+    if (!t || LEAD_NOISE.has(t)) {
+      a += 1;
+      continue;
+    }
+    break;
+  }
+  while (b > a) {
+    const t = normToken(tokens[b - 1]);
+    if (!t || TAIL_NOISE.has(t)) {
+      b -= 1;
+      continue;
+    }
+    break;
+  }
+  const kept = tokens.slice(a, b);
+  if (kept.length === 0 || kept.length > 12) return "";
+  const name = kept
+    .join(" ")
+    .replace(/^[\s\-–—:.,;|/*+~=>#]+/, "")
+    .replace(/[\s\-–—:.,;|/*+~=<]+$/, "")
+    .trim();
+  if (name.length < 2 || name.length > 90) return "";
+  if (!/\p{L}/u.test(name)) return ""; // toàn số -> không phải tên hàng
+  return name;
+}
+
+/**
+ * detectCondition(text) — suy ra tình trạng máy: "mới" | "likenew" | "cũ" | null.
+ * CHỈ nhận các dấu hiệu ĐẶC HIỆU; mơ hồ thì trả null (thà thiếu còn hơn sai).
+ * Không dùng token trần "mới"/"cũ" vì sau khi bỏ dấu chúng đụng "mời", "củ"
+ * (đơn vị tiền: "5 củ"), "mọi".
+ */
+export function detectCondition(text) {
+  const s = deaccent(String(text || "")).toLowerCase();
+  if (/\b9[5-9]\s*%/.test(s) || /\blike\s*new\b/.test(s) || /\blikenew\b/.test(s)) {
+    return "likenew";
+  }
+  if (
+    /\bmoi\s*100\s*%?/.test(s) ||
+    /\bfull\s*box\b/.test(s) ||
+    /\bfullbox\b/.test(s) ||
+    /\bnguyen\s*(seal|box|hop|tem)\b/.test(s) ||
+    /\bchua\s*(boc|khui|khai|su\s*dung)\b/.test(s) ||
+    /\bbrand\s*new\b/.test(s) ||
+    /\bmoi\s*keng\b/.test(s) ||
+    /\bhang\s*moi\b/.test(s)
+  ) {
+    return "mới";
+  }
+  if (
+    /\b(hang|may|do|em|con)\s*cu\b/.test(s) ||
+    /\b(da\s*)?qua\s*su\s*dung\b/.test(s) ||
+    /\bsecond\s*hand\b/.test(s) ||
+    /\bsecondhand\b/.test(s) ||
+    /\b2nd\b/.test(s) ||
+    /\b9[0-4]\s*%/.test(s)
+  ) {
+    return "cũ";
+  }
+  return null;
+}
+
+/**
+ * detectWarranty(text) — suy ra bảo hành: "6 tháng" | "1 năm" | "hết bảo hành"
+ * | "bảo hành hãng" | null.
+ */
+export function detectWarranty(text) {
+  const s = deaccent(String(text || "")).toLowerCase();
+  if (/\b(het|khong|ko|k)\s*(bh|bao\s*hanh)\b/.test(s)) return "hết bảo hành";
+  let m = s.match(/\b(?:bh|bao\s*hanh)[^\d\n]{0,10}?(\d{1,2})\s*(thang|nam|t\b|n\b)/);
+  if (!m) m = s.match(/\b(\d{1,2})\s*(thang|nam)\s*(?:bh|bao\s*hanh)\b/);
+  if (m) {
+    const n = Number(m[1]);
+    const unit = String(m[2]).startsWith("n") ? "năm" : "tháng";
+    if (Number.isFinite(n) && n > 0 && n <= 60) return n + " " + unit;
+  }
+  if (/\b(?:bh|bao\s*hanh)\s*(hang|chinh\s*hang|shop|dai\s*ly|cua\s*hang)\b/.test(s)) {
+    return "bảo hành hãng";
+  }
+  return null;
+}
+
+/**
+ * localExtract(post) — TRÍCH GIÁ KHÔNG CẦN AI.
+ *
+ * Đọc từng dòng; một dòng chỉ sinh item khi có ĐÚNG MỘT con số tiền và phần
+ * text quanh nó gọt được thành tên hàng. Trả:
+ *   { items, complete }
+ *     items    — [{ name, price(VND int), condition, warranty, category:null, confidence }]
+ *     complete — TRUE khi MỌI con số tiền trong bài đều đã được gán vào item và
+ *                không gặp mẫu nhập nhằng. `complete === true` là điều kiện để
+ *                BỎ HẲN lượt gọi AI cho bài này.
+ */
+export function localExtract(post) {
+  const text = String((post && post.text) || "");
+  const items = [];
+  let unconsumed = 0;
+  let ambiguous = false;
+
+  const condition = detectCondition(text);
+  const warranty = detectWarranty(text);
+
+  for (const line of text.split(/[\r\n]+/)) {
+    const hits = scanMoney(line).filter(
+      (h) => h.value >= LOCAL_MIN_PRICE && h.value <= LOCAL_MAX_PRICE
+    );
+    if (hits.length === 0) continue;
+
+    const flat = deaccent(line).toLowerCase();
+    if (RE_MIXED_UNIT.test(flat) || RE_PRICE_RANGE.test(flat)) {
+      ambiguous = true;
+      unconsumed += hits.length;
+      continue;
+    }
+    // Nhiều giá trên cùng dòng ("giá 5tr, ship 30k" / "i5 2tr i7 3tr"): không
+    // chắc số nào thuộc món nào -> nhường AI.
+    if (hits.length > 1) {
+      unconsumed += hits.length;
+      continue;
+    }
+
+    const hit = hits[0];
+    const before = line.slice(0, hit.start);
+    const after = line.slice(hit.end);
+    let name = cleanItemName(before);
+    let fromBefore = true;
+    if (!name) {
+      name = cleanItemName(after); // dòng mở đầu bằng giá: "5.000.000 laptop Dell"
+      fromBefore = false;
+    }
+    if (!name) {
+      unconsumed += 1;
+      continue;
+    }
+
+    // Có tín hiệu "giá" ngay trước con số -> độ tin cậy cao hơn.
+    const beforeFlat = deaccent(before).toLowerCase();
+    const cued =
+      /(?:gia|price|only|chi|con)\s*[:=\-~]?\s*$/.test(beforeFlat) ||
+      /[:=\-–~]\s*$/.test(before);
+
+    items.push({
+      name,
+      price: hit.value,
+      condition,
+      warranty,
+      category: null,
+      confidence: fromBefore ? (cued ? 0.85 : 0.7) : 0.6,
+    });
+  }
+
+  return { items, complete: items.length > 0 && unconsumed === 0 && !ambiguous };
 }
 
 /* =============================== TẦNG 3 ================================== */
@@ -314,19 +571,25 @@ async function defaultAiCall(batch, sellKeywords) {
  * Luồng:
  *   1) GET /api/keywords?type=sell -> chỉ lấy keyword enabled.
  *   2) getAllPosts() -> selectForAI -> các bài đủ điều kiện.
- *   3) extractBatch(eligible, aiCall) -> kết quả AI per-post.
- *   4) verifyExtraction từng bài -> bỏ item bịa giá.
- *   5) POST /api/group-prices các dòng đã hậu kiểm (parser:'ai').
+ *   2.5) localExtract từng bài: bài nào đọc TRỌN VẸN (complete) thì chốt luôn
+ *        bằng parser 'local' và KHÔNG gửi lên AI (0 token). Phần còn lại (bài
+ *        nhập nhằng / không đọc được) mới xuống tầng 3.
+ *   3) extractBatch(rest, aiCall) -> kết quả AI per-post.
+ *   4) verifyExtraction từng bài (cả local lẫn AI) -> bỏ item bịa giá.
+ *   5) POST /api/group-prices các dòng đã hậu kiểm (parser:'local'|'ai').
  *   6) markParsed(các postId đã xử lý) -> đánh dấu parsedAt.
  *   7) POST /api/keywords cho mọi new_keywords (addedBy:'ai', enabled:true, type:'sell').
  *
- * Trả { processed, inserted, newKeywords } để UI báo cáo.
+ * Trả { processed, inserted, newKeywords, localPosts, aiPosts } để UI báo cáo
+ * (localPosts = số bài xử lý miễn phí, aiPosts = số bài thực sự tốn token).
  */
 export async function runGroupPriceExtraction(deps = {}) {
   const apiFetch = deps.apiFetch || realApiFetch;
   const getAllPosts = deps.getAllPosts || DB.getAllPosts;
   const aiCall = deps.aiCall || defaultAiCall;
   const markParsed = deps.markParsed || defaultMarkParsed(apiFetch);
+  // Cho phép tắt tầng cục bộ (test so sánh / debug), mặc định BẬT.
+  const useLocal = deps.useLocal !== false;
 
   // 1) Nạp sell keywords đang bật.
   const kwResp = await apiFetch("/api/keywords?type=sell");
@@ -339,11 +602,8 @@ export async function runGroupPriceExtraction(deps = {}) {
   const posts = (await getAllPosts()) || [];
   const eligible = selectForAI(posts, sellKeywords);
   if (eligible.length === 0) {
-    return { processed: 0, inserted: 0, newKeywords: 0 };
+    return { processed: 0, inserted: 0, newKeywords: 0, localPosts: 0, aiPosts: 0 };
   }
-
-  // 3) Gọi AI theo lô.
-  const aiResults = await extractBatch(eligible, (batch) => aiCall(batch, sellKeywords));
 
   // Tra cứu bài theo postId để hậu kiểm + dựng dòng giá.
   const postById = new Map(eligible.map((p) => [String(p.postId), p]));
@@ -352,30 +612,67 @@ export async function runGroupPriceExtraction(deps = {}) {
   const processedIds = [];
   const newKeywordSet = new Set();
 
-  // 4) Hậu kiểm + dựng payload group-prices.
+  // Dựng 1 dòng group_prices từ item đã hậu kiểm.
+  const toRow = (post, it, parser) => ({
+    postId: post.postId,
+    name: it.name ?? null,
+    price: it.price ?? null,
+    condition: it.condition ?? null,
+    warranty: it.warranty ?? null,
+    category: it.category ?? null,
+    sellerName: post.authorName ?? null,
+    sellerProfile: post.authorProfile ?? null,
+    groupId: post.groupId ?? null,
+    postedAt: post.timestamp ?? null,
+    parser,
+    confidence: it.confidence ?? null,
+  });
+
+  // 2.5) TẦNG CỤC BỘ — chốt các bài đọc trọn vẹn, phần còn lại đẩy sang AI.
+  const rest = [];
+  let localPosts = 0;
+  for (const post of eligible) {
+    if (!useLocal) {
+      rest.push(post);
+      continue;
+    }
+    let local = null;
+    try {
+      local = localExtract(post);
+    } catch (e) {
+      local = null;
+    }
+    // Chỉ tự quyết khi đọc TRỌN VẸN; nhập nhằng -> nhường AI.
+    if (!local || !local.complete) {
+      rest.push(post);
+      continue;
+    }
+    // Vẫn đi qua đúng một cửa hậu kiểm như AI (không có đường tắt vào DB).
+    const verified = verifyExtraction(post, local.items);
+    if (verified.length === 0) {
+      rest.push(post);
+      continue;
+    }
+    localPosts += 1;
+    processedIds.push(post.postId);
+    for (const it of verified) rows.push(toRow(post, it, "local"));
+  }
+
+  // 3) Gọi AI cho phần còn lại (có thể rỗng -> 0 request).
+  const aiResults =
+    rest.length > 0 ? await extractBatch(rest, (batch) => aiCall(batch, sellKeywords)) : [];
+
+  // 4) Hậu kiểm + dựng payload group-prices cho nhánh AI.
+  let aiPosts = 0;
   for (const r of aiResults) {
     if (!r || r.postId == null) continue;
     const post = postById.get(String(r.postId));
     if (!post) continue;
+    aiPosts += 1;
     processedIds.push(post.postId);
 
     const verified = verifyExtraction(post, r.items);
-    for (const it of verified) {
-      rows.push({
-        postId: post.postId,
-        name: it.name ?? null,
-        price: it.price ?? null,
-        condition: it.condition ?? null,
-        warranty: it.warranty ?? null,
-        category: it.category ?? null,
-        sellerName: post.authorName ?? null,
-        sellerProfile: post.authorProfile ?? null,
-        groupId: post.groupId ?? null,
-        postedAt: post.timestamp ?? null,
-        parser: "ai",
-        confidence: it.confidence ?? null,
-      });
-    }
+    for (const it of verified) rows.push(toRow(post, it, "ai"));
 
     if (Array.isArray(r.new_keywords)) {
       for (const kw of r.new_keywords) {
@@ -413,6 +710,8 @@ export async function runGroupPriceExtraction(deps = {}) {
     processed: processedIds.length,
     inserted,
     newKeywords: newKeywordSet.size,
+    localPosts,
+    aiPosts,
   };
 }
 

@@ -2,11 +2,15 @@
  * sheets.js — Domain "Kho của tôi": nhập sản phẩm từ Google Sheet công khai.
  *
  * Tách từ background.js (ESM). Phụ thuộc:
- *   - db.js: saveProducts.
+ *   - db.js: saveProducts / getProducts / deleteProduct / get-setSetting.
  *   - util.js: parsePrice, decodeEntities, stripTags, sleepJitter.
  *
  * Quy trình: listSheetTabs (đọc htmlview/pubhtml) -> previewSheet (xem trước cột)
  * -> importSheetTabs (tải CSV từng tab, map cột, lưu DB dưới source "mystore").
+ *
+ * Ngoài lần nhập thủ công, module còn LƯU cấu hình sheet (mystoreSheetConfig) và
+ * tự đồng bộ lại theo chu kỳ bằng chrome.alarms (SHEET_ALARM) — nhờ vậy sửa giá
+ * trên Google Sheet là kho tự cập nhật, không phải nhập tay lại.
  */
 
 import * as DB from "./db.js";
@@ -230,9 +234,24 @@ async function previewSheet(spreadsheetId, gid) {
   };
 }
 
+/**
+ * Khoá định danh sản phẩm. Ưu tiên SKU: SKU là mã do người bán tự đặt nên KHÔNG
+ * đổi khi sửa tên sản phẩm trong Sheet -> sửa tên là cập nhật đúng bản ghi cũ
+ * thay vì sinh bản ghi mới (đây là nguồn gốc của kho bị nhân đôi trước đây).
+ * Không có cột SKU thì rơi về gid::slug(tên) như bản cũ để tương thích dữ liệu
+ * đã nhập trước đó.
+ */
+function productIdFor(name, sku, gid) {
+  const bySku = slugify(sku);
+  if (bySku) return `${MYSTORE_SOURCE}::sku::${bySku}`;
+  return `${MYSTORE_SOURCE}::${gid}::${slugify(name)}`;
+}
+
 // Chuyển các dòng dữ liệu của 1 tab thành sản phẩm "owned".
+// Dòng trùng productId trong CÙNG một lần nhập được gộp (dòng sau thắng) để
+// payload gửi lên /api/products không chứa 2 bản ghi cùng khoá (upsert sẽ lỗi).
 function rowsToProducts(dataRows, cols, tab) {
-  const out = [];
+  const byId = new Map();
   const category = tab.category || tab.name || "Khác";
   for (const r of dataRows) {
     const get = (idx) => (idx >= 0 && idx < r.length ? String(r[idx]).trim() : "");
@@ -244,9 +263,11 @@ function rowsToProducts(dataRows, cols, tab) {
     const price = priceRaw ? parsePrice(priceRaw) : null;
     const qtyRaw = cols.qty >= 0 ? get(cols.qty) : "";
     const qty = qtyRaw ? parseInt(qtyRaw.replace(/[^\d]/g, ""), 10) : null;
+    const sku = cols.sku >= 0 ? get(cols.sku) : "";
 
-    out.push({
-      productId: `mystore::${tab.gid}::${slugify(name)}`,
+    const productId = productIdFor(name, sku, tab.gid);
+    byId.set(productId, {
+      productId,
       source: MYSTORE_SOURCE,
       sourceName: MYSTORE_NAME,
       owned: true,
@@ -255,16 +276,60 @@ function rowsToProducts(dataRows, cols, tab) {
       price: Number.isFinite(price) ? price : null,
       brand: cols.brand >= 0 ? get(cols.brand) : "",
       warranty: cols.warranty >= 0 ? get(cols.warranty) : "",
-      sku: cols.sku >= 0 ? get(cols.sku) : "",
+      sku,
       qty: Number.isFinite(qty) ? qty : null,
       url: "",
     });
   }
-  return out;
+  return [...byId.values()];
 }
 
-// Nhập danh sách tab đã chọn: mỗi tab {gid, name, category}. Tải CSV, map, lưu DB.
-async function importSheetTabs(spreadsheetId, tabs) {
+/**
+ * Xoá các sản phẩm "mystore" KHÔNG còn xuất hiện trong lần nhập vừa rồi.
+ *
+ * Đây là bước đối chiếu (reconcile) để dòng bị xoá khỏi Google Sheet cũng biến
+ * mất khỏi kho — nếu chỉ upsert thì hàng đã ngừng bán vẫn nằm lại vĩnh viễn.
+ *
+ * CHỐT AN TOÀN: chỉ gọi khi mọi tab đã nhập THÀNH CÔNG (xem importSheetTabs).
+ * Thêm trần PRUNE_CAP để một lần đối chiếu lệch không thể quét sạch cả kho.
+ */
+const PRUNE_CAP = 500;
+
+async function pruneMissingProducts(keepIds) {
+  if (!(keepIds instanceof Set) || keepIds.size === 0) {
+    return { deleted: 0, skipped: 0, capped: false };
+  }
+  let existing = [];
+  try {
+    existing = await DB.getProducts(MYSTORE_SOURCE);
+  } catch (e) {
+    return { deleted: 0, skipped: 0, capped: false, error: String(e) };
+  }
+  const stale = (Array.isArray(existing) ? existing : []).filter(
+    (p) => p && p.productId && !keepIds.has(p.productId)
+  );
+  const capped = stale.length > PRUNE_CAP;
+  const target = capped ? stale.slice(0, PRUNE_CAP) : stale;
+
+  let deleted = 0;
+  let skipped = 0;
+  for (const p of target) {
+    try {
+      await DB.deleteProduct(p.productId);
+      deleted++;
+    } catch (e) {
+      skipped++;
+    }
+  }
+  return { deleted, skipped, capped };
+}
+
+/**
+ * Nhập danh sách tab đã chọn: mỗi tab {gid, name, category}. Tải CSV, map, lưu DB.
+ * opts.prune = true -> sau khi TẤT CẢ tab nhập xong không lỗi, xoá những sản
+ * phẩm mystore không còn trong Sheet (đồng bộ 2 chiều thật sự).
+ */
+async function importSheetTabs(spreadsheetId, tabs, opts = {}) {
   if (!spreadsheetId) throw new Error("Thiếu spreadsheetId.");
   if (!Array.isArray(tabs) || !tabs.length) throw new Error("Chưa chọn tab nào để nhập.");
 
@@ -272,6 +337,7 @@ async function importSheetTabs(spreadsheetId, tabs) {
   let updated = 0;
   let imported = 0;
   const results = [];
+  const keepIds = new Set();
 
   for (const tab of tabs) {
     try {
@@ -291,6 +357,7 @@ async function importSheetTabs(spreadsheetId, tabs) {
       added += r.added || 0;
       updated += r.updated || 0;
       imported += products.length;
+      for (const p of products) keepIds.add(p.productId);
       results.push({ gid: tab.gid, name: tab.name, ok: true, count: products.length });
       await sleepJitter(200, 600);
     } catch (e) {
@@ -298,7 +365,249 @@ async function importSheetTabs(spreadsheetId, tabs) {
     }
   }
 
-  return { ok: true, imported, added, updated, results };
+  // Chỉ đối chiếu khi bức tranh đầy đủ: một tab lỗi mạng giữa đường sẽ khiến
+  // hàng của tab đó bị coi là "đã xoá khỏi Sheet" -> mất dữ liệu oan.
+  const allOk = results.length > 0 && results.every((r) => r.ok);
+  let pruned = null;
+  if (opts.prune && allOk && imported > 0) {
+    pruned = await pruneMissingProducts(keepIds);
+  }
+
+  return {
+    ok: true,
+    imported,
+    added,
+    updated,
+    deleted: pruned ? pruned.deleted : 0,
+    pruneCapped: !!(pruned && pruned.capped),
+    pruneSkipped: allOk ? !opts.prune : true,
+    results,
+  };
+}
+
+/* ============== CẤU HÌNH + TỰ ĐỘNG ĐỒNG BỘ SHEET (alarms) ============== */
+
+const SHEET_KEY = "mystoreSheetConfig";
+const SHEET_ALARM = "mystoreSheetSync";
+// Chu kỳ hợp lệ (giờ). CSV export của Google là endpoint tĩnh, công khai nên 1h
+// vẫn an toàn; mặc định 6h là đủ tươi cho bảng giá bán lẻ.
+const SHEET_INTERVALS = [1, 3, 6, 12, 24];
+const SHEET_DEFAULT = {
+  enabled: false,
+  intervalHours: 6,
+  url: "",
+  spreadsheetId: "",
+  tabs: [],
+  prune: true,
+  lastSyncAt: 0,
+  lastResult: null,
+};
+
+function normalizeSheetHours(v) {
+  const h = parseInt(v, 10);
+  return SHEET_INTERVALS.includes(h) ? h : SHEET_DEFAULT.intervalHours;
+}
+
+// Chỉ giữ 3 trường cần cho lần nhập lại: gid (bắt buộc), name, category.
+function normalizeSheetTabs(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const t of list) {
+    if (!t || typeof t !== "object") continue;
+    const gid = String(t.gid == null ? "" : t.gid).trim();
+    if (!gid || seen.has(gid)) continue;
+    seen.add(gid);
+    out.push({
+      gid,
+      name: String(t.name || "").slice(0, 120),
+      category: String(t.category || "").slice(0, 120),
+    });
+  }
+  return out;
+}
+
+function normalizeSheetConfig(saved) {
+  const s = saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+  const url = String(s.url || "").trim().slice(0, 500);
+  // spreadsheetId luôn được suy lại từ url nếu url còn đó: tránh trạng thái lệch
+  // khi người dùng đổi link nhưng id cũ vẫn nằm trong settings.
+  const fromUrl = url ? parseSheetId(url).spreadsheetId : "";
+  return {
+    enabled: !!s.enabled,
+    intervalHours: normalizeSheetHours(s.intervalHours),
+    url,
+    spreadsheetId: fromUrl || String(s.spreadsheetId || "").trim(),
+    tabs: normalizeSheetTabs(s.tabs),
+    prune: s.prune == null ? true : !!s.prune,
+    lastSyncAt: Number.isFinite(Number(s.lastSyncAt)) ? Number(s.lastSyncAt) : 0,
+    lastResult:
+      s.lastResult && typeof s.lastResult === "object" && !Array.isArray(s.lastResult)
+        ? s.lastResult
+        : null,
+  };
+}
+
+/** Đọc cấu hình dạng structured (không ném lỗi; hỏng -> default + stale). */
+async function getSheetConfigResult() {
+  let r = null;
+  try {
+    r = await DB.getSettingResult(SHEET_KEY);
+  } catch (e) {
+    r = null;
+  }
+  if (!r || !r.ok) {
+    return {
+      ok: false,
+      status: (r && r.status) || "server_error",
+      retryable: !!(r && r.retryable),
+      message: (r && r.message) || "Không đọc được mystoreSheetConfig",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeSheetConfig({}),
+    };
+  }
+  if (r.found && r.value != null && (typeof r.value !== "object" || Array.isArray(r.value))) {
+    return {
+      ok: false,
+      status: "invalid_response",
+      retryable: true,
+      message: "mystoreSheetConfig value không phải object",
+      found: false,
+      source: "default",
+      stale: true,
+      config: normalizeSheetConfig({}),
+    };
+  }
+  return {
+    ok: true,
+    status: r.status,
+    found: !!r.found,
+    source: r.found ? "server" : "default",
+    stale: false,
+    config: normalizeSheetConfig(r.found ? r.value || {} : {}),
+  };
+}
+
+async function getSheetConfig() {
+  const r = await getSheetConfigResult();
+  return r.config;
+}
+
+// Đặt lại alarm theo cấu hình. Tách riêng để cả apply* và init* dùng chung.
+async function rescheduleSheetSync(cfg) {
+  if (typeof chrome === "undefined" || !chrome.alarms) return;
+  try {
+    await chrome.alarms.clear(SHEET_ALARM);
+    if (cfg.enabled && cfg.spreadsheetId && cfg.tabs.length) {
+      chrome.alarms.create(SHEET_ALARM, { periodInMinutes: cfg.intervalHours * 60 });
+    }
+  } catch (e) {}
+}
+
+/** Lưu cấu hình (merge từng trường) + (tái)tạo hoặc xoá alarm. */
+async function applySheetConfig(input = {}) {
+  const current = await getSheetConfig();
+  const merged = {
+    ...current,
+    ...(input.url != null ? { url: input.url } : {}),
+    ...(input.spreadsheetId != null ? { spreadsheetId: input.spreadsheetId } : {}),
+    ...(input.tabs != null ? { tabs: input.tabs } : {}),
+    ...(input.enabled != null ? { enabled: input.enabled } : {}),
+    ...(input.intervalHours != null ? { intervalHours: input.intervalHours } : {}),
+    ...(input.prune != null ? { prune: input.prune } : {}),
+  };
+  const next = normalizeSheetConfig(merged);
+  await DB.setSetting(SHEET_KEY, next);
+  await rescheduleSheetSync(next);
+  return next;
+}
+
+// Ghi kết quả lần chạy gần nhất (không ném lỗi: chỉ là dữ liệu hiển thị).
+async function recordSheetSyncResult(cfg, result) {
+  const next = normalizeSheetConfig({
+    ...cfg,
+    lastSyncAt: Date.now(),
+    lastResult: result,
+  });
+  try {
+    await DB.setSetting(SHEET_KEY, next);
+  } catch (e) {}
+  return next;
+}
+
+let _sheetSyncing = false;
+
+/**
+ * Đồng bộ lại kho từ Sheet đã lưu. Dùng cho cả nút "Đồng bộ ngay" và alarm.
+ * opts.force = true -> chạy dù cấu hình đang tắt tự động (nút bấm tay).
+ */
+async function syncMyStoreSheet(opts = {}) {
+  if (_sheetSyncing) return { ok: false, error: "Đang đồng bộ, bỏ qua lượt này." };
+
+  const cfgRes = await getSheetConfigResult();
+  if (!cfgRes.ok) {
+    // Settings lỗi tạm thời: KHÔNG chạy với cấu hình default (rỗng) để tránh
+    // đối chiếu sai rồi xoá sạch kho.
+    return { ok: false, deferred: true, status: cfgRes.status, error: cfgRes.message };
+  }
+  const cfg = cfgRes.config;
+  if (!opts.force && !cfg.enabled) return { ok: false, error: "Tự động đồng bộ đang tắt." };
+  if (!cfg.spreadsheetId) return { ok: false, error: "Chưa lưu link Google Sheet." };
+
+  let tabs = cfg.tabs;
+  if (!tabs.length) {
+    // Cấu hình chỉ có link (người dùng lưu nhanh): tự dò lại toàn bộ tab.
+    try {
+      const listed = await listSheetTabs(cfg.url || cfg.spreadsheetId);
+      tabs = normalizeSheetTabs(listed.tabs);
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  }
+  if (!tabs.length) return { ok: false, error: "Không tìm thấy tab nào trong Sheet." };
+
+  _sheetSyncing = true;
+  try {
+    const r = await importSheetTabs(cfg.spreadsheetId, tabs, { prune: cfg.prune });
+    const summary = {
+      ok: true,
+      imported: r.imported,
+      added: r.added,
+      updated: r.updated,
+      deleted: r.deleted,
+      failedTabs: r.results.filter((x) => !x.ok).length,
+    };
+    const saved = await recordSheetSyncResult(cfg, summary);
+    return { ...r, config: saved };
+  } catch (e) {
+    const summary = { ok: false, error: String(e) };
+    const saved = await recordSheetSyncResult(cfg, summary);
+    return { ok: false, error: String(e), config: saved };
+  } finally {
+    _sheetSyncing = false;
+  }
+}
+
+/** Handler cho alarm: chỉ chạy khi cấu hình còn bật. */
+async function processSheetSync() {
+  return syncMyStoreSheet({});
+}
+
+/** Khôi phục alarm khi service worker khởi động lại. */
+async function initSheetSync() {
+  if (typeof chrome === "undefined" || !chrome.alarms) return;
+  const cfg = await getSheetConfig();
+  try {
+    const existing = await chrome.alarms.get(SHEET_ALARM);
+    const want = cfg.enabled && !!cfg.spreadsheetId && cfg.tabs.length > 0;
+    if (want && !existing) {
+      chrome.alarms.create(SHEET_ALARM, { periodInMinutes: cfg.intervalHours * 60 });
+    } else if (!want && existing) {
+      await chrome.alarms.clear(SHEET_ALARM);
+    }
+  } catch (e) {}
 }
 
 export {
@@ -312,6 +621,19 @@ export {
   detectColumns,
   slugify,
   previewSheet,
+  productIdFor,
   rowsToProducts,
+  pruneMissingProducts,
   importSheetTabs,
+  SHEET_KEY,
+  SHEET_ALARM,
+  SHEET_INTERVALS,
+  normalizeSheetTabs,
+  normalizeSheetConfig,
+  getSheetConfig,
+  getSheetConfigResult,
+  applySheetConfig,
+  syncMyStoreSheet,
+  processSheetSync,
+  initSheetSync,
 };

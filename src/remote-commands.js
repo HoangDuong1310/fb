@@ -11,9 +11,37 @@
 
 import { apiFetch, getBaseUrl, getToken } from "./api.js";
 import * as DB from "./db.js";
-import { crawlGroupInTab, scanJoinedGroups, executeDeletePost } from "./crawl.js";
+import {
+  crawlGroupInTab,
+  crawlGroupApiSmart,
+  scanJoinedGroups,
+  executeDeletePost,
+} from "./crawl.js";
 import { approveAdvisory } from "./advisory.js";
 import { broadcast } from "./util.js";
+
+/**
+ * Đọc "Cách crawl" đã lưu trong chrome.storage.local (khoá `crawlSettings`, do
+ * ConfigTab của dashboard ghi — xem saveCrawl trong ui/src/views/Tools.tsx).
+ * Trả "dom" | "api"; mặc định "api" cho khớp CRAWL_DEFAULTS.crawlMethod của UI.
+ * Lệnh từ xa PHẢI tôn trọng cấu hình này, nếu không sẽ chạy bộ bóc tách khác
+ * với crawl tay và sinh ra dữ liệu không đồng nhất.
+ */
+async function readStoredCrawlMethod() {
+  try {
+    const o = await new Promise((resolve) => {
+      try {
+        chrome.storage.local.get("crawlSettings", (r) => resolve(r || {}));
+      } catch (e) {
+        resolve({});
+      }
+    });
+    const m = String((o.crawlSettings && o.crawlSettings.crawlMethod) || "").toLowerCase();
+    return m === "dom" ? "dom" : "api";
+  } catch (e) {
+    return "api";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Deduplication — track command IDs already processed (via WS or poll) so a
@@ -160,7 +188,28 @@ async function dispatchCommand(cmd) {
         maxPosts: payload.maxPosts ?? 50,
         ...(payload.options || {}),
       };
-      const res = await crawlGroupInTab(payload.groupId, options);
+      // TÔN TRỌNG CẤU HÌNH "Cách crawl" như crawl tay/crawl hàng loạt.
+      // TRƯỚC ĐÂY: luôn gọi crawlGroupInTab (nhánh DOM) bất kể người dùng đã
+      // chọn "api" trong Cấu hình => lệnh từ xa âm thầm chạy bộ bóc tách DOM
+      // (heuristic) thay vì bộ bóc tách GraphQL. Bộ DOM bóc theo phỏng đoán:
+      // không thấy link tác giả -> authorName rỗng ("Không rõ" trên UI), text
+      // lấy khối dài nhất trong ô feed nên dễ trúng metadata thẻ nhóm
+      // ("Có 3,4K người theo dõi"), không có permalink -> id rơi xuống vân tay
+      // "fp:" -> UI báo "thiếu link gốc nên chưa bình luận được".
+      // Thứ tự ưu tiên: payload.method (lệnh chỉ định rõ) -> crawlSettings đã
+      // lưu -> "api" (giống CRAWL_DEFAULTS.crawlMethod của UI).
+      let method = String(payload.method || options.method || "").toLowerCase();
+      if (method !== "api" && method !== "dom") {
+        method = await readStoredCrawlMethod();
+      }
+      // B2 — TRUY NGUYÊN: gắn nhãn nguồn kích hoạt để telemetry "crawl.start"
+      // phân biệt được lệnh từ server với lịch tự động / bấm tay / hàng loạt.
+      options.trigger = "remote";
+      options.method = method;
+      const res =
+        method === "dom"
+          ? await crawlGroupInTab(payload.groupId, options)
+          : await crawlGroupApiSmart(payload.groupId, options);
       return res;
     }
 

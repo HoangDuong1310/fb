@@ -13,14 +13,25 @@ import {
   AlertCircle,
   Package,
   CalendarClock,
+  ChevronDown,
   Eye,
   PenLine,
   Wand2,
+  Signature,
+  Save,
 } from "lucide-react";
 import { bg, type BgResponse } from "@/lib/bg";
 import { cn } from "@/lib/utils";
 import { useIncremental } from "@/lib/useIncremental";
 import { compressAndUploadImages } from "@/lib/upload";
+import {
+  SIGNATURE_SETTING_KEY,
+  DEFAULT_SIGNATURE,
+  normalizeSignature,
+  isSignatureActive,
+  appendSignature,
+  type SignatureConfig,
+} from "@/lib/signature";
 
 /* -------------------------------------------------------------------------
    Compose — Đăng bài lên nhiều nhóm (và/hoặc trang cá nhân).
@@ -64,6 +75,9 @@ interface AiVariantsResponse extends BgResponse {
 }
 interface CreateJobsResponse extends BgResponse {
   jobs?: unknown[];
+}
+interface SettingResponse extends BgResponse {
+  value?: unknown;
 }
 
 interface Target {
@@ -120,12 +134,20 @@ export function Compose() {
   // Kho sản phẩm để dựng brief chào hàng
   const [products, setProducts] = useState<Product[]>([]);
   const [pickedProduct, setPickedProduct] = useState<string>("");
+  const [productQuery, setProductQuery] = useState("");
+  const [productOpen, setProductOpen] = useState(false);
+  const [productHi, setProductHi] = useState(0);
 
   // Ảnh + lịch
   const [images, setImages] = useState<string[]>([]);
   const [imgBusy, setImgBusy] = useState(false);
   const [scheduleAt, setScheduleAt] = useState("");
   const [spacing, setSpacing] = useState(0);
+
+  // Chữ ký cuối bài — lưu ở settings theo user, dán SAU khi AI viết/xào nấu.
+  const [sig, setSig] = useState<SignatureConfig>(DEFAULT_SIGNATURE);
+  const [sigSaving, setSigSaving] = useState(false);
+  const [sigDirty, setSigDirty] = useState(false);
 
   // Trạng thái AI / tạo việc
   const [aiBusy, setAiBusy] = useState(false);
@@ -140,6 +162,9 @@ export function Compose() {
   const [toast, setToast] = useState<Toast>(null);
   const toastTimer = useRef<number | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
+  const productBoxRef = useRef<HTMLDivElement | null>(null);
+  const productSearchRef = useRef<HTMLInputElement | null>(null);
+  const productListRef = useRef<HTMLUListElement | null>(null);
 
   function flash(kind: NonNullable<Toast>["kind"], text: string, ms = 3600) {
     setToast({ kind, text });
@@ -169,6 +194,39 @@ export function Compose() {
   useEffect(() => {
     void load();
   }, []);
+
+  // Nạp chữ ký đã lưu. GET_SETTING không bao giờ throw (getSetting tự fallback
+  // về default) nên lỗi mạng chỉ khiến chữ ký rỗng, không chặn composer.
+  useEffect(() => {
+    void (async () => {
+      const res = await bg<SettingResponse>("GET_SETTING", {
+        key: SIGNATURE_SETTING_KEY,
+      });
+      if (res && res.ok) setSig(normalizeSignature(res.value));
+    })();
+  }, []);
+
+  async function saveSignature() {
+    setSigSaving(true);
+    const next = normalizeSignature(sig);
+    const res = await bg<SettingResponse>("SET_SETTING", {
+      key: SIGNATURE_SETTING_KEY,
+      value: next,
+    });
+    setSigSaving(false);
+    if (!res || !res.ok) {
+      flash("err", res?.error || "Không lưu được chữ ký.");
+      return;
+    }
+    setSig(next);
+    setSigDirty(false);
+    flash("ok", "Đã lưu chữ ký. Mọi bài tạo sau sẽ tự có chữ ký ở cuối.");
+  }
+
+  function patchSig(patch: Partial<SignatureConfig>) {
+    setSig((s) => ({ ...s, ...patch }));
+    setSigDirty(true);
+  }
 
   // Nạp kho sản phẩm khi lần đầu chuyển sang chế độ AI viết.
   useEffect(() => {
@@ -216,6 +274,84 @@ export function Compose() {
 
   const allVisibleSelected =
     filteredGroups.length > 0 && filteredGroups.every((g) => selected[g.groupId]);
+
+  // Danh sách sản phẩm sau khi lọc — giữ nguyên index gốc để fillBriefFromProduct vẫn đúng.
+  const filteredProducts = useMemo(() => {
+    const indexed = products.map((p, idx) => ({ p, idx }));
+    const q = productQuery.trim().toLowerCase();
+    if (!q) return indexed;
+    const terms = q.split(/\s+/).filter(Boolean);
+    return indexed.filter(({ p }) => {
+      const hay = [p.name, p.category, p.brand, p.store, p.warranty, String(p.price ?? "")]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return terms.every((t) => hay.includes(t));
+    });
+  }, [products, productQuery]);
+
+  const pickedProductLabel = useMemo(() => {
+    if (pickedProduct === "") return "";
+    const p = products[Number(pickedProduct)];
+    if (!p) return "";
+    const price = fmtPrice(p.price);
+    return (p.name || "SP") + (price ? " · " + price : "");
+  }, [products, pickedProduct]);
+
+  // Đóng dropdown khi bấm ra ngoài.
+  useEffect(() => {
+    if (!productOpen) return;
+    function onDocDown(e: MouseEvent) {
+      if (!productBoxRef.current?.contains(e.target as Node)) setProductOpen(false);
+    }
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, [productOpen]);
+
+  // Tự focus ô tìm kiếm và cuộn tới dòng đang trỏ.
+  useEffect(() => {
+    if (productOpen) productSearchRef.current?.focus();
+  }, [productOpen]);
+
+  useEffect(() => {
+    if (!productOpen) return;
+    const el = productListRef.current?.querySelector<HTMLElement>('[data-hi="1"]');
+    el?.scrollIntoView({ block: "nearest" });
+  }, [productHi, productOpen]);
+
+  function openProductPicker() {
+    setProductOpen(true);
+    setProductHi(0);
+  }
+
+  function pickProduct(idx: number) {
+    fillBriefFromProduct(String(idx));
+    setProductOpen(false);
+    setProductQuery("");
+  }
+
+  function clearProduct() {
+    setPickedProduct("");
+    setProductQuery("");
+    setProductOpen(false);
+  }
+
+  function onProductKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setProductHi((h) => Math.min(h + 1, Math.max(0, filteredProducts.length - 1)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setProductHi((h) => Math.max(0, h - 1));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const hit = filteredProducts[productHi];
+      if (hit) pickProduct(hit.idx);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setProductOpen(false);
+    }
+  }
 
   function fillBriefFromProduct(idx: string) {
     setPickedProduct(idx);
@@ -305,10 +441,17 @@ export function Compose() {
       variants = targets.map(() => text);
     }
 
+    // Chữ ký dán SAU CÙNG, sau khi AI đã xào nấu: số điện thoại/link trong chữ ký
+    // phải nguyên văn ở mọi mục tiêu. isOrig vẫn so trên THÂN BÀI (trước khi dán
+    // chữ ký) để nhãn "Nguyên gốc / AI xào nấu" không bị chữ ký làm lệch.
     setPreview(
       targets.map((t, i) => {
         const v = variants[i] ?? text;
-        return { target: t, text: v, isOrig: v.trim() === text.trim() };
+        return {
+          target: t,
+          text: appendSignature(v, sig),
+          isOrig: v.trim() === text.trim(),
+        };
       }),
     );
     setPreviewNote(note);
@@ -555,24 +698,141 @@ export function Compose() {
           {/* Chế độ AI viết: brief + kho + tone */}
           {mode === "generate" && (
             <div className="flex flex-col gap-2.5 rounded-md border border-line-soft bg-surface-2/50 p-3">
-              <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
+              <div className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
                 <span className="flex items-center gap-1.5">
                   <Package className="size-3.5 text-accent" />
                   Lấy sản phẩm từ kho (tùy chọn)
                 </span>
-                <select
-                  value={pickedProduct}
-                  onChange={(e) => fillBriefFromProduct(e.target.value)}
-                  className="rounded-sm border border-line bg-surface px-2.5 py-2 text-sm text-ink outline-none focus:border-accent"
-                >
-                  <option value="">— Chọn sản phẩm để tạo yêu cầu —</option>
-                  {products.map((p, i) => (
-                    <option key={i} value={i}>
-                      {(p.name || "SP") + (fmtPrice(p.price) ? " · " + fmtPrice(p.price) : "")}
-                    </option>
-                  ))}
-                </select>
-              </label>
+
+                <div className="relative" ref={productBoxRef}>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => (productOpen ? setProductOpen(false) : openProductPicker())}
+                      aria-haspopup="listbox"
+                      aria-expanded={productOpen}
+                      className={cn(
+                        "flex w-full items-center justify-between gap-2 rounded-sm border bg-surface px-2.5 py-2 text-left text-sm outline-none transition-colors",
+                        productOpen ? "border-accent" : "border-line hover:border-accent/50",
+                        pickedProductLabel ? "text-ink" : "text-ink-faint",
+                      )}
+                    >
+                      <span className="truncate">
+                        {pickedProductLabel || "— Chọn sản phẩm để tạo yêu cầu —"}
+                      </span>
+                      <ChevronDown
+                        className={cn(
+                          "size-4 shrink-0 text-ink-faint transition-transform",
+                          productOpen && "rotate-180",
+                        )}
+                      />
+                    </button>
+                    {pickedProductLabel && (
+                      <button
+                        type="button"
+                        onClick={clearProduct}
+                        title="Bỏ chọn sản phẩm"
+                        aria-label="Bỏ chọn sản phẩm"
+                        className="grid size-8 shrink-0 place-items-center rounded-sm border border-line bg-surface text-ink-faint hover:text-ink"
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {productOpen && (
+                    <div className="absolute left-0 right-0 top-full z-30 mt-1 overflow-hidden rounded-md border border-line bg-surface shadow-lg">
+                      <div className="flex items-center gap-2 border-b border-line-soft px-2.5">
+                        <Search className="size-4 shrink-0 text-ink-faint" />
+                        <input
+                          ref={productSearchRef}
+                          value={productQuery}
+                          onChange={(e) => {
+                            setProductQuery(e.target.value);
+                            setProductHi(0);
+                          }}
+                          onKeyDown={onProductKeyDown}
+                          placeholder="Tìm theo tên, hãng, loại, cửa hàng…"
+                          className="w-full bg-transparent py-2 text-sm font-normal text-ink outline-none placeholder:text-ink-faint"
+                        />
+                        {productQuery && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setProductQuery("");
+                              setProductHi(0);
+                              productSearchRef.current?.focus();
+                            }}
+                            title="Xoá từ khoá"
+                            aria-label="Xoá từ khoá"
+                            className="shrink-0 text-ink-faint hover:text-ink"
+                          >
+                            <X className="size-3.5" />
+                          </button>
+                        )}
+                      </div>
+
+                      {filteredProducts.length === 0 ? (
+                        <p className="px-3 py-5 text-center text-xs font-normal text-ink-faint">
+                          {products.length === 0
+                            ? "Kho chưa có sản phẩm của bạn. Thêm ở Bảng giá → Kho của tôi."
+                            : "Không có sản phẩm khớp từ khoá."}
+                        </p>
+                      ) : (
+                        <ul
+                          ref={productListRef}
+                          role="listbox"
+                          className="max-h-56 overflow-y-auto divide-y divide-line-soft"
+                        >
+                          {filteredProducts.map(({ p, idx }, i) => {
+                            const price = fmtPrice(p.price);
+                            const meta = [p.brand, p.category, p.store].filter(Boolean).join(" · ");
+                            return (
+                              <li key={idx}>
+                                <button
+                                  type="button"
+                                  role="option"
+                                  aria-selected={String(idx) === pickedProduct}
+                                  data-hi={i === productHi ? "1" : undefined}
+                                  onMouseEnter={() => setProductHi(i)}
+                                  onClick={() => pickProduct(idx)}
+                                  className={cn(
+                                    "flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left transition-colors",
+                                    i === productHi ? "bg-surface-2" : "hover:bg-surface-2",
+                                  )}
+                                >
+                                  <span className="flex w-full items-center justify-between gap-2">
+                                    <span className="truncate text-sm font-medium text-ink">
+                                      {p.name || "SP"}
+                                    </span>
+                                    {price && (
+                                      <span className="shrink-0 text-xs font-semibold text-accent-ink">
+                                        {price}
+                                      </span>
+                                    )}
+                                  </span>
+                                  {(meta || p.inStock === false) && (
+                                    <span className="truncate text-xs font-normal text-ink-faint">
+                                      {meta}
+                                      {p.inStock === false ? (meta ? " · " : "") + "tạm hết" : ""}
+                                    </span>
+                                  )}
+                                </button>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+
+                      {products.length > 0 && (
+                        <div className="border-t border-line-soft px-3 py-1.5 text-xs font-normal text-ink-faint">
+                          {filteredProducts.length}/{products.length} sản phẩm
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
 
               <label className="flex flex-col gap-1 text-xs font-medium text-ink-soft">
                 Yêu cầu nội dung (AI sẽ viết bài từ đây)
@@ -632,6 +892,49 @@ export function Compose() {
               className="resize-y rounded-sm border border-line bg-surface px-3 py-2.5 text-sm leading-relaxed text-ink outline-none focus:border-accent"
             />
           </label>
+
+          {/* Chữ ký cuối bài — dán sau khi AI viết/xào nấu nên số điện thoại,
+              link trong chữ ký luôn nguyên văn ở mọi mục tiêu. */}
+          <div className="flex flex-col gap-2.5 rounded-md border border-line-soft bg-surface-2/50 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-ink-soft">
+                <input
+                  type="checkbox"
+                  checked={sig.enabled}
+                  onChange={(e) => patchSig({ enabled: e.target.checked })}
+                  className="size-4 accent-accent"
+                />
+                <Signature className="size-4 text-accent" />
+                <span>Tự thêm chữ ký xuống dưới mỗi bài</span>
+              </label>
+              <button
+                onClick={saveSignature}
+                disabled={sigSaving}
+                className="inline-flex items-center gap-1.5 rounded-sm border border-line bg-surface px-2.5 py-1 text-xs font-medium text-ink-soft hover:border-accent/50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {sigSaving ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Save className="size-3.5" />
+                )}
+                {sigDirty ? "Lưu chữ ký *" : "Lưu chữ ký"}
+              </button>
+            </div>
+
+            <textarea
+              value={sig.text}
+              onChange={(e) => patchSig({ text: e.target.value })}
+              rows={3}
+              placeholder={"— Liên hệ: 09xx xxx xxx\nĐịa chỉ: …\nFanpage: …"}
+              className="resize-y rounded-sm border border-line bg-surface px-3 py-2.5 text-sm leading-relaxed text-ink outline-none focus:border-accent"
+            />
+
+            <p className="text-xs text-ink-faint">
+              {isSignatureActive(sig)
+                ? "Chữ ký được dán nguyên văn ở cuối bài, sau khi AI viết/xào nấu — số điện thoại và link không bị AI đổi."
+                : "Bật và nhập chữ ký để mọi bài (tự viết hoặc AI viết) tự có phần liên hệ ở cuối."}
+            </p>
+          </div>
 
           {/* Ảnh đính kèm */}
           <div className="flex flex-col gap-2">

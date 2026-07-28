@@ -12,7 +12,7 @@ import {
   fetchWithTimeout,
 } from "./util.js";
 import { syncAllSources } from "./prices.js";
-import { extractPostsFromChunks } from "./gql-parse.js";
+import { extractPostsFromChunks, hashStr } from "./gql-parse.js";
 import { API_BASE_URL } from "./config.js";
 import { assertFbMatch, MATCH_MISMATCH, MATCH_FB_ABSENT } from "./fb-identity.js";
 import { recordTelemetry } from "./client-telemetry.js";
@@ -111,10 +111,70 @@ function withNewestSort(rawUrl) {
   }
 }
 
+/* --------- TRUY NGUYÊN NGUỒN KÍCH HOẠT CRAWL (B2) ---------------------- */
+// VÌ SAO CẦN: đã quan sát bài của HAI nhóm được ghi trong CÙNG một giây
+// (10:24:11) trong khi KHÔNG có alarm autoCrawl nào tồn tại và 0 tab nhóm FB
+// đang mở => không có cách nào biết đường nào đã gọi crawl. Không truy nguyên
+// được nguồn kích hoạt thì mọi chốt chống chạy chồng (B1) đều chỉ là phỏng đoán.
+//
+// VÌ SAO GẮN Ở ĐÂY MÀ KHÔNG GẮN Ở 4 NƠI GỌI: mọi đường vào (lịch tự động /
+// crawl hàng loạt từ dashboard / lệnh từ server / bấm tay / tab đang mở) đều
+// chảy qua đúng 3 hàm phễu: startCrawlInActiveTab, crawlGroupInTab,
+// crawlGroupApiSmart. Gắn ở phễu => đường vào MỚI thêm sau này cũng tự được ghi
+// (nhãn "unknown" lộ ngay chỗ hở), không thể bỏ sót như khi rải rác nơi gọi.
+const CRAWL_TRIGGERS = new Set([
+  "autocrawl", // chu kỳ tự động theo alarm (processAutoCrawl)
+  "bulk", // hàng đợi crawl nhiều nhóm từ dashboard
+  "remote", // lệnh crawl_group từ server
+  "manual", // người dùng bấm crawl 1 nhóm
+  "activetab", // crawl tab nhóm đang mở
+]);
+
+/** Chuẩn hoá nhãn nguồn kích hoạt. Giá trị thiếu/lạ => "unknown" (vẫn GHI, để
+ *  lộ ra đường vào chưa gắn nhãn thay vì âm thầm bỏ qua). */
+function normalizeCrawlTrigger(v) {
+  const s = String(v == null ? "" : v).trim().toLowerCase();
+  if (!s) return "unknown";
+  return CRAWL_TRIGGERS.has(s) ? s : "unknown";
+}
+
+/**
+ * Ghi 1 sự kiện "crawl.start" cho mỗi lần crawl. KHÔNG BAO GIỜ ném lỗi và KHÔNG
+ * BAO GIỜ chặn crawl — telemetry hỏng không được phép làm chết tự động hoá.
+ *
+ * HAI CÁI BẪY ĐÃ TÍNH TRƯỚC:
+ *  (1) DEDUP: recordTelemetry gộp các sự kiện cùng (tên + payload) trong cửa sổ
+ *      60s. Chính hiện tượng cần điều tra là NHIỀU LẦN crawl sát nhau, nên nếu
+ *      payload giống nhau thì telemetry sẽ tự xoá đúng bằng chứng cần tìm. Vì
+ *      vậy payload mang `stamp` duy nhất cho mỗi lần gọi.
+ *  (2) REDACT: client-telemetry thay mọi chuỗi số >= 10 chữ số bằng
+ *      "[redacted-id]" (chống lộ id). groupId của FB là 14–16 chữ số nên nếu ghi
+ *      thô thì mọi nhóm đều thành CÙNG một giá trị => mất khả năng phân biệt
+ *      nhóm. Vì vậy ghi BĂM ngắn của groupId: vẫn đối chiếu được giữa các sự
+ *      kiện, mà không mang id thật.
+ */
+async function recordCrawlTrigger(entry, groupId, options) {
+  try {
+    const opts = options || {};
+    const gid = String(groupId || "");
+    await recordTelemetry("crawl.start", {
+      entry,
+      trigger: normalizeCrawlTrigger(opts.trigger),
+      group: gid ? "g:" + hashStr(gid) : "",
+      method: opts.method === "dom" ? "dom" : "api",
+      tabless: opts.preferTabless === true,
+      // base36 (không phải chuỗi số dài) để không bị bộ lọc redact ăn mất.
+      stamp:
+        Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6),
+    });
+  } catch (e) {}
+}
+
 /* ------------------------- CRAWL TAB ĐANG MỞ --------------------------- */
 
 /** Tìm tab đang active; nếu là trang nhóm FB thì gửi lệnh bắt đầu crawl tới content script. */
 async function startCrawlInActiveTab(options) {
+  await recordCrawlTrigger("activeTab", "", options);
   const tab = await getActiveTab();
   if (!tab) return { ok: false, error: "Không tìm thấy tab đang mở." };
 
@@ -181,6 +241,7 @@ async function stopCrawlInActiveTab() {
 /** Mở tab nhóm rồi khởi động crawl trong tab đó (tiến độ phát qua broadcast). */
 async function crawlGroupInTab(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
+  await recordCrawlTrigger("groupInTab", groupId, options);
   // Ép feed về "Bài viết mới" (CHRONOLOGICAL) để crawl tăng dần lấy đúng & đủ bài mới.
   const url = withNewestSort("https://www.facebook.com/groups/" + groupId + "/");
   // Mở tab theo công tắc focusTabs (mặc định NỀN để không nhảy tab); tiến trình phát qua broadcast.
@@ -390,6 +451,9 @@ async function crawlGroupApiInTab(groupId, options, active = true) {
 async function crawlGroupApiSmart(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
   const opts = options || {};
+  // Ghi Ở ĐÂY (không ghi trong crawlGroupApiInTab/Tabless) để mỗi lần crawl 1
+  // nhóm chỉ sinh ĐÚNG 1 sự kiện, bất kể định tuyến xuống tầng nào.
+  await recordCrawlTrigger("groupApiSmart", groupId, options);
 
   // Người gọi CHỦ ĐỘNG chọn tabless (TIER-3) => tôn trọng.
   if (opts.preferTabless === true) {
@@ -901,10 +965,24 @@ async function scanJoinedGroupsInPage() {
     // Notification / unread composite (dump: aText bắt đầu "Chưa đọc…")
     if (/^chưa đọc/i.test(t)) return false;
     if (/^unread\b/i.test(t)) return false;
-    // Activity / last-visit lines (dump titleNodes[1])
-    if (/lần hoạt động gần nhất/i.test(t)) return false;
-    if (/lần truy cập gần đây/i.test(t)) return false;
+    // Activity / last-visit lines (dump titleNodes[1]).
+    // KHÔNG neo đầu chuỗi: span lồng nhau làm tên DÍNH nhãn phụ, ví dụ
+    // "Chợ Máy Tính PC Hà NộiLần hoạt động gần nhất: 3 phút trước".
+    if (/lần hoạt động/i.test(t)) return false;
+    if (/lần truy cập/i.test(t)) return false;
     if (/last active|last activity|last visit/i.test(t)) return false;
+    // Banner chào mừng sau khi vào nhóm ("Chào mừng bạn đến với X -... Giờ bạn
+    // có thể đăng bài, kết nối với các thành viên khác và hơn thế nữa").
+    if (/^chào mừng/i.test(t)) return false;
+    if (/^welcome\b/i.test(t)) return false;
+    if (/giờ bạn có thể/i.test(t)) return false;
+    // Dòng tổng hợp thông báo ("Đã có hơn 10 bài viết mới từ lần gần đây nhất…").
+    if (/^đã có hơn/i.test(t)) return false;
+    if (/bài viết mới từ lần/i.test(t)) return false;
+    if (/^there (are|were)\b/i.test(t)) return false;
+    // Tên dính mốc thời gian ở cuối ("…: 3 phút trước", "…13 giờ", "…1 ngày").
+    if (/\d+\s*(giây|phút|giờ|ngày|tuần|tháng|năm)(\s*trước)?$/i.test(t)) return false;
+    if (/\d+\s*(sec|min|hour|day|week|month|year)s?(\s*ago)?$/i.test(t)) return false;
     // Relative time only
     if (
       /^\d+([.,]\d+)?\s*(giây|phút|giờ|ngày|tuần|tháng|năm)(\s*trước)?$/i.test(t)
@@ -1060,6 +1138,11 @@ async function scanJoinedGroupsInPage() {
    * Slug ↔ numeric: dump có DOM id "spicybox.vn" (scriptName null) nhưng
    * script id "890568078717431" = "SPICY BOX GROUP" trùng tên DOM thuần.
    * Chỉ remap khi đúng 1 script id khớp tên (tránh 2 nhóm cùng tên).
+   *
+   * BẮT BUỘC groupId là SỐ: trước đây slug không resolve được vẫn bị lưu, nên
+   * cùng một nhóm sinh HAI bản ghi (slug + numeric) và postCount bị chia đôi
+   * (đúng các cặp 71/72, 30/31, 239/254 trong danh sách nhóm). Slug không map
+   * được thì BỎ — lần quét sau Facebook trả script payload sẽ lấy đúng id.
    */
   const out = Object.create(null);
   for (const domId of Object.keys(byDomId)) {
@@ -1069,28 +1152,41 @@ async function scanJoinedGroupsInPage() {
 
     if (!/^\d{5,}$/.test(domId)) {
       const matches = scriptIdsByName[groupName] || [];
-      if (matches.length === 1) {
-        groupId = matches[0];
-        groupName = scriptNameById[groupId] || groupName;
-      }
+      if (matches.length !== 1) continue; // không resolve được → bỏ, không lưu slug
+      groupId = matches[0];
+      groupName = scriptNameById[groupId] || groupName;
     } else if (scriptNameById[domId]) {
       groupName = scriptNameById[domId];
     }
 
-    // Nếu vừa slug vừa numeric cùng nhóm → giữ bản numeric (đã remap).
-    const prev = out[groupId];
-    if (!prev || (prev.fromSlug && /^\d{5,}$/.test(groupId))) {
-      out[groupId] = {
-        groupId,
-        groupName,
-        fromSlug: !/^\d{5,}$/.test(domId) && groupId !== domId,
-      };
-    }
+    // Chốt lần cuối: chỉ nhận id số và tên đã qua bộ lọc.
+    if (!/^\d{5,}$/.test(groupId)) continue;
+    if (!isPureGroupName(groupName)) continue;
+
+    if (!out[groupId]) out[groupId] = { groupId, groupName };
   }
 
-  return Object.keys(out).map((id) => ({
-    groupId: out[id].groupId,
-    groupName: out[id].groupName,
+  /**
+   * Gộp trùng theo TÊN: nếu nhiều id số cùng một tên (Facebook render cả id
+   * nhóm và id "community" của cùng nhóm), giữ id xuất hiện trong script
+   * payload — đó là id thật dùng cho /groups/{id}/.
+   */
+  const byName = Object.create(null);
+  for (const id of Object.keys(out)) {
+    const name = out[id].groupName;
+    const prev = byName[name];
+    if (!prev) {
+      byName[name] = id;
+      continue;
+    }
+    const prevInScript = !!scriptNameById[prev];
+    const curInScript = !!scriptNameById[id];
+    if (!prevInScript && curInScript) byName[name] = id;
+  }
+
+  return Object.keys(byName).map((name) => ({
+    groupId: byName[name],
+    groupName: name,
   }));
 }
 
@@ -1132,8 +1228,9 @@ async function scanJoinedGroups() {
   }
 
   // replace:true = đồng bộ membership: thêm/cập nhật nhóm quét được + gỡ nhóm
-  // không còn trong lần quét (user đã rời). Server xoá user_groups, không xoá
-  // bản ghi groups/posts dùng chung.
+  // không còn trong lần quét (user đã rời). Server xoá user_groups VÀ xoá hẳn
+  // dòng trong `groups` khi nhóm không còn ai tham gia (groupsDeleted). Bài
+  // viết/giá đã crawl được giữ lại.
   const saved = await DB.saveGroups(groups, { replace: true });
   return {
     ok: true,
@@ -1141,6 +1238,7 @@ async function scanJoinedGroups() {
     added: saved.added,
     updated: saved.updated,
     removed: saved.removed,
+    groupsDeleted: saved.groupsDeleted,
   };
 }
 
@@ -2692,7 +2790,91 @@ async function applyAutoCrawlConfig(input) {
   return next;
 }
 
-let _autoCrawling = false;
+/* ------------- CHỐT CHỐNG CHẠY CHỒNG CHU KỲ AUTO-CRAWL ------------------ */
+// VÌ SAO KHÔNG DÙNG MỖI BIẾN RAM:
+// `let _autoCrawling` chỉ tồn tại trong MỘT instance service worker. MV3 tự kill
+// SW sau ~30s rảnh; chu kỳ auto-crawl lại NGỦ 20–90s giữa 2 nhóm (jitter chống
+// dấu vết máy). Nếu SW bị kill trong lúc ngủ, cả biến cờ LẪN vòng lặp worker
+// biến mất; alarm kế tiếp đánh thức SW mới với _autoCrawling = false => chu kỳ
+// mới khởi động trong khi các tab/tiến trình crawl của chu kỳ trước vẫn có thể
+// còn sống (tab đã mở tự crawl rồi gửi CRAWL_DONE về sau). Đó chính là cách 2
+// nhóm ghi bài trong CÙNG một giây dù threads = 1 (đã quan sát: 10:24:11 có bài
+// của cả 86520505876088 và 761814895940998).
+//
+// CHỐT BỀN: ghi lock vào chrome.storage.session (sống qua SW restart, tự mất khi
+// đóng trình duyệt — đúng phạm vi mong muốn) kèm HEARTBEAT. Lock có TTL: nếu SW
+// chết hẳn mà không kịp release, lock quá hạn sẽ được coi là rác và chiếm lại,
+// nên không bao giờ kẹt vĩnh viễn. Biến RAM vẫn giữ làm chốt nhanh cho trường
+// hợp re-entry trong CÙNG một instance (get/set storage không nguyên tử).
+const AUTOCRAWL_LOCK_KEY = "autoCrawlLock";
+// TTL phải LỚN HƠN khoảng ngủ dài nhất giữa 2 nhóm (90s) cộng thời gian crawl 1
+// nhóm, nếu không heartbeat sẽ không kịp và chu kỳ tự cướp lock của chính mình.
+const AUTOCRAWL_LOCK_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Lock còn hiệu lực hay đã là rác? Tách riêng (thuần) để test được không cần chrome.
+ * Rác khi: không có lock, thiếu heartbeat, hoặc heartbeat quá TTL (SW đã chết).
+ */
+function isAutoCrawlLockStale(lock, now, ttlMs = AUTOCRAWL_LOCK_TTL_MS) {
+  if (!lock || typeof lock !== "object") return true;
+  const beat = Number(lock.heartbeatAt || 0);
+  if (!Number.isFinite(beat) || beat <= 0) return true;
+  // Đồng hồ nhảy về quá khứ (sửa giờ hệ thống) cũng coi là rác để không kẹt.
+  if (beat > now + ttlMs) return true;
+  return now - beat > ttlMs;
+}
+
+let _autoCrawling = false; // chốt nhanh trong cùng instance SW
+let _autoCrawlToken = ""; // token của lock instance này đang giữ
+
+/** Cố chiếm lock. Trả về token nếu chiếm được, "" nếu chu kỳ khác đang chạy. */
+async function acquireAutoCrawlLock(now = Date.now()) {
+  const token = String(now) + "-" + Math.random().toString(36).slice(2, 10);
+  try {
+    const r = await chrome.storage.session.get(AUTOCRAWL_LOCK_KEY);
+    const cur = r && r[AUTOCRAWL_LOCK_KEY];
+    if (!isAutoCrawlLockStale(cur, now)) return "";
+    await chrome.storage.session.set({
+      [AUTOCRAWL_LOCK_KEY]: { token, startedAt: now, heartbeatAt: now },
+    });
+    return token;
+  } catch (e) {
+    // storage.session không dùng được (test/môi trường lạ) => vẫn cho chạy,
+    // chốt RAM là tuyến phòng thủ còn lại.
+    return token;
+  }
+}
+
+/** Gia hạn lock. Nếu lock đã bị chủ khác chiếm thì trả false để chu kỳ tự dừng. */
+async function touchAutoCrawlLock(token, now = Date.now()) {
+  if (!token) return false;
+  try {
+    const r = await chrome.storage.session.get(AUTOCRAWL_LOCK_KEY);
+    const cur = r && r[AUTOCRAWL_LOCK_KEY];
+    if (cur && cur.token && cur.token !== token) return false;
+    await chrome.storage.session.set({
+      [AUTOCRAWL_LOCK_KEY]: {
+        token,
+        startedAt: (cur && cur.startedAt) || now,
+        heartbeatAt: now,
+      },
+    });
+    return true;
+  } catch (e) {
+    return true;
+  }
+}
+
+/** Nhả lock — chỉ nhả nếu đúng token của mình (không xoá lock của chu kỳ khác). */
+async function releaseAutoCrawlLock(token) {
+  if (!token) return;
+  try {
+    const r = await chrome.storage.session.get(AUTOCRAWL_LOCK_KEY);
+    const cur = r && r[AUTOCRAWL_LOCK_KEY];
+    if (cur && cur.token && cur.token !== token) return;
+    await chrome.storage.session.remove(AUTOCRAWL_LOCK_KEY);
+  } catch (e) {}
+}
 
 // Số nguyên ngẫu nhiên trong [min, max].
 const randInt = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
@@ -2730,7 +2912,17 @@ async function processAutoCrawl() {
   }
   const cfg = cfgRes.config;
   if (!cfg.enabled) return;
+  // CHỐT BỀN (B1): chặn chu kỳ mới khi chu kỳ trước còn sống, KỂ CẢ khi service
+  // worker đã bị kill và khởi động lại giữa chừng (biến RAM mất, lock thì không).
+  const token = await acquireAutoCrawlLock();
+  if (!token) {
+    try {
+      await recordTelemetry("autoCrawl.skipped_locked", { reason: "cycle_in_progress" });
+    } catch (e) {}
+    return { ok: true, skipped: true, reason: "cycle_in_progress" };
+  }
   _autoCrawling = true;
+  _autoCrawlToken = token;
   try {
     // (5) NGẮT MẠCH: nếu đang trong thời gian nghỉ do bị FB chặn ở chu kỳ trước
     // thì bỏ qua CẢ chu kỳ này. Checkpoint/429 thường là giới hạn toàn tài khoản
@@ -2751,7 +2943,23 @@ async function processAutoCrawl() {
     const order = shuffleInPlace((groups || []).slice()).filter(
       (g) => g && (g.groupId || g.id)
     );
-    const opts = cfg.options || {};
+    // QUAN TRỌNG — MẶC ĐỊNH PHẢI LÀ "api":
+    // UI chỉ gửi { enabled, intervalMinutes } khi bật lịch (xem saveAuto trong
+    // ui/src/views/Tools.tsx) nên cấu hình đã lưu có thể là options: {}. Nếu để
+    // `opts.method === "api"` quyết định thì options rỗng => rơi vào nhánh DOM,
+    // KHÁC hẳn crawl tay (CRAWL_DEFAULTS.crawlMethod = "api"). Nhánh DOM bóc tách
+    // bằng heuristic: khi không lấy được link tác giả/permalink, text lấy khối dài
+    // nhất trong ô feed (dễ trúng metadata thẻ nhóm kiểu "Có 3,4K người theo dõi"),
+    // authorName rỗng -> postId rơi xuống fingerprint "fp:" -> permalink = null.
+    // Kết quả: hàng loạt bài "Không rõ" + "thiếu link gốc nên chưa bình luận được".
+    // Vì vậy CHỈ dùng DOM khi người dùng chọn tường minh "dom".
+    const opts = { ...(cfg.options || {}) };
+    if (opts.method !== "dom") opts.method = "api";
+    // NHÃN TRUY NGUYÊN (B2): mọi nhóm trong chu kỳ này đều mang trigger
+    // "autocrawl" nên telemetry crawl.start phân biệt được rõ ràng lịch tự động
+    // với crawl tay / crawl hàng loạt / lệnh từ xa. Ghi ĐÈ (không nhận từ cấu
+    // hình đã lưu) để cấu hình cũ không thể mạo nhãn.
+    opts.trigger = "autocrawl";
     const isApi = opts.method === "api";
     // QUAN TRỌNG về số luồng — CẢ DOM lẫn API đều phải crawl TUẦN TỰ 1 nhóm/lần:
     // - DOM scroll: Facebook ảo hoá feed, chỉ mount bài khi tab đang hiển thị.
@@ -2781,6 +2989,10 @@ async function processAutoCrawl() {
         // từ nhóm trước đó qua đường bất đồng bộ.
         const blk = await getCrawlBlockState();
         if (blk.blocked) break;
+        // HEARTBEAT trước mỗi nhóm: (a) gia hạn lock để chu kỳ dài không bị coi
+        // là rác, (b) nếu lock đã bị chu kỳ khác chiếm (SW này ngủ quá TTL) thì
+        // DỪNG ngay — đúng chỗ ngăn 2 nhóm cùng chạy sau khi SW restart.
+        if (!(await touchAutoCrawlLock(token))) break;
         try {
           await crawlFn(gid, opts);
         } catch (e) {
@@ -2804,6 +3016,8 @@ async function processAutoCrawl() {
     // bỏ qua, chờ chu kỳ sau
   } finally {
     _autoCrawling = false;
+    _autoCrawlToken = "";
+    await releaseAutoCrawlLock(token);
   }
 }
 
@@ -5849,6 +6063,18 @@ export {
   applyAutoCrawlConfig,
   processAutoCrawl,
   initAutoCrawl,
+  // Truy nguyên nguồn kích hoạt crawl (B2) — xuất ra để test hồi quy khoá được
+  // nhãn trigger và chống hai cái bẫy redact/dedup của telemetry.
+  CRAWL_TRIGGERS,
+  normalizeCrawlTrigger,
+  recordCrawlTrigger,
+  // Chốt bền chống chạy chồng chu kỳ auto-crawl (xuất ra để test hồi quy).
+  AUTOCRAWL_LOCK_KEY,
+  AUTOCRAWL_LOCK_TTL_MS,
+  isAutoCrawlLockStale,
+  acquireAutoCrawlLock,
+  touchAutoCrawlLock,
+  releaseAutoCrawlLock,
   AUTOSYNC_ALARM,
   getAutoSyncConfig,
   getAutoSyncConfigResult,

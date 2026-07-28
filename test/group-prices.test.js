@@ -196,6 +196,10 @@ test("extractBatch: returns per-post {postId, items, new_keywords} from the AI",
 
 /* ------------------------- runGroupPriceExtraction ----------------------- */
 
+// Ghim vào ĐƯỜNG AI (useLocal:false): bài p1 dưới đây sạch nên tầng cục bộ đọc
+// trọn được và sẽ chiếm luôn, khiến mock AI không bao giờ chạy. Đường cục bộ đã
+// có test riêng ở test/group-prices-local.test.js; test này giữ nhiệm vụ gốc là
+// kiểm hậu kiểm chống bịa giá + học từ khoá mới từ output AI.
 test("runGroupPriceExtraction: end-to-end with injected mocks, verification applied", async () => {
   // Two crawl-able posts: one sell (passes tier1), one buyer (fails tier1).
   const posts = [
@@ -262,6 +266,7 @@ test("runGroupPriceExtraction: end-to-end with injected mocks, verification appl
     getAllPosts: async () => posts,
     aiCall,
     markParsed,
+    useLocal: false,
   });
 
   // Only p1 reaches the AI (p2 fails tier1).

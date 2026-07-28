@@ -61,6 +61,9 @@ export interface GroupPriceFilters {
   condition?: string;
   priceMin?: number | null;
   priceMax?: number | null;
+  // Free-text search over name / seller / category / condition. Diacritic- and
+  // case-insensitive; every whitespace-separated token must appear (AND).
+  query?: string;
 }
 
 export interface Cluster {
@@ -102,6 +105,48 @@ export function normalizeProductKey(name?: string): string {
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// Strip Vietnamese diacritics + lowercase, so "ram ddr4" matches "RAM DDR4" and
+// "man hinh" matches "Màn hình". NFD splits the base letter from its combining
+// marks; đ/Đ has no decomposition so it is mapped explicitly.
+export function searchNorm(s?: string | null): string {
+  return String(s == null ? "" : s)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Split a query into search tokens (already normalized). Empty -> [].
+export function queryTokens(query?: string | null): string[] {
+  const q = searchNorm(query);
+  return q ? q.split(" ").filter(Boolean) : [];
+}
+
+// A row matches when EVERY token appears somewhere in its searchable text.
+// Token-AND (not whole-phrase) so word order and extra words don't matter:
+// "ram 16" finds "RAM Kingston 16GB". Price is included as raw digits so
+// typing "5000000" also works.
+export function rowMatchesTokens(row: GroupPriceRow, tokens: string[]): boolean {
+  if (tokens.length === 0) return true;
+  if (!row) return false;
+  const hay = searchNorm(
+    [
+      row.name,
+      row.sellerName,
+      row.category,
+      row.condition,
+      row.warranty,
+      row.price == null ? "" : String(row.price),
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+  return tokens.every((t) => hay.includes(t));
 }
 
 // Return a row/group price, or +Infinity if missing, to push it last on sort.
@@ -148,18 +193,22 @@ export function groupByProduct(rows: GroupPriceRow[]): ProductGroup[] {
 
 // Filter price rows by conditions (skip empty filters). groupId/category/
 // condition are exact matches; priceMin/priceMax define an inclusive range.
-// Rows without price are dropped when a range constraint exists.
+// Rows without price are dropped when a range constraint exists. `query` is a
+// diacritic-insensitive token-AND search over name/seller/category/price.
 export function filterRows(
   rows: GroupPriceRow[],
   filters: GroupPriceFilters = {},
 ): GroupPriceRow[] {
   if (!Array.isArray(rows)) return [];
-  const { groupId, category, condition, priceMin, priceMax } = filters || {};
+  const { groupId, category, condition, priceMin, priceMax, query } = filters || {};
+  // Tokenize once, not per row.
+  const tokens = queryTokens(query);
   return rows.filter((r) => {
     if (!r) return false;
     if (groupId && String(r.groupId) !== String(groupId)) return false;
     if (category && r.category !== category) return false;
     if (condition && r.condition !== condition) return false;
+    if (tokens.length > 0 && !rowMatchesTokens(r, tokens)) return false;
     const hasRange = priceMin != null || priceMax != null;
     if (hasRange) {
       if (r.price == null) return false;

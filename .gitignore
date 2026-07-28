@@ -23,6 +23,11 @@ yarn-error.log*
 out2.txt
 test-out.txt
 *.out.txt
+# File tạm lúc chẩn đoán (dump diff/HTML). LƯU Ý: KHÔNG đặt tên bắt đầu bằng "_"
+# — Chrome từ chối nạp extension nếu thư mục chứa file/thư mục tên bắt đầu bằng
+# "_" ("Filenames starting with _ are reserved for use by the system").
+tmp_*
+*.diff
 
 # ===== TypeScript =====
 *.tsbuildinfo

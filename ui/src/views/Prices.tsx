@@ -14,6 +14,11 @@ import {
   AlertCircle,
   LayoutGrid,
   List,
+  FileSpreadsheet,
+  ChevronDown,
+  Clock,
+  Download,
+  CheckCircle2,
 } from "lucide-react";
 import { bg, type BgResponse } from "@/lib/bg";
 import { colorFor, initials } from "@/lib/avatar";
@@ -67,7 +72,61 @@ interface ExtractionResponse extends BgResponse {
   processed?: number;
   inserted?: number;
   newKeywords?: number;
+  // Số bài bộ trích cục bộ tự xử lý (0 token) vs. số bài phải nhờ AI.
+  localPosts?: number;
+  aiPosts?: number;
 }
+
+/* ---- Nhập kho từ Google Sheet -------------------------------------------- */
+
+interface SheetTab {
+  gid: string;
+  name: string;
+  category?: string;
+}
+interface SheetTabsResponse extends BgResponse {
+  spreadsheetId?: string;
+  tabs?: SheetTab[];
+}
+interface SheetTabResult {
+  gid: string;
+  name?: string;
+  ok: boolean;
+  count?: number;
+  error?: string;
+}
+interface SheetImportResponse extends BgResponse {
+  imported?: number;
+  added?: number;
+  updated?: number;
+  deleted?: number;
+  results?: SheetTabResult[];
+}
+interface SheetSyncSummary {
+  ok: boolean;
+  imported?: number;
+  added?: number;
+  updated?: number;
+  deleted?: number;
+  failedTabs?: number;
+  error?: string;
+}
+interface SheetConfig {
+  enabled: boolean;
+  intervalHours: number;
+  url: string;
+  spreadsheetId: string;
+  tabs: SheetTab[];
+  prune: boolean;
+  lastSyncAt: number;
+  lastResult: SheetSyncSummary | null;
+}
+interface SheetConfigResponse extends BgResponse {
+  config?: SheetConfig;
+}
+
+// Khớp SHEET_INTERVALS trong src/sheets.js — service worker sẽ ép về mốc hợp lệ.
+const SHEET_INTERVALS = [1, 3, 6, 12, 24];
 
 const TABS: { id: TabId; label: string; icon: typeof Tag }[] = [
   { id: "group", label: "Giá Group", icon: Tag },
@@ -215,7 +274,7 @@ export function Prices() {
       ) : tab === "catalog" ? (
         <CatalogTab flash={flash} />
       ) : (
-        <MyStoreTab />
+        <MyStoreTab flash={flash} />
       )}
 
       {/* Toast */}
@@ -245,11 +304,20 @@ function GroupPriceTab({ flash }: { flash: FlashFn }) {
   const [extracting, setExtracting] = useState(false);
 
   // Filters
+  const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [groupId, setGroupId] = useState("");
   const [category, setCategory] = useState("");
   const [condition, setCondition] = useState("");
   const [priceMin, setPriceMin] = useState("");
   const [priceMax, setPriceMax] = useState("");
+
+  // Gõ tới đâu lọc tới đó, nhưng chỉ tính lại sau 180ms để không refilter +
+  // re-render toàn bộ danh sách trên từng ký tự.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(query), 180);
+    return () => clearTimeout(t);
+  }, [query]);
 
   async function load() {
     setLoading(true);
@@ -277,13 +345,15 @@ function GroupPriceTab({ flash }: { flash: FlashFn }) {
 
   async function runExtraction() {
     setExtracting(true);
-    flash("info", "Đang trích giá từ bài đã crawl bằng AI…", 5000);
+    flash("info", "Đang trích giá: đọc cục bộ trước, chỉ bài khó mới nhờ AI…", 5000);
     const res = await bg<ExtractionResponse>("RUN_GROUP_PRICE_EXTRACTION");
     setExtracting(false);
     if (res && res.ok) {
+      const local = res.localPosts || 0;
+      const ai = res.aiPosts || 0;
       flash(
         "ok",
-        `Trích xong: xử lý ${res.processed || 0} bài, thêm ${res.inserted || 0} dòng giá, học ${res.newKeywords || 0} từ khoá mới.`,
+        `Trích xong: ${res.processed || 0} bài (${local} tự đọc, ${ai} qua AI), thêm ${res.inserted || 0} dòng giá, học ${res.newKeywords || 0} từ khoá mới.`,
         5000,
       );
       await load();
@@ -301,13 +371,14 @@ function GroupPriceTab({ flash }: { flash: FlashFn }) {
     const pMin = priceMin.trim() ? Number(priceMin) : null;
     const pMax = priceMax.trim() ? Number(priceMax) : null;
     return filterRows(rows, {
+      query: debouncedQuery,
       groupId,
       category,
       condition,
       priceMin: Number.isNaN(pMin as number) ? null : pMin,
       priceMax: Number.isNaN(pMax as number) ? null : pMax,
     });
-  }, [rows, groupId, category, condition, priceMin, priceMax]);
+  }, [rows, debouncedQuery, groupId, category, condition, priceMin, priceMax]);
 
   const productGroups = useMemo(() => groupByProduct(filtered), [filtered]);
 
@@ -357,8 +428,19 @@ function GroupPriceTab({ flash }: { flash: FlashFn }) {
           </div>
         </div>
 
-        {/* Filters */}
+        {/* Search + filters */}
         <div className="flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[220px] flex-1">
+            <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-ink-faint" />
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Tìm tên sản phẩm, người bán, mức giá…"
+              aria-label="Tìm trong mặt bằng giá"
+              className="w-full rounded-md border border-line bg-bg py-1.5 pl-8 pr-2.5 text-xs text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
+            />
+          </div>
           <select
             value={groupId}
             onChange={(e) => setGroupId(e.target.value)}
@@ -893,9 +975,396 @@ function CatalogTab({ flash }: { flash: FlashFn }) {
   );
 }
 
+/* ================= NHẬP KHO TỪ GOOGLE SHEET (panel) ==================== */
+
+/**
+ * SheetImportPanel — đường vào duy nhất cho luồng nhập kho từ Google Sheet.
+ *
+ * Ba bước: dán link -> chọn tab -> nhập. Sau khi nhập, cấu hình (link + tab)
+ * được LƯU lại nên có thể bật "tự động đồng bộ": service worker sẽ nhập lại
+ * theo chu kỳ, nhờ đó sửa giá trên Sheet là kho tự cập nhật.
+ */
+function SheetImportPanel({
+  flash,
+  onImported,
+}: {
+  flash: FlashFn;
+  onImported: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState("");
+  const [spreadsheetId, setSpreadsheetId] = useState("");
+  const [tabs, setTabs] = useState<SheetTab[]>([]);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [listing, setListing] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [cfg, setCfg] = useState<SheetConfig | null>(null);
+  const [results, setResults] = useState<SheetTabResult[] | null>(null);
+
+  // Nạp cấu hình đã lưu để hiển thị trạng thái tự động đồng bộ + prefill link.
+  async function loadConfig() {
+    const res = await bg<SheetConfigResponse>("GET_SHEET_CONFIG");
+    if (res && res.ok && res.config) {
+      setCfg(res.config);
+      if (res.config.url) setUrl((u) => u || res.config!.url);
+      if (res.config.spreadsheetId) {
+        setSpreadsheetId((s) => s || res.config!.spreadsheetId);
+      }
+      if (res.config.tabs.length) {
+        setPicked((p) => (p.size ? p : new Set(res.config!.tabs.map((t) => t.gid))));
+      }
+      // Đã lưu cấu hình -> mở panel để người dùng thấy ngay trạng thái.
+      if (res.config.spreadsheetId) setOpen(true);
+    }
+  }
+
+  useEffect(() => {
+    void loadConfig();
+  }, []);
+
+  async function fetchTabs() {
+    const link = url.trim();
+    if (!link) {
+      flash("err", "Hãy dán link Google Sheet trước.");
+      return;
+    }
+    setListing(true);
+    setResults(null);
+    const res = await bg<SheetTabsResponse>("SHEET_TABS", { url: link });
+    setListing(false);
+    if (!res || !res.ok) {
+      flash("err", res?.error || "Không đọc được Sheet.", 6000);
+      return;
+    }
+    const list = res.tabs || [];
+    setSpreadsheetId(res.spreadsheetId || "");
+    setTabs(list);
+    // Mặc định chọn hết: phần lớn người dùng muốn nhập cả bảng giá.
+    setPicked(new Set(list.map((t) => t.gid)));
+    flash("ok", `Tìm thấy ${list.length} tab.`);
+  }
+
+  function toggleTab(gid: string) {
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(gid)) next.delete(gid);
+      else next.add(gid);
+      return next;
+    });
+  }
+
+  const selected = useMemo(
+    () => tabs.filter((t) => picked.has(t.gid)),
+    [tabs, picked],
+  );
+
+  async function runImport() {
+    if (!spreadsheetId) {
+      flash("err", "Chưa có Sheet nào được đọc.");
+      return;
+    }
+    if (!selected.length) {
+      flash("err", "Hãy chọn ít nhất một tab.");
+      return;
+    }
+    setImporting(true);
+    setResults(null);
+    const res = await bg<SheetImportResponse>("IMPORT_SHEET", {
+      spreadsheetId,
+      tabs: selected,
+    });
+    setImporting(false);
+    if (!res || !res.ok) {
+      flash("err", res?.error || "Nhập kho thất bại.", 6000);
+      return;
+    }
+    setResults(res.results || null);
+    // Lưu lại link + tab để có thể bật tự động đồng bộ mà không phải chọn lại.
+    const saved = await bg<SheetConfigResponse>("SET_SHEET_CONFIG", {
+      config: { url: url.trim(), spreadsheetId, tabs: selected },
+    });
+    if (saved && saved.ok && saved.config) setCfg(saved.config);
+    flash(
+      "ok",
+      `Đã nhập ${res.imported || 0} dòng · thêm ${res.added || 0} · cập nhật ${
+        res.updated || 0
+      }.`,
+      5000,
+    );
+    onImported();
+  }
+
+  async function patchConfig(patch: Record<string, unknown>) {
+    const res = await bg<SheetConfigResponse>("SET_SHEET_CONFIG", { config: patch });
+    if (!res || !res.ok) {
+      flash("err", res?.error || "Không lưu được cấu hình.", 6000);
+      return;
+    }
+    if (res.config) setCfg(res.config);
+  }
+
+  async function toggleAuto(next: boolean) {
+    if (next && !(cfg?.spreadsheetId || spreadsheetId)) {
+      flash("err", "Hãy nhập kho một lần trước để lưu link Sheet.");
+      return;
+    }
+    await patchConfig({ enabled: next });
+    flash(
+      next ? "ok" : "info",
+      next ? "Đã bật tự động đồng bộ theo chu kỳ." : "Đã tắt tự động đồng bộ.",
+    );
+  }
+
+  async function syncNow() {
+    setSyncing(true);
+    const res = await bg<SheetImportResponse & SheetConfigResponse>("SYNC_SHEET_NOW");
+    setSyncing(false);
+    if (!res || !res.ok) {
+      flash("err", res?.error || "Đồng bộ thất bại.", 6000);
+      if (res && res.config) setCfg(res.config);
+      return;
+    }
+    if (res.config) setCfg(res.config);
+    flash(
+      "ok",
+      `Đồng bộ xong: ${res.imported || 0} dòng · thêm ${res.added || 0} · cập nhật ${
+        res.updated || 0
+      } · xóa ${res.deleted || 0}.`,
+      5000,
+    );
+    onImported();
+  }
+
+  const hasSaved = !!cfg?.spreadsheetId;
+
+  return (
+    <div className="rounded-lg border border-line bg-surface">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2.5 px-4 py-3 text-left"
+      >
+        <FileSpreadsheet className="size-4 shrink-0 text-accent" strokeWidth={2} />
+        <span className="text-sm font-medium text-ink">Nhập kho từ Google Sheet</span>
+        {hasSaved && (
+          <span
+            className={cn(
+              "rounded-sm px-1.5 py-0.5 text-xs font-medium",
+              cfg?.enabled
+                ? "bg-green-soft/30 text-green"
+                : "bg-surface-2 text-ink-faint",
+            )}
+          >
+            {cfg?.enabled ? `Tự động ${cfg.intervalHours}h` : "Tự động: tắt"}
+          </span>
+        )}
+        <ChevronDown
+          className={cn(
+            "ml-auto size-4 shrink-0 text-ink-faint transition-transform",
+            open && "rotate-180",
+          )}
+        />
+      </button>
+
+      {open && (
+        <div className="flex flex-col gap-3 border-t border-line-soft px-4 py-3.5">
+          {/* Bước 1 — link */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              htmlFor="sheet-url"
+              className="text-xs font-medium text-ink-soft"
+            >
+              Link Google Sheet (chia sẻ "Bất kỳ ai có liên kết → Người xem")
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                id="sheet-url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://docs.google.com/spreadsheets/d/…"
+                className="min-w-[240px] flex-1 rounded-md border border-line bg-bg px-3 py-2 font-mono text-xs text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => void fetchTabs()}
+                disabled={listing}
+                className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-3 py-2 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-60"
+              >
+                {listing ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Search className="size-3.5" />
+                )}
+                Đọc tab
+              </button>
+            </div>
+          </div>
+
+          {/* Bước 2 — chọn tab */}
+          {tabs.length > 0 && (
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-medium text-ink-soft">
+                  Chọn tab để nhập ({picked.size}/{tabs.length})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setPicked(new Set(tabs.map((t) => t.gid)))}
+                  className="rounded-sm px-1.5 py-0.5 text-xs text-ink-faint hover:text-accent"
+                >
+                  Chọn hết
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPicked(new Set())}
+                  className="rounded-sm px-1.5 py-0.5 text-xs text-ink-faint hover:text-accent"
+                >
+                  Bỏ chọn
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {tabs.map((t) => {
+                  const on = picked.has(t.gid);
+                  return (
+                    <button
+                      key={t.gid}
+                      type="button"
+                      onClick={() => toggleTab(t.gid)}
+                      aria-pressed={on}
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-sm px-2.5 py-1 text-xs font-medium transition-colors",
+                        on
+                          ? "bg-accent text-on-accent"
+                          : "bg-surface-2 text-ink-faint hover:text-ink",
+                      )}
+                    >
+                      {on && <CheckCircle2 className="size-3" />}
+                      {t.name || `Tab ${t.gid}`}
+                    </button>
+                  );
+                })}
+              </div>
+              <div>
+                <button
+                  type="button"
+                  onClick={() => void runImport()}
+                  disabled={importing || !picked.size}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-accent px-3.5 py-2 text-xs font-semibold text-on-accent transition-opacity hover:opacity-90 disabled:opacity-60"
+                >
+                  {importing ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Download className="size-3.5" />
+                  )}
+                  Nhập {picked.size} tab vào kho
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Kết quả từng tab */}
+          {results && results.length > 0 && (
+            <div className="flex flex-col gap-1 rounded-md border border-line-soft bg-surface-2 p-2.5">
+              {results.map((r) => (
+                <div
+                  key={r.gid}
+                  className="flex items-center gap-2 text-xs"
+                >
+                  {r.ok ? (
+                    <CheckCircle2 className="size-3.5 shrink-0 text-green" />
+                  ) : (
+                    <AlertCircle className="size-3.5 shrink-0 text-red" />
+                  )}
+                  <span className="truncate text-ink-soft">
+                    {r.name || `Tab ${r.gid}`}
+                  </span>
+                  <span className="ml-auto shrink-0 font-mono text-ink-faint">
+                    {r.ok ? `${r.count || 0} dòng` : r.error || "lỗi"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Bước 3 — tự động đồng bộ */}
+          <div className="flex flex-col gap-2.5 border-t border-line-soft pt-3">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <label className="inline-flex cursor-pointer items-center gap-2 text-xs font-medium text-ink-soft">
+                <input
+                  type="checkbox"
+                  checked={!!cfg?.enabled}
+                  onChange={(e) => void toggleAuto(e.target.checked)}
+                  className="size-3.5 accent-[var(--accent)]"
+                />
+                Tự động đồng bộ lại từ Sheet
+              </label>
+              <select
+                value={cfg?.intervalHours ?? 6}
+                onChange={(e) =>
+                  void patchConfig({ intervalHours: Number(e.target.value) })
+                }
+                disabled={!hasSaved}
+                className="rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink focus:border-accent/60 focus-visible:outline-none disabled:opacity-60"
+                aria-label="Chu kỳ đồng bộ"
+              >
+                {SHEET_INTERVALS.map((h) => (
+                  <option key={h} value={h}>
+                    mỗi {h} giờ
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => void syncNow()}
+                disabled={syncing || !hasSaved}
+                className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-3 py-1.5 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-60"
+              >
+                <RefreshCw className={cn("size-3.5", syncing && "animate-spin")} />
+                Đồng bộ ngay
+              </button>
+            </div>
+
+            <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-ink-faint">
+              <input
+                type="checkbox"
+                checked={cfg?.prune !== false}
+                onChange={(e) => void patchConfig({ prune: e.target.checked })}
+                disabled={!hasSaved}
+                className="size-3.5 accent-[var(--accent)]"
+              />
+              Xóa khỏi kho những dòng đã bị xóa trong Sheet
+            </label>
+
+            {cfg?.lastSyncAt ? (
+              <p className="flex items-center gap-1.5 text-xs text-ink-faint">
+                <Clock className="size-3.5" />
+                Đồng bộ lần cuối {timeAgo(cfg.lastSyncAt)}
+                {cfg.lastResult
+                  ? cfg.lastResult.ok
+                    ? ` · ${cfg.lastResult.imported || 0} dòng, xóa ${
+                        cfg.lastResult.deleted || 0
+                      }`
+                    : ` · lỗi: ${cfg.lastResult.error || "không rõ"}`
+                  : ""}
+              </p>
+            ) : (
+              <p className="text-xs leading-relaxed text-ink-faint">
+                Google Sheet không tự thông báo khi có thay đổi, nên kho được làm
+                mới theo chu kỳ bạn chọn ở trên (hoặc bấm "Đồng bộ ngay").
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ============================ TAB 3 — KHO CỦA TÔI ====================== */
 
-function MyStoreTab() {
+function MyStoreTab({ flash }: { flash: FlashFn }) {
   const [all, setAll] = useState<Product[]>([]);
   const [market, setMarket] = useState<Product[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
@@ -961,6 +1430,9 @@ function MyStoreTab() {
 
   return (
     <div className="flex flex-col gap-4">
+      {/* Nhập / đồng bộ từ Google Sheet */}
+      <SheetImportPanel flash={flash} onImported={() => void load()} />
+
       {/* Toolbar */}
       <div className="flex flex-col gap-3 rounded-lg border border-line bg-surface p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1033,7 +1505,7 @@ function MyStoreTab() {
       ) : all.length === 0 ? (
         <EmptyState
           title="Chưa có sản phẩm"
-          desc="Nhập kho từ Google Sheet (ở dashboard cũ) để bắt đầu, hoặc đồng bộ nguồn giá."
+          desc="Dán link Google Sheet ở khung phía trên, chọn tab rồi bấm Nhập kho để bắt đầu."
         />
       ) : products.length === 0 ? (
         <EmptyState
