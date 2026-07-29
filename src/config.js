@@ -27,7 +27,7 @@
 // >>> SỬA DÒNG NÀY KHI DEPLOY <<<
 // Ví dụ production: "https://api.tenmiencuaban.com"
 //        hoặc IP:   "http://203.0.113.10:3300"
-const BACKEND_BASE_URL = "http://14.225.206.162:3000";
+const BACKEND_BASE_URL = "http://169.58.91.84:3000";
 
 /**
  * Base URL backend đã chuẩn hoá (bỏ "/" thừa ở cuối).
