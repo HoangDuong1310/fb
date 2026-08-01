@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { parseExcelFile, type ExcelImportSummary } from "@/lib/excelImport";
 import {
   Tag,
   Store,
@@ -19,9 +20,18 @@ import {
   Clock,
   Download,
   CheckCircle2,
+  Upload,
+  SlidersHorizontal,
 } from "lucide-react";
 import { bg, type BgResponse } from "@/lib/bg";
 import { colorFor, initials } from "@/lib/avatar";
+import {
+  groupLabel,
+  productGroupOptions,
+  productMatchesGroup,
+  productMatchesWarranty,
+  type WarrantyFilter,
+} from "@/lib/inventoryFilters";
 import { cn } from "@/lib/utils";
 import { useIncremental } from "@/lib/useIncremental";
 import {
@@ -38,6 +48,8 @@ import {
   shownSpread,
   sourceBreakdown,
   marketMatches,
+  queryTokens,
+  searchNorm,
   type GroupPriceRow,
   type Product,
   type Source,
@@ -1366,6 +1378,12 @@ function SheetImportPanel({
 
 function MyStoreTab({ flash }: { flash: FlashFn }) {
   const [all, setAll] = useState<Product[]>([]);
+  const [excelImporting, setExcelImporting] = useState(false);
+  const [excelSummary, setExcelSummary] = useState<ExcelImportSummary | null>(null);
+  const [stockFilter, setStockFilter] = useState<"all" | "in" | "out">("all");
+  const [priceFilter, setPriceFilter] = useState<"all" | "priced" | "missing">("all");
+  const [warrantyFilter, setWarrantyFilter] = useState<WarrantyFilter>("all");
+  const [sortMode, setSortMode] = useState<"name" | "priceAsc" | "priceDesc" | "stockAsc">("name");
   const [market, setMarket] = useState<Product[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1398,30 +1416,64 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
     void load();
   }, []);
 
-  const cats = useMemo(
-    () => [...new Set(all.map((p) => canonCat(p.category)).filter(Boolean))].sort(),
-    [all],
-  );
+  async function importExcel(file: File) {
+    setExcelImporting(true);
+    setExcelSummary(null);
+    try {
+      const parsed = await parseExcelFile(file);
+      const response = await bg<BgResponse>("IMPORT_PRODUCTS", {
+        products: parsed.products,
+        prune: false,
+      });
+      if (!response.ok) throw new Error(response.error || "Không nhập được file Excel.");
+      setExcelSummary(parsed.summary);
+      flash("ok", `Đã nhập ${parsed.summary.imported} sản phẩm từ ${parsed.summary.sheetName}.`);
+      await load();
+    } catch (error) {
+      flash("err", String(error instanceof Error ? error.message : error));
+    } finally {
+      setExcelImporting(false);
+    }
+  }
+
+  const groups = useMemo(() => productGroupOptions(all), [all]);
 
   const products = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    let list = all;
-    if (cat) list = list.filter((p) => canonCat(p.category) === cat);
-    if (q) {
-      const terms = q.split(/\s+/).filter(Boolean);
-      list = list.filter((p) => {
-        const hay = (
-          (p.name || "") +
-          " " +
-          (p.category || "") +
-          " " +
-          (p.brand || "")
-        ).toLowerCase();
-        return terms.every((t) => hay.includes(t));
-      });
-    }
-    return list;
-  }, [all, cat, query]);
+    const terms = queryTokens(query);
+    let list = all.filter((p) => {
+      if (!productMatchesGroup(p, cat)) return false;
+      const qty = p.qty == null ? null : Number(p.qty);
+      if (stockFilter === "in" && qty != null && qty <= 0) return false;
+      if (stockFilter === "out" && (qty == null || qty > 0)) return false;
+      if (priceFilter === "priced" && (p.price == null || Number(p.price) <= 0)) return false;
+      if (priceFilter === "missing" && p.price != null && Number(p.price) > 0) return false;
+      if (!productMatchesWarranty(p, warrantyFilter)) return false;
+      if (terms.length) {
+        const hay = searchNorm([
+          p.name,
+          p.category,
+          p.itemType,
+          p.brand,
+          p.sku,
+          p.barcode,
+          p.warranty,
+          p.description,
+        ].filter(Boolean).join(" "));
+        if (!terms.every((term) => hay.includes(term))) return false;
+      }
+      return true;
+    });
+    return [...list].sort((a, b) => {
+      if (sortMode === "priceAsc" || sortMode === "priceDesc") {
+        const av = Number(a.price); const bv = Number(b.price);
+        const aa = Number.isFinite(av) ? av : sortMode === "priceAsc" ? Infinity : -Infinity;
+        const bb = Number.isFinite(bv) ? bv : sortMode === "priceAsc" ? Infinity : -Infinity;
+        return sortMode === "priceAsc" ? aa - bb : bb - aa;
+      }
+      if (sortMode === "stockAsc") return (Number(a.qty) || 0) - (Number(b.qty) || 0);
+      return String(a.name || "").localeCompare(String(b.name || ""), "vi");
+    });
+  }, [all, cat, priceFilter, query, sortMode, stockFilter, warrantyFilter]);
 
   const { visible: windowed, sentinelRef, hasMore, loadMore, shown, total } =
     useIncremental(products, { pageSize: 24 });
@@ -1430,8 +1482,24 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Nhập / đồng bộ từ Google Sheet */}
+      {/* Nhập / đồng bộ từ Google Sheet và Excel */}
       <SheetImportPanel flash={flash} onImported={() => void load()} />
+      <div className="flex flex-col gap-2 rounded-lg border border-line bg-surface p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-medium text-ink">
+              <FileSpreadsheet className="size-4 text-accent" /> Nhập kho từ Excel
+            </div>
+            <p className="mt-1 text-xs text-ink-faint">Tự nhận diện các cột mã hàng, tên hàng, nhóm hàng, giá bán, giá vốn, tồn kho và bảo hành.</p>
+          </div>
+          <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-md bg-accent px-3.5 py-2 text-xs font-semibold text-on-accent hover:opacity-90">
+            {excelImporting ? <Loader2 className="size-3.5 animate-spin" /> : <Upload className="size-3.5" />}
+            {excelImporting ? "Đang đọc…" : "Chọn file Excel"}
+            <input type="file" accept=".xlsx,.xls" className="hidden" disabled={excelImporting} onChange={(e) => { const file = e.target.files?.[0]; if (file) void importExcel(file); e.currentTarget.value = ""; }} />
+          </label>
+        </div>
+        {excelSummary && <p className="text-xs text-ink-faint">{excelSummary.imported} dòng đã nhập · {excelSummary.skipped} dòng bỏ qua{excelSummary.warnings.length ? ` · ${excelSummary.warnings.join(" ")}` : ""}</p>}
+      </div>
 
       {/* Toolbar */}
       <div className="flex flex-col gap-3 rounded-lg border border-line bg-surface p-4">
@@ -1441,7 +1509,7 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Tìm trong kho của tôi…"
+              placeholder="Tìm tên, mã hàng, nhóm hàng, bảo hành…"
               className="w-full rounded-md border border-line bg-bg py-2 pl-9 pr-3 text-sm text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
             />
           </div>
@@ -1456,36 +1524,34 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
           </button>
         </div>
 
-        {/* Category chips */}
-        {cats.length > 0 && (
-          <div className="flex flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => setCat("")}
-              className={cn(
-                "rounded-sm px-2.5 py-1 text-xs font-medium transition-colors",
-                cat === ""
-                  ? "bg-accent text-on-accent"
-                  : "bg-surface-2 text-ink-faint hover:text-ink",
-              )}
-            >
-              Tất cả
-            </button>
-            {cats.map((c) => (
-              <button
-                key={c}
-                type="button"
-                onClick={() => setCat(c)}
-                className={cn(
-                  "rounded-sm px-2.5 py-1 text-xs font-medium transition-colors",
-                  cat === c
-                    ? "bg-accent text-on-accent"
-                    : "bg-surface-2 text-ink-faint hover:text-ink",
-                )}
-              >
-                {c}
-              </button>
-            ))}
+        <div className="flex flex-wrap items-center gap-2 border-t border-line-soft pt-3">
+          <SlidersHorizontal className="size-3.5 text-ink-faint" />
+          <select value={stockFilter} onChange={(e) => setStockFilter(e.target.value as typeof stockFilter)} className="rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink" aria-label="Lọc tồn kho">
+            <option value="all">Tất cả tồn kho</option><option value="in">Còn hàng</option><option value="out">Hết hàng</option>
+          </select>
+          <select value={priceFilter} onChange={(e) => setPriceFilter(e.target.value as typeof priceFilter)} className="rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink" aria-label="Lọc giá">
+            <option value="all">Tất cả giá</option><option value="priced">Đã có giá</option><option value="missing">Thiếu giá</option>
+          </select>
+          <select value={warrantyFilter} onChange={(e) => setWarrantyFilter(e.target.value as WarrantyFilter)} className="rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink" aria-label="Lọc bảo hành">
+            <option value="all">Tất cả bảo hành</option><option value="has">Có bảo hành</option><option value="none">Không bảo hành</option><option value="upTo3">Tối đa 3 tháng</option><option value="4To12">4–12 tháng</option><option value="over12">Trên 12 tháng</option>
+          </select>
+          <select value={sortMode} onChange={(e) => setSortMode(e.target.value as typeof sortMode)} className="rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink" aria-label="Sắp xếp kho">
+            <option value="name">Tên A → Z</option><option value="priceAsc">Giá thấp → cao</option><option value="priceDesc">Giá cao → thấp</option><option value="stockAsc">Tồn kho thấp → cao</option>
+          </select>
+        </div>
+
+        {groups.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 border-t border-line-soft pt-3">
+            <span className="text-xs font-medium text-ink-soft">Nhóm hàng</span>
+            <select value={cat} onChange={(e) => setCat(e.target.value)} className="min-w-[240px] max-w-full rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink" aria-label="Lọc nhóm hàng">
+              <option value="">Tất cả nhóm hàng ({all.length})</option>
+              {groups.map((group) => (
+                <option key={group.value} value={group.value}>
+                  {`${group.depth > 1 ? "↳ " : ""}${group.label} (${group.count})`}
+                </option>
+              ))}
+            </select>
+            {cat && <span className="rounded-sm bg-accent-soft/30 px-2 py-1 text-xs text-accent-ink">Đang lọc: {groupLabel(cat)}</span>}
           </div>
         )}
 
@@ -1505,7 +1571,7 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
       ) : all.length === 0 ? (
         <EmptyState
           title="Chưa có sản phẩm"
-          desc="Dán link Google Sheet ở khung phía trên, chọn tab rồi bấm Nhập kho để bắt đầu."
+          desc="Nhập file Excel hoặc dán link Google Sheet ở các khung phía trên để bắt đầu."
         />
       ) : products.length === 0 ? (
         <EmptyState
@@ -1515,7 +1581,7 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
       ) : (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           {windowed.map((p) => {
-            const catLabel = canonCat(p.category);
+            const catLabel = groupLabel(p.category) || canonCat(p.category);
             const isOpen = expanded === p.productId;
             const offers = isOpen ? marketMatches(p, market) : [];
             return (

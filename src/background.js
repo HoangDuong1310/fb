@@ -862,6 +862,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
+    case "IMPORT_PRODUCTS": {
+      const products = Array.isArray(msg.products) ? msg.products : [];
+      DB.saveProducts(products)
+        .then((r) => sendResponse({ ok: true, ...r, imported: products.length }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    case "IMPORT_PRODUCTS": {
+      DB.saveProducts(msg.products || [])
+        .then((r) => sendResponse({ ok: true, ...r, imported: (msg.products || []).length }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
     case "CLEAR_PRODUCTS": {
       DB.clearProducts(msg.source)
         .then((deleted) => sendResponse({ ok: true, deleted }))
@@ -2076,6 +2091,17 @@ try {
         .catch(() => {})
         .finally(() => scheduleNextWarming({ retryOnFailure: true }));
     }
+  });
+  // CHỐT AN TOÀN tab handoff (bổ trợ sweepOrphanCrawlTabs chạy theo jobTick):
+  // khi 1 tab crawl biến mất — người dùng đóng tay, tab crash, hoặc FB tự điều
+  // hướng đóng — CRAWL_DONE có thể KHÔNG BAO GIỜ tới, để lại id rác trong
+  // registry crawlTabs. onRemoved bắn NGAY khi tab đóng nên ta gỡ id tức thời,
+  // không phải đợi tới lượt quét kế tiếp. removeCrawlTab đọc/ghi
+  // chrome.storage.session nên vẫn đúng dù SW vừa thức dậy. Nuốt lỗi: đây chỉ là
+  // dọn dẹp phụ trợ, không được phép làm hỏng luồng khác.
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    if (tabId == null) return;
+    removeCrawlTab(tabId).catch(() => {});
   });
   initAutoCrawl();
   initAutoSync();

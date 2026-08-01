@@ -37,6 +37,12 @@ export interface Product {
   url?: string;
   inStock?: boolean;
   owned?: boolean;
+  sku?: string;
+  barcode?: string;
+  imageUrl?: string;
+  description?: string;
+  businessStatus?: string;
+  itemType?: string;
 }
 
 export interface Source {

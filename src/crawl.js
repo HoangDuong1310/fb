@@ -36,34 +36,112 @@ import {
 // trong RAM, set sẽ bị xoá sạch khi SW restart => khi tab gửi CRAWL_DONE, SW vừa thức
 // dậy thấy set rỗng nên không nhận ra tab cần đóng => để lại hàng loạt tab rác.
 const CRAWL_TABS_KEY = "crawlTabs";
+// Tab crawl bị "mồ côi" nếu CRAWL_DONE KHÔNG BAO GIỜ tới để đóng nó: script
+// injection trượt, tab bị crash, gửi START_CRAWL lỗi, hoặc người dùng đóng tay
+// để lại id rác trong storage. Ta lưu KÈM mốc thời gian mở (ts) để bộ quét định
+// kỳ (sweepOrphanCrawlTabs, chạy theo jobTick) cưỡng chế đóng tab treo quá hạn.
+const CRAWL_TAB_MAX_AGE_MS = 10 * 60 * 1000; // 10 phút: quá hạn => coi là tab rác
 
-async function getCrawlTabs() {
+// Đọc RAW entries của registry. TƯƠNG THÍCH NGƯỢC: định dạng cũ là mảng số id;
+// định dạng mới là mảng { id, ts }. Chuẩn hoá hết về { id, ts } để xử lý đồng nhất.
+async function getCrawlTabEntries() {
   try {
     const r = await chrome.storage.session.get(CRAWL_TABS_KEY);
-    return Array.isArray(r[CRAWL_TABS_KEY]) ? r[CRAWL_TABS_KEY] : [];
+    const raw = r[CRAWL_TABS_KEY];
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((e) => (typeof e === "number" ? { id: e, ts: 0 } : e))
+      .filter((e) => e && e.id != null);
   } catch (e) {
     return [];
   }
 }
 
+// Danh sách ID tab crawl — giữ nguyên hợp đồng cũ cho nơi chỉ cần id.
+async function getCrawlTabs() {
+  const entries = await getCrawlTabEntries();
+  return entries.map((e) => e.id);
+}
+
 async function addCrawlTab(tabId) {
   if (tabId == null) return;
-  const ids = await getCrawlTabs();
-  if (!ids.includes(tabId)) {
-    ids.push(tabId);
-    await chrome.storage.session.set({ [CRAWL_TABS_KEY]: ids });
+  const entries = await getCrawlTabEntries();
+  if (!entries.some((e) => e.id === tabId)) {
+    entries.push({ id: tabId, ts: Date.now() });
+    await chrome.storage.session.set({ [CRAWL_TABS_KEY]: entries });
   }
 }
 
 // Trả về true nếu tabId đúng là tab do background tự mở (và đã được gỡ khỏi danh sách).
 async function removeCrawlTab(tabId) {
-  const ids = await getCrawlTabs();
-  const next = ids.filter((id) => id !== tabId);
-  if (next.length !== ids.length) {
+  const entries = await getCrawlTabEntries();
+  const next = entries.filter((e) => e.id !== tabId);
+  if (next.length !== entries.length) {
     await chrome.storage.session.set({ [CRAWL_TABS_KEY]: next });
     return true;
   }
   return false;
+}
+
+/**
+ * Quét tab crawl "mồ côi" và dọn dẹp — CHỐT AN TOÀN cho luồng handoff (tab mở ở
+ * đây, đóng ở CRAWL_DONE). Nếu CRAWL_DONE không tới, tab treo mãi. Chạy theo
+ * jobTick (60s). Hai việc:
+ *   1) Tab KHÔNG còn tồn tại (chrome.tabs.get lỗi) => chỉ gỡ id rác khỏi registry.
+ *   2) Tab CÒN sống nhưng quá CRAWL_TAB_MAX_AGE_MS => cưỡng chế đóng + gỡ.
+ * `now` tiêm được để test. Trả về { pruned, closed } để test khoá hành vi.
+ */
+async function sweepOrphanCrawlTabs(now = Date.now()) {
+  const entries = await getCrawlTabEntries();
+  if (!entries.length) return { pruned: 0, closed: 0 };
+
+  const tabExists = (id) =>
+    new Promise((resolve) => {
+      try {
+        chrome.tabs.get(id, (tab) => {
+          const err = chrome.runtime.lastError;
+          resolve(!err && !!tab);
+        });
+      } catch (_) {
+        resolve(false);
+      }
+    });
+  const closeTab = (id) =>
+    new Promise((resolve) => {
+      try {
+        chrome.tabs.remove(id, () => {
+          void chrome.runtime.lastError;
+          resolve();
+        });
+      } catch (_) {
+        resolve();
+      }
+    });
+
+  let pruned = 0;
+  let closed = 0;
+  const survivors = [];
+  for (const e of entries) {
+    const alive = await tabExists(e.id);
+    if (!alive) {
+      // Tab đã biến mất (đóng tay / crash) => chỉ dọn id rác.
+      pruned++;
+      continue;
+    }
+    const age = now - (e.ts || 0);
+    if (age > CRAWL_TAB_MAX_AGE_MS) {
+      // Tab treo quá lâu mà CRAWL_DONE không tới => cưỡng chế đóng.
+      await closeTab(e.id);
+      closed++;
+      pruned++;
+      continue;
+    }
+    survivors.push(e);
+  }
+  if (pruned > 0) {
+    await chrome.storage.session.set({ [CRAWL_TABS_KEY]: survivors });
+  }
+  return { pruned, closed };
 }
 
 /* ---------------------- CÔNG TẮC FOCUS TAB ----------------------------- */
@@ -265,6 +343,11 @@ async function crawlGroupInTab(groupId, options) {
     });
     return { ok: true, tabId: tab.id, started: !!(res && res.ok) };
   } catch (e) {
+    // Gửi START_CRAWL lỗi => content.js sẽ KHÔNG BAO GIỜ gửi CRAWL_DONE, tức
+    // không còn ai đóng tab handoff này. Tự đóng + gỡ khỏi registry ngay để
+    // không bỏ lại tab rác (đúng lỗi "xong việc mà không đóng tab").
+    try { await removeCrawlTab(tab.id); } catch (_) {}
+    try { await chrome.tabs.remove(tab.id); } catch (_) {}
     return {
       ok: false,
       tabId: tab.id,
@@ -411,6 +494,10 @@ async function crawlGroupApiInTab(groupId, options, active = true) {
     });
     return { ok: true, tabId: tab.id, started: !!(res && res.ok), mode: "api" };
   } catch (e) {
+    // Gửi START_API_CRAWL lỗi => không có CRAWL_DONE về sau, tab handoff này sẽ
+    // không ai đóng. Tự đóng + gỡ registry để không bỏ lại tab rác.
+    try { await removeCrawlTab(tab.id); } catch (_) {}
+    try { await chrome.tabs.remove(tab.id); } catch (_) {}
     return {
       ok: false,
       tabId: tab.id,
@@ -2404,6 +2491,13 @@ async function executeDeletePost(postUrl) {
     return (res && res[0] && res[0].result) || { ok: false, error: "Không có kết quả khi xoá bài." };
   } catch (e) {
     return { ok: false, error: "Lỗi chạy script xoá bài: " + String(e) };
+  } finally {
+    // Tab xoá bài mở foreground và KHÔNG hand off cho CRAWL_DONE => phải tự đóng
+    // trên MỌI nhánh (thành công / lỗi). Trước đây thiếu finally nên mỗi lần xoá
+    // bài đều bỏ lại 1 tab rác — đúng lỗi "xong việc mà không đóng tab".
+    try {
+      if (tab && tab.id != null) await chrome.tabs.remove(tab.id);
+    } catch (_) {}
   }
 }
 
@@ -2542,11 +2636,38 @@ async function processDueJobs() {
   try {
     // Khôi phục job bị KẸT ở "running" (service worker MV3 tắt giữa chừng) để
     // một mẻ lớn không bị đứng sau vài bài. Đưa job kẹt về "pending" rồi chạy.
+    // Bước này KHÔNG mở tab foreground nên chạy được trước khi giành lock.
     try { await DB.recoverStuckJobs(Date.now()); } catch (e) {}
+    // CHỐT AN TOÀN tab handoff: mỗi tick (60s) quét tab crawl "mồ côi" (CRAWL_DONE
+    // không tới) để gỡ id rác + cưỡng chế đóng tab treo quá hạn. KHÔNG cần
+    // foreground lock (chỉ reconcile registry, không mở tab foreground mới).
+    try { await sweepOrphanCrawlTabs(Date.now()); } catch (e) {}
     const due = await DB.getDueJobs(Date.now());
-    for (const job of due) {
-      await runJob(job);
-      await sleep(5000); // giãn cách giữa các job để giảm rủi ro bị FB chặn
+    if (!due || !due.length) return;
+    // FOREGROUND MUTEX (Hướng B): job đăng bài/bình luận/nhắn tin đều mở tab
+    // foreground nên phải loại trừ lẫn nhau với auto-crawl / warming / reply-watch.
+    // Không giành được lock => bỏ tick này; job vẫn "due", tick kế (60s) chạy lại.
+    const jobToken = await acquireForegroundLock("jobtick");
+    if (!jobToken) {
+      try {
+        const held = await readForegroundLock();
+        await recordTelemetry("jobTick.skipped_locked", {
+          reason: "foreground_busy",
+          holder: (held && held.owner) || "",
+        });
+      } catch (e) {}
+      return;
+    }
+    try {
+      for (const job of due) {
+        // HEARTBEAT: gia hạn lock cho mẻ dài; nếu bị owner khác chiếm (SW này ngủ
+        // quá TTL) thì DỪNG để không chạy chồng lên scheduler đang giữ tab.
+        if (!(await touchForegroundLock(jobToken))) break;
+        await runJob(job);
+        await sleep(5000); // giãn cách giữa các job để giảm rủi ro bị FB chặn
+      }
+    } finally {
+      await releaseForegroundLock(jobToken);
     }
   } catch (e) {
     // bỏ qua, chờ tick sau
@@ -2806,55 +2927,84 @@ async function applyAutoCrawlConfig(input) {
 // chết hẳn mà không kịp release, lock quá hạn sẽ được coi là rác và chiếm lại,
 // nên không bao giờ kẹt vĩnh viễn. Biến RAM vẫn giữ làm chốt nhanh cho trường
 // hợp re-entry trong CÙNG một instance (get/set storage không nguyên tử).
-const AUTOCRAWL_LOCK_KEY = "autoCrawlLock";
-// TTL phải LỚN HƠN khoảng ngủ dài nhất giữa 2 nhóm (90s) cộng thời gian crawl 1
-// nhóm, nếu không heartbeat sẽ không kịp và chu kỳ tự cướp lock của chính mình.
-const AUTOCRAWL_LOCK_TTL_MS = 5 * 60 * 1000;
+// ===========================================================================
+// FOREGROUND LOCK DÙNG CHUNG (Hướng B)
+// ---------------------------------------------------------------------------
+// Cả 4 scheduler chạy nền (auto-crawl, warming, reply-watch, jobTick) đều cần
+// MỞ TAB FOREGROUND của Facebook. Focus là tài nguyên SINGLETON: 2 tab foreground
+// song song sẽ cướp focus của nhau (hỏng pha capture template GraphQL, thao tác
+// sai tab...). Trước đây mỗi scheduler chỉ tự chặn re-entry bằng một biến RAM và
+// KHÔNG biết đến nhau, nên khi bật đồng thời chúng đua nhau giành tab.
+//
+// Giải pháp: MỘT lock duy nhất trong chrome.storage.session (sống qua các lần SW
+// bị kill rồi thức lại — đúng phạm vi "còn phiên trình duyệt") kèm HEARTBEAT +
+// TTL. Mọi scheduler phải giành lock trước khi mở tab và nhả sau khi xong => loại
+// trừ lẫn nhau. Trường `owner` chỉ để chẩn đoán (biết scheduler nào đang giữ).
+// Lock quá TTL bị coi là rác và chiếm lại được => không bao giờ kẹt vĩnh viễn.
+// Biến RAM của từng scheduler vẫn giữ làm chốt nhanh cho re-entry trong CÙNG một
+// instance (get/set storage không nguyên tử).
+// ===========================================================================
+const FOREGROUND_LOCK_KEY = "foregroundLock";
+// TTL phải LỚN HƠN khoảng ngủ dài nhất giữa 2 bước của BẤT KỲ scheduler nào
+// (auto-crawl ngủ tới 90s/nhóm, warming tới 75s/hành động) cộng thời gian một
+// bước, nếu không heartbeat không kịp và scheduler tự cướp lock của chính mình.
+const FOREGROUND_LOCK_TTL_MS = 5 * 60 * 1000;
 
 /**
  * Lock còn hiệu lực hay đã là rác? Tách riêng (thuần) để test được không cần chrome.
- * Rác khi: không có lock, thiếu heartbeat, hoặc heartbeat quá TTL (SW đã chết).
+ * Rác khi: không có lock, thiếu heartbeat, hoặc heartbeat quá TTL (owner đã chết).
  */
-function isAutoCrawlLockStale(lock, now, ttlMs = AUTOCRAWL_LOCK_TTL_MS) {
+function isForegroundLockStale(lock, now, ttlMs = FOREGROUND_LOCK_TTL_MS) {
   if (!lock || typeof lock !== "object") return true;
   const beat = Number(lock.heartbeatAt || 0);
   if (!Number.isFinite(beat) || beat <= 0) return true;
-  // Đồng hồ nhảy về quá khứ (sửa giờ hệ thống) cũng coi là rác để không kẹt.
+  // Đồng hồ nhảy về tương lai xa (sửa giờ hệ thống) cũng coi là rác để không kẹt.
   if (beat > now + ttlMs) return true;
   return now - beat > ttlMs;
 }
 
-let _autoCrawling = false; // chốt nhanh trong cùng instance SW
-let _autoCrawlToken = ""; // token của lock instance này đang giữ
+/** Đọc lock hiện tại (để telemetry biết scheduler nào đang giữ). */
+async function readForegroundLock() {
+  try {
+    const r = await chrome.storage.session.get(FOREGROUND_LOCK_KEY);
+    return (r && r[FOREGROUND_LOCK_KEY]) || null;
+  } catch (e) {
+    return null;
+  }
+}
 
-/** Cố chiếm lock. Trả về token nếu chiếm được, "" nếu chu kỳ khác đang chạy. */
-async function acquireAutoCrawlLock(now = Date.now()) {
+/**
+ * Cố chiếm foreground lock cho `owner` (autocrawl|warming|replywatch|jobtick).
+ * Trả về token nếu chiếm được, "" nếu scheduler khác đang giữ lock còn sống.
+ */
+async function acquireForegroundLock(owner = "unknown", now = Date.now()) {
   const token = String(now) + "-" + Math.random().toString(36).slice(2, 10);
   try {
-    const r = await chrome.storage.session.get(AUTOCRAWL_LOCK_KEY);
-    const cur = r && r[AUTOCRAWL_LOCK_KEY];
-    if (!isAutoCrawlLockStale(cur, now)) return "";
+    const r = await chrome.storage.session.get(FOREGROUND_LOCK_KEY);
+    const cur = r && r[FOREGROUND_LOCK_KEY];
+    if (!isForegroundLockStale(cur, now)) return "";
     await chrome.storage.session.set({
-      [AUTOCRAWL_LOCK_KEY]: { token, startedAt: now, heartbeatAt: now },
+      [FOREGROUND_LOCK_KEY]: { token, owner, startedAt: now, heartbeatAt: now },
     });
     return token;
   } catch (e) {
     // storage.session không dùng được (test/môi trường lạ) => vẫn cho chạy,
-    // chốt RAM là tuyến phòng thủ còn lại.
+    // chốt RAM của từng scheduler là tuyến phòng thủ còn lại.
     return token;
   }
 }
 
-/** Gia hạn lock. Nếu lock đã bị chủ khác chiếm thì trả false để chu kỳ tự dừng. */
-async function touchAutoCrawlLock(token, now = Date.now()) {
+/** Gia hạn lock. Nếu lock đã bị owner khác chiếm thì trả false để tự dừng. */
+async function touchForegroundLock(token, now = Date.now()) {
   if (!token) return false;
   try {
-    const r = await chrome.storage.session.get(AUTOCRAWL_LOCK_KEY);
-    const cur = r && r[AUTOCRAWL_LOCK_KEY];
+    const r = await chrome.storage.session.get(FOREGROUND_LOCK_KEY);
+    const cur = r && r[FOREGROUND_LOCK_KEY];
     if (cur && cur.token && cur.token !== token) return false;
     await chrome.storage.session.set({
-      [AUTOCRAWL_LOCK_KEY]: {
+      [FOREGROUND_LOCK_KEY]: {
         token,
+        owner: (cur && cur.owner) || "unknown",
         startedAt: (cur && cur.startedAt) || now,
         heartbeatAt: now,
       },
@@ -2865,16 +3015,33 @@ async function touchAutoCrawlLock(token, now = Date.now()) {
   }
 }
 
-/** Nhả lock — chỉ nhả nếu đúng token của mình (không xoá lock của chu kỳ khác). */
-async function releaseAutoCrawlLock(token) {
+/** Nhả lock — chỉ nhả nếu đúng token của mình (không xoá lock của owner khác). */
+async function releaseForegroundLock(token) {
   if (!token) return;
   try {
-    const r = await chrome.storage.session.get(AUTOCRAWL_LOCK_KEY);
-    const cur = r && r[AUTOCRAWL_LOCK_KEY];
+    const r = await chrome.storage.session.get(FOREGROUND_LOCK_KEY);
+    const cur = r && r[FOREGROUND_LOCK_KEY];
     if (cur && cur.token && cur.token !== token) return;
-    await chrome.storage.session.remove(AUTOCRAWL_LOCK_KEY);
+    await chrome.storage.session.remove(FOREGROUND_LOCK_KEY);
   } catch (e) {}
 }
+
+// ---------------------------------------------------------------------------
+// TƯƠNG THÍCH NGƯỢC: trước Hướng B chỉ có lock riêng cho auto-crawl. Giữ nguyên
+// các tên cũ dưới dạng alias để test hồi quy (test/autocrawl-lock.test.js) và mã
+// gọi cũ tiếp tục chạy — tất cả nay trỏ về CÙNG một foreground lock dùng chung.
+// ---------------------------------------------------------------------------
+const AUTOCRAWL_LOCK_KEY = FOREGROUND_LOCK_KEY;
+const AUTOCRAWL_LOCK_TTL_MS = FOREGROUND_LOCK_TTL_MS;
+const isAutoCrawlLockStale = isForegroundLockStale;
+async function acquireAutoCrawlLock(now = Date.now()) {
+  return acquireForegroundLock("autocrawl", now);
+}
+const touchAutoCrawlLock = touchForegroundLock;
+const releaseAutoCrawlLock = releaseForegroundLock;
+
+let _autoCrawling = false; // chốt nhanh trong cùng instance SW
+let _autoCrawlToken = ""; // token của lock instance này đang giữ
 
 // Số nguyên ngẫu nhiên trong [min, max].
 const randInt = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
@@ -2914,12 +3081,16 @@ async function processAutoCrawl() {
   if (!cfg.enabled) return;
   // CHỐT BỀN (B1): chặn chu kỳ mới khi chu kỳ trước còn sống, KỂ CẢ khi service
   // worker đã bị kill và khởi động lại giữa chừng (biến RAM mất, lock thì không).
-  const token = await acquireAutoCrawlLock();
+  const token = await acquireForegroundLock("autocrawl");
   if (!token) {
+    const held = await readForegroundLock();
     try {
-      await recordTelemetry("autoCrawl.skipped_locked", { reason: "cycle_in_progress" });
+      await recordTelemetry("autoCrawl.skipped_locked", {
+        reason: "foreground_busy",
+        holder: (held && held.owner) || "",
+      });
     } catch (e) {}
-    return { ok: true, skipped: true, reason: "cycle_in_progress" };
+    return { ok: true, skipped: true, reason: "foreground_busy" };
   }
   _autoCrawling = true;
   _autoCrawlToken = token;
@@ -2992,7 +3163,7 @@ async function processAutoCrawl() {
         // HEARTBEAT trước mỗi nhóm: (a) gia hạn lock để chu kỳ dài không bị coi
         // là rác, (b) nếu lock đã bị chu kỳ khác chiếm (SW này ngủ quá TTL) thì
         // DỪNG ngay — đúng chỗ ngăn 2 nhóm cùng chạy sau khi SW restart.
-        if (!(await touchAutoCrawlLock(token))) break;
+        if (!(await touchForegroundLock(token))) break;
         try {
           await crawlFn(gid, opts);
         } catch (e) {
@@ -3017,7 +3188,7 @@ async function processAutoCrawl() {
   } finally {
     _autoCrawling = false;
     _autoCrawlToken = "";
-    await releaseAutoCrawlLock(token);
+    await releaseForegroundLock(token);
   }
 }
 
@@ -3318,6 +3489,18 @@ async function processReplyWatch(opts = {}) {
       blockedUntil: blockState.blockedUntil,
     };
   }
+  // FOREGROUND MUTEX (Hướng B): chỉ MỘT scheduler được mở tab foreground.
+  const watchToken = await acquireForegroundLock("replywatch");
+  if (!watchToken) {
+    const held = await readForegroundLock();
+    try {
+      await recordTelemetry("replyWatch.skipped_locked", {
+        reason: "foreground_busy",
+        holder: (held && held.owner) || "",
+      });
+    } catch (e) {}
+    return { ok: true, skipped: true, reason: "foreground_busy" };
+  }
   _watching = true;
   let checked = 0, newReplies = 0, noParent = 0;
   let blocked = false;
@@ -3336,6 +3519,8 @@ async function processReplyWatch(opts = {}) {
     convs = convs.slice(0, limit);
     for (let i = 0; i < convs.length; i++) {
       const c = convs[i];
+      // HEARTBEAT: gia hạn lock; nếu bị owner khác chiếm thì dừng lượt này.
+      if (!(await touchForegroundLock(watchToken))) break;
       const res = await executeWatchReplies(c);
       checked += 1;
       // Phát hiện FB chặn (redirect checkpoint/login) -> arm ngắt mạch chung và
@@ -3392,6 +3577,7 @@ async function processReplyWatch(opts = {}) {
   } catch (e) {
     // bỏ qua, chờ chu kỳ sau
   } finally {
+    await releaseForegroundLock(watchToken);
     _watching = false;
   }
   // Lượt hoàn tất mà KHÔNG bị chặn -> reset ngắt mạch (đồng bộ với feed/inbox:
@@ -5094,6 +5280,18 @@ async function processWarming(opts = {}) {
     // assertFbMatch itself handles unbound as ok-ish depending on evaluateMatch.
   }
 
+  // FOREGROUND MUTEX (Hướng B): chỉ MỘT scheduler được mở tab foreground.
+  const warmToken = await acquireForegroundLock("warming");
+  if (!warmToken) {
+    const held = await readForegroundLock();
+    try {
+      await recordTelemetry("warming.skipped_locked", {
+        reason: "foreground_busy",
+        holder: (held && held.owner) || "",
+      });
+    } catch (e) {}
+    return { ok: true, skipped: true, reason: "foreground_busy" };
+  }
   _warming = true;
   _warmingStop = false;
   let done = 0; // compat alias → succeeded
@@ -5172,6 +5370,11 @@ async function processWarming(opts = {}) {
       const blk = await getCrawlBlockState();
       if (blk && blk.blocked) {
         blocked = true;
+        break;
+      }
+      // HEARTBEAT: gia hạn lock cho phiên dài; nếu bị owner khác chiếm thì dừng.
+      if (!(await touchForegroundLock(warmToken))) {
+        stopped = true;
         break;
       }
       const action = plan[i];
@@ -5281,6 +5484,7 @@ async function processWarming(opts = {}) {
     } catch (e4) {}
   } finally {
     await releaseWarmingTab(warmTabId, ownedTab);
+    await releaseForegroundLock(warmToken);
     _warming = false;
     _warmingStop = false;
   }
@@ -6037,6 +6241,8 @@ export {
   getCrawlTabs,
   addCrawlTab,
   removeCrawlTab,
+  sweepOrphanCrawlTabs,
+  CRAWL_TAB_MAX_AGE_MS,
   getCrawlBlockState,
   setCrawlBlock,
   clearCrawlBlock,
@@ -6068,7 +6274,14 @@ export {
   CRAWL_TRIGGERS,
   normalizeCrawlTrigger,
   recordCrawlTrigger,
-  // Chốt bền chống chạy chồng chu kỳ auto-crawl (xuất ra để test hồi quy).
+  // Foreground mutex dùng chung cho cả 4 scheduler (Hướng B) — xuất để test.
+  FOREGROUND_LOCK_KEY,
+  FOREGROUND_LOCK_TTL_MS,
+  isForegroundLockStale,
+  acquireForegroundLock,
+  touchForegroundLock,
+  releaseForegroundLock,
+  // Chốt bền chống chạy chồng chu kỳ auto-crawl (alias tương thích ngược).
   AUTOCRAWL_LOCK_KEY,
   AUTOCRAWL_LOCK_TTL_MS,
   isAutoCrawlLockStale,
