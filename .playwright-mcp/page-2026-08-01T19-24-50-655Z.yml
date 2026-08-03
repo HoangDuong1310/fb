@@ -1,0 +1,765 @@
+- generic [active] [ref=f1e1]:
+  - banner [ref=f1e2]:
+    - generic [ref=f1e4]:
+      - group "1 / 1" [ref=f1e5]:
+        - link [ref=f1e6] [cursor=pointer]:
+          - /url: /ad.php?id=392
+          - img "banner" [ref=f1e7]
+      - group "1 / 1" [ref=f1e8]:
+        - link [ref=f1e9] [cursor=pointer]:
+          - /url: /ad.php?id=392
+          - img "banner" [ref=f1e10]
+      - group "1 / 1" [ref=f1e11]:
+        - link [ref=f1e12] [cursor=pointer]:
+          - /url: /ad.php?id=392
+          - img "banner" [ref=f1e13]
+    - generic [ref=f1e15]:
+      - generic [ref=f1e16]:
+        - link [ref=f1e17] [cursor=pointer]:
+          - /url: /
+          - img "logo" [ref=f1e18]
+        - link "" [ref=f1e19] [cursor=pointer]:
+          - /url: "#fancybox-showroom"
+      - generic [ref=f1e20]:
+        - text: 
+        - generic [ref=f1e22]:
+          - textbox "Bạn cần tìm gì?" [ref=f1e24]
+          - button "submit-search" [ref=f1e25] [cursor=pointer]
+        - generic [ref=f1e27]:
+          - link "Xây dựng cấu hình" [ref=f1e28] [cursor=pointer]:
+            - /url: /buildpc
+            - paragraph [ref=f1e29]
+          - link "Khách hàng liên hệ" [ref=f1e32] [cursor=pointer]:
+            - /url: javascript:void(0)
+            - paragraph [ref=f1e33]
+          - link "Tin tức công nghệ" [ref=f1e36] [cursor=pointer]:
+            - /url: /tin-tuc
+            - paragraph [ref=f1e37]
+          - link "Giỏ hàng" [ref=f1e41] [cursor=pointer]:
+            - /url: /cart
+            - paragraph [ref=f1e42]
+          - link "Tài khoản" [ref=f1e46] [cursor=pointer]:
+            - /url: /dang-nhap
+            - paragraph [ref=f1e47]
+    - generic [ref=f1e51]:
+      - generic [ref=f1e52]:
+        - paragraph [ref=f1e53] [cursor=pointer]:
+          - generic [ref=f1e54]: 
+          - text: Danh mục sản phẩm
+        - generic [ref=f1e55]:
+          - link "PC GAMING PC GAMING" [ref=f1e57] [cursor=pointer]:
+            - /url: /pc-gaming
+            - img "PC GAMING" [ref=f1e58]
+            - generic [ref=f1e59]: PC GAMING
+          - link "PC ĐỒ HOẠ - LÀM VIỆC PC ĐỒ HOẠ - LÀM VIỆC" [ref=f1e61] [cursor=pointer]:
+            - /url: /pc-workstation
+            - img "PC ĐỒ HOẠ - LÀM VIỆC" [ref=f1e62]
+            - generic [ref=f1e63]: PC ĐỒ HOẠ - LÀM VIỆC
+          - link "APPLE APPLE" [ref=f1e65] [cursor=pointer]:
+            - /url: /apple
+            - img "APPLE" [ref=f1e66]
+            - generic [ref=f1e67]: APPLE
+          - link "LAPTOP LAPTOP" [ref=f1e69] [cursor=pointer]:
+            - /url: /laptop
+            - img "LAPTOP" [ref=f1e70]
+            - generic [ref=f1e71]: LAPTOP
+          - link "PC VĂN PHÒNG PC VĂN PHÒNG" [ref=f1e73] [cursor=pointer]:
+            - /url: /pc-van-phong-gia-re
+            - img "PC VĂN PHÒNG" [ref=f1e74]
+            - generic [ref=f1e75]: PC VĂN PHÒNG
+          - link "PC AI - TRÍ TUỆ NHÂN TẠO PC AI - TRÍ TUỆ NHÂN TẠO" [ref=f1e77] [cursor=pointer]:
+            - /url: /bo-pc-chay-ai-tri-tue-nhan-tao
+            - img "PC AI - TRÍ TUỆ NHÂN TẠO" [ref=f1e78]
+            - generic [ref=f1e79]: PC AI - TRÍ TUỆ NHÂN TẠO
+          - link "LINH KIỆN MÁY TÍNH LINH KIỆN MÁY TÍNH" [ref=f1e81] [cursor=pointer]:
+            - /url: /linh-kien-may-tinh
+            - img "LINH KIỆN MÁY TÍNH" [ref=f1e82]
+            - generic [ref=f1e83]: LINH KIỆN MÁY TÍNH
+          - link "MÀN HÌNH MÁY TÍNH MÀN HÌNH MÁY TÍNH" [ref=f1e85] [cursor=pointer]:
+            - /url: /man-hinh-may-tinh
+            - img "MÀN HÌNH MÁY TÍNH" [ref=f1e86]
+            - generic [ref=f1e87]: MÀN HÌNH MÁY TÍNH
+          - link "THIẾT BỊ LƯU TRỮ THIẾT BỊ LƯU TRỮ" [ref=f1e89] [cursor=pointer]:
+            - /url: /o-cung-hdd-ssd
+            - img "THIẾT BỊ LƯU TRỮ" [ref=f1e90]
+            - generic [ref=f1e91]: THIẾT BỊ LƯU TRỮ
+          - link "THIẾT BỊ VĂN PHÒNG THIẾT BỊ VĂN PHÒNG" [ref=f1e93] [cursor=pointer]:
+            - /url: /thiet-bi-van-phong
+            - img "THIẾT BỊ VĂN PHÒNG" [ref=f1e94]
+            - generic [ref=f1e95]: THIẾT BỊ VĂN PHÒNG
+          - link "PHÍM CHUỘT, GHẾ, GEAR PHÍM CHUỘT, GHẾ, GEAR" [ref=f1e97] [cursor=pointer]:
+            - /url: /phu-kien
+            - img "PHÍM CHUỘT, GHẾ, GEAR" [ref=f1e98]
+            - generic [ref=f1e99]: PHÍM CHUỘT, GHẾ, GEAR
+          - link "THIẾT BỊ MẠNG THIẾT BỊ MẠNG" [ref=f1e101] [cursor=pointer]:
+            - /url: /thiet-bi-mang
+            - img "THIẾT BỊ MẠNG" [ref=f1e102]
+            - generic [ref=f1e103]: THIẾT BỊ MẠNG
+          - link "PHẦN MỀM BẢN QUYỀN PHẦN MỀM BẢN QUYỀN" [ref=f1e105] [cursor=pointer]:
+            - /url: /phan-mem-ban-quyen
+            - img "PHẦN MỀM BẢN QUYỀN" [ref=f1e106]
+            - generic [ref=f1e107]: PHẦN MỀM BẢN QUYỀN
+      - list [ref=f1e108]:
+        - listitem [ref=f1e109]:
+          - link "PC " [ref=f1e110] [cursor=pointer]:
+            - /url: javascript:;
+            - generic [ref=f1e112]: PC
+            - generic [ref=f1e113]: 
+        - listitem [ref=f1e114]:
+          - link "Laptop " [ref=f1e115] [cursor=pointer]:
+            - /url: /laptop
+            - generic [ref=f1e117]: Laptop
+            - generic [ref=f1e118]: 
+        - listitem [ref=f1e119]:
+          - link "Mini PC " [ref=f1e120] [cursor=pointer]:
+            - /url: /pc-van-phong-gia-re
+            - generic [ref=f1e122]: Mini PC
+            - generic [ref=f1e123]: 
+        - listitem [ref=f1e124]:
+          - link "PC AI " [ref=f1e125] [cursor=pointer]:
+            - /url: /bo-pc-chay-ai-tri-tue-nhan-tao
+            - generic [ref=f1e127]: PC AI
+            - generic [ref=f1e128]: 
+        - listitem [ref=f1e129]:
+          - link "Linh kiện PC " [ref=f1e130] [cursor=pointer]:
+            - /url: /linh-kien-may-tinh
+            - generic [ref=f1e132]: Linh kiện PC
+            - generic [ref=f1e133]: 
+        - listitem [ref=f1e134]:
+          - link "Màn hình " [ref=f1e135] [cursor=pointer]:
+            - /url: /man-hinh-may-tinh
+            - generic [ref=f1e137]: Màn hình
+            - generic [ref=f1e138]: 
+        - listitem [ref=f1e139]:
+          - link "Phím chuột ghế gear " [ref=f1e140] [cursor=pointer]:
+            - /url: /phu-kien
+            - generic [ref=f1e142]: Phím chuột ghế gear
+            - generic [ref=f1e143]: 
+  - list [ref=f1e147]:
+    - listitem [ref=f1e148]:
+      - link "Trang chủ " [ref=f1e149] [cursor=pointer]:
+        - /url: /
+        - text: Trang chủ
+        - generic [ref=f1e150]: 
+    - listitem [ref=f1e151]:
+      - link "LINH KIỆN MÁY TÍNH " [ref=f1e152] [cursor=pointer]:
+        - /url: /linh-kien-may-tinh
+        - text: LINH KIỆN MÁY TÍNH
+        - generic [ref=f1e153]: 
+    - listitem [ref=f1e154]:
+      - link "VGA - Card Màn Hình " [ref=f1e155] [cursor=pointer]:
+        - /url: /vga-card-man-hinh
+        - text: VGA - Card Màn Hình
+        - generic [ref=f1e156]: 
+    - listitem [ref=f1e157]:
+      - link "VGA Nvidia " [ref=f1e158] [cursor=pointer]:
+        - /url: /vga-nvidia
+        - text: VGA Nvidia
+        - generic [ref=f1e159]: 
+    - listitem [ref=f1e160]:
+      - link "Nvidia RTX 3000 Series" [ref=f1e161] [cursor=pointer]:
+        - /url: /nvidia-rtx-3000-series
+        - text: Nvidia RTX 3000 Series 
+  - generic [ref=f1e164]:
+    - generic [ref=f1e165]:
+      - generic [ref=f1e166]:
+        - generic [ref=f1e167]:
+          - generic [ref=f1e168]:
+            - group "1 / 6" [ref=f1e169]:
+              - link [ref=f1e170] [cursor=pointer]:
+                - /url: /media/product/29852-asus-dual-geforce-rtx-3060-oc-12gb-06.jpg
+                - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e171]
+            - group "2 / 6" [ref=f1e172]:
+              - link [ref=f1e173] [cursor=pointer]:
+                - /url: /media/product/29852-asus-dual-geforce-rtx-3060-oc-12gb-01.jpg
+                - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e174]
+            - group "3 / 6" [ref=f1e175]:
+              - link [ref=f1e176] [cursor=pointer]:
+                - /url: /media/product/29852-asus-dual-geforce-rtx-3060-oc-12gb-02.jpg
+                - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e177]
+            - group "4 / 6" [ref=f1e178]:
+              - link [ref=f1e179] [cursor=pointer]:
+                - /url: /media/product/29852-asus-dual-geforce-rtx-3060-oc-12gb-03.jpg
+                - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e180]
+            - group "5 / 6" [ref=f1e181]:
+              - link [ref=f1e182] [cursor=pointer]:
+                - /url: /media/product/29852-asus-dual-geforce-rtx-3060-oc-12gb-04.jpg
+                - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e183]
+            - group "6 / 6" [ref=f1e184]:
+              - link [ref=f1e185] [cursor=pointer]:
+                - /url: /media/product/29852-asus-dual-geforce-rtx-3060-oc-12gb-05.jpg
+                - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e186]
+          - button "Next slide" [ref=f1e187] [cursor=pointer]: next
+          - button "Previous slide" [disabled]: prev
+        - generic [ref=f1e188]:
+          - generic [ref=f1e190]:
+            - group "1 / 6" [ref=f1e191]:
+              - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e192]
+            - group "2 / 6" [ref=f1e193]:
+              - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e194]
+            - group "3 / 6" [ref=f1e195]:
+              - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e196]
+            - group "4 / 6" [ref=f1e197]:
+              - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e198]
+            - group "5 / 6" [ref=f1e199]:
+              - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e200]
+            - group "6 / 6" [ref=f1e201]:
+              - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e202]
+          - text: next prev
+      - generic [ref=f1e203]:
+        - generic [ref=f1e204]:
+          - generic [ref=f1e205]: Thông số sản phẩm
+          - link "Xem tất cả thông số" [ref=f1e206] [cursor=pointer]:
+            - /url: javascript:;
+        - generic [ref=f1e208]:
+          - generic [ref=f1e209]:
+            - generic [ref=f1e210]:
+              - img "GPU" [ref=f1e212]
+              - generic [ref=f1e213]: GPU
+            - generic [ref=f1e214]: NVIDIA® GeForce RTX™ 3060
+          - generic [ref=f1e215]:
+            - generic [ref=f1e216]: Chuẩn giao tiếp
+            - generic [ref=f1e218]: PCI Express 4.0
+          - generic [ref=f1e219]:
+            - generic [ref=f1e220]: CUDA Cores
+            - generic [ref=f1e222]: "3.584"
+      - generic [ref=f1e223]:
+        - generic [ref=f1e224]: Chính sách mua hàng
+        - generic [ref=f1e225]:
+          - generic [ref=f1e226]:
+            - img "khien" [ref=f1e227]
+            - paragraph [ref=f1e228]: Cam kết giá tốt.
+          - generic [ref=f1e229]:
+            - img "icon_sp_moi" [ref=f1e230]
+            - paragraph [ref=f1e231]: Sản phẩm mới 100%.
+          - generic [ref=f1e232]:
+            - img "icon_sp_moi" [ref=f1e233]
+            - paragraph [ref=f1e234]: Lỗi 1 đổi 1 ngay lập tức.
+          - generic [ref=f1e235]:
+            - img "icon_sp_moi" [ref=f1e236]
+            - paragraph [ref=f1e237]: Hỗ trợ trả góp - Thủ tục nhanh gọn.
+      - generic [ref=f1e242]:
+        - group "1 / 5" [ref=f1e243]:
+          - generic [ref=f1e244]:
+            - paragraph [ref=f1e245]: Khách hàng Tăng Hà (086 216 xxxx)
+            - paragraph [ref=f1e246]: Đã mua hàng 1 giờ trước
+        - group "2 / 5" [ref=f1e247]:
+          - generic [ref=f1e248]:
+            - paragraph [ref=f1e249]: Khách hàng Mạnh Hùng (035 348 xxxx)
+            - paragraph [ref=f1e250]: Đã mua hàng 1 giờ trước
+        - group "3 / 5" [ref=f1e251]:
+          - generic [ref=f1e252]:
+            - paragraph [ref=f1e253]: Khách hàng Tuấn Châu (097 408 xxxx)
+            - paragraph [ref=f1e254]: Đã mua hàng 30 phút trước
+        - group "4 / 5" [ref=f1e255]:
+          - generic [ref=f1e256]:
+            - paragraph [ref=f1e257]: Khách hàng Hương (037 964 xxxx)
+            - paragraph [ref=f1e258]: Đã mua hàng 25 phút trước
+        - group "5 / 5" [ref=f1e259]:
+          - generic [ref=f1e260]:
+            - paragraph [ref=f1e261]: Khách hàng Phương (096 169 xxxx)
+            - paragraph [ref=f1e262]: Đã mua hàng 20 phút trước
+      - text: next prev
+      - generic [ref=f1e263]:
+        - generic [ref=f1e264]:
+          - link "Thông số kỹ thuật" [ref=f1e265] [cursor=pointer]:
+            - /url: javascript:void(0)
+          - link "Mô tả sản phẩm" [ref=f1e266] [cursor=pointer]:
+            - /url: javascript:void(0)
+        - generic [ref=f1e268]:
+          - table [ref=f1e270]:
+            - rowgroup [ref=f1e271]:
+              - row [ref=f1e272]:
+                - cell "Tên sản phẩm" [ref=f1e273]
+                - cell "ASUS Dual GeForce RTX™ 3060 OC Edition" [ref=f1e274]
+              - row [ref=f1e275]:
+                - cell "GPU" [ref=f1e276]
+                - cell "NVIDIA® GeForce RTX™ 3060" [ref=f1e277]
+              - row [ref=f1e278]:
+                - cell "Chuẩn giao tiếp" [ref=f1e279]
+                - cell "PCI Express 4.0" [ref=f1e280]
+              - row [ref=f1e281]:
+                - cell "CUDA Cores" [ref=f1e282]
+                - cell "3.584" [ref=f1e283]
+              - row [ref=f1e284]:
+                - cell "Bộ nhớ đồ họa" [ref=f1e285]
+                - cell "12GB GDDR6" [ref=f1e286]
+              - row [ref=f1e287]:
+                - cell "Tốc độ bộ nhớ" [ref=f1e288]
+                - cell "15 Gbps" [ref=f1e289]
+              - row [ref=f1e290]:
+                - cell "Bus bộ nhớ" [ref=f1e291]
+                - cell "192-bit" [ref=f1e292]
+              - row [ref=f1e293]:
+                - cell "Xung nhịp OC Mode" [ref=f1e294]
+                - cell "1867 MHz" [ref=f1e295]
+              - row [ref=f1e296]:
+                - cell "Xung nhịp Gaming Mode" [ref=f1e297]
+                - cell "1837 MHz" [ref=f1e298]
+              - row [ref=f1e299]:
+                - cell "Độ phân giải tối đa" [ref=f1e300]
+                - cell "7680 × 4320" [ref=f1e301]
+              - row [ref=f1e302]:
+                - cell "Số màn hình hỗ trợ" [ref=f1e303]
+                - cell "4" [ref=f1e304]
+              - row [ref=f1e305]:
+                - cell "Cổng xuất hình" [ref=f1e306]
+                - cell "1 × HDMI 2.13 × DisplayPort 1.4a" [ref=f1e307]
+              - row [ref=f1e308]:
+                - cell "HDCP" [ref=f1e309]
+                - cell "HDCP 2.3" [ref=f1e310]
+              - row [ref=f1e311]:
+                - cell "OpenGL" [ref=f1e312]
+                - cell "OpenGL 4.6" [ref=f1e313]
+              - row [ref=f1e314]:
+                - cell "Hỗ trợ NVLink / CrossFire" [ref=f1e315]
+                - cell "Không" [ref=f1e316]
+              - row [ref=f1e317]:
+                - cell "Nguồn đề xuất" [ref=f1e318]
+                - cell "650W" [ref=f1e319]
+              - row [ref=f1e320]:
+                - cell "Đầu cấp nguồn" [ref=f1e321]
+                - cell "1 × 8-pin PCIe" [ref=f1e322]
+              - row [ref=f1e323]:
+                - cell "Độ dày" [ref=f1e324]
+                - cell "2 slot" [ref=f1e325]
+              - row [ref=f1e326]:
+                - cell "Kích thước" [ref=f1e327]
+                - cell "200 × 123 × 38 mm" [ref=f1e328]
+              - row [ref=f1e329]:
+                - cell "Phần mềm hỗ trợ" [ref=f1e330]
+                - cell "ASUS GPU Tweak II, GeForce Game Ready Driver, NVIDIA Studio Driver" [ref=f1e331]
+              - row [ref=f1e332]:
+                - cell "Phụ kiện đi kèm" [ref=f1e333]
+                - cell "1 × Hướng dẫn cài đặt nhanh1 × Collection Card" [ref=f1e334]
+          - text: 
+          - link "Xem đầy đủ thông số kỹ thuật " [ref=f1e335] [cursor=pointer]:
+            - /url: javascript:;
+            - text: Xem đầy đủ thông số kỹ thuật
+            - generic [ref=f1e336]: 
+        - text: 
+      - generic [ref=f1e337]:
+        - generic [ref=f1e338]:
+          - paragraph [ref=f1e339]: Bình luận và đánh giá
+          - generic [ref=f1e341]:
+            - generic [ref=f1e342]:
+              - generic [ref=f1e343]:
+                - generic [ref=f1e344]: 0/5
+                - paragraph [ref=f1e346]: 0 đánh giá và nhận xét
+              - generic [ref=f1e348]:
+                - generic [ref=f1e349]:
+                  - generic [ref=f1e350]:
+                    - text: "5"
+                    - generic [ref=f1e351]: 
+                  - generic "Xem các đánh giá này" [ref=f1e353]:
+                    - strong [ref=f1e354]: "0"
+                    - text: đánh giá
+                - generic [ref=f1e355]:
+                  - generic [ref=f1e356]:
+                    - text: "4"
+                    - generic [ref=f1e357]: 
+                  - generic "Xem các đánh giá này" [ref=f1e359]:
+                    - strong [ref=f1e360]: "0"
+                    - text: đánh giá
+                - generic [ref=f1e361]:
+                  - generic [ref=f1e362]:
+                    - text: "3"
+                    - generic [ref=f1e363]: 
+                  - generic "Xem các đánh giá này" [ref=f1e365]:
+                    - strong [ref=f1e366]: "0"
+                    - text: đánh giá
+                - generic [ref=f1e367]:
+                  - generic [ref=f1e368]:
+                    - text: "2"
+                    - generic [ref=f1e369]: 
+                  - generic "Xem các đánh giá này" [ref=f1e371]:
+                    - strong [ref=f1e372]: "0"
+                    - text: đánh giá
+                - generic [ref=f1e373]:
+                  - generic [ref=f1e374]:
+                    - text: "1"
+                    - generic [ref=f1e375]: 
+                  - generic "Xem các đánh giá này" [ref=f1e377]:
+                    - strong [ref=f1e378]: "0"
+                    - text: đánh giá
+            - paragraph [ref=f1e379]: Bạn đánh giá sao sản phẩm này
+            - link "Đánh giá ngay" [ref=f1e381] [cursor=pointer]:
+              - /url: javascript:;
+            - text: 
+          - link "Xem thêm đánh giá" [ref=f1e383] [cursor=pointer]:
+            - /url: javascript:void(0)
+        - generic [ref=f1e384]:
+          - paragraph [ref=f1e385]: Hỏi và đáp
+          - generic [ref=f1e386]:
+            - generic [ref=f1e387]:
+              - textbox "Xin mời để lại câu hỏi, Nguyencong sẽ trả lời ngay trong 1h, các câu hỏi sau 22h - 8h sẽ được trả lời vào sáng hôm sau." [ref=f1e388]
+              - link "Gửi" [ref=f1e389] [cursor=pointer]:
+                - /url: javascript:showCommentBox('0','')
+            - paragraph
+            - generic [ref=f1e391]:
+              - generic [ref=f1e392] [cursor=pointer]:
+                - generic [ref=f1e393]: 
+                - text: Đính kèm ảnh
+              - paragraph
+            - text: 
+    - generic [ref=f1e394]:
+      - heading "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [level=1] [ref=f1e395]
+      - generic [ref=f1e396]:
+        - generic [ref=f1e397]: "Mã SP: SP004179"
+        - generic [ref=f1e398]:
+          - generic [ref=f1e399]: 
+          - generic [ref=f1e400]: "0.0"
+          - generic [ref=f1e401]: (0 đánh giá)
+        - generic [ref=f1e402]:
+          - generic [ref=f1e403]: 
+          - generic [ref=f1e404]: "17"
+        - generic [ref=f1e405]:
+          - generic [ref=f1e406]: 
+          - generic [ref=f1e407]: "0"
+      - generic [ref=f1e408]: "Bảo hành: 36 Tháng"
+      - generic [ref=f1e411]:
+        - generic [ref=f1e412]: 9.500.000đ
+        - generic [ref=f1e414]:
+          - paragraph [ref=f1e415]: Hoặc
+          - generic [ref=f1e416]:
+            - paragraph [ref=f1e417]: Trả góp
+            - generic [ref=f1e419]:
+              - generic [ref=f1e420]: "814.942"
+              - text: /
+              - generic [ref=f1e421]: tháng
+      - generic [ref=f1e422]:
+        - paragraph [ref=f1e424]: Khuyến mại & Quà tặng khác
+        - paragraph [ref=f1e428]:
+          - generic [ref=f1e429]:
+            - text: "🔹 Giá ưu đãi Build PC:"
+            - strong [ref=f1e430]: 9.500.000đ
+          - generic [ref=f1e431]:
+            - text: "🔹 Giá bán lẻ:"
+            - strong [ref=f1e433]: 10.200.000đ
+      - generic [ref=f1e434]:
+        - link "TRẢ GÓP" [ref=f1e435] [cursor=pointer]:
+          - /url: javascript:;
+        - link "MUA NGAY" [ref=f1e437] [cursor=pointer]:
+          - /url: javascript:;
+        - link [ref=f1e439] [cursor=pointer]:
+          - /url: javascript:void(0)
+          - img "icon-cart" [ref=f1e440]
+          - paragraph [ref=f1e441]: Thêm vào giỏ
+      - generic [ref=f1e442]:
+        - heading "Sản phẩm đã xem" [level=2] [ref=f1e444]
+        - generic [ref=f1e445]:
+          - group "1 / 1" [ref=f1e447]:
+            - generic [ref=f1e448]:
+              - link [ref=f1e449] [cursor=pointer]:
+                - /url: /card-man-hinh-asus-dual-geforce-rtx-3060-oc-12gb
+                - img "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [ref=f1e450]
+              - generic [ref=f1e451]:
+                - link [ref=f1e452] [cursor=pointer]:
+                  - /url: /card-man-hinh-asus-dual-geforce-rtx-3060-oc-12gb
+                  - heading "Card Màn Hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6" [level=3] [ref=f1e453]
+                - generic [ref=f1e454]: 9.500.000đ
+          - text: next prev
+  - contentinfo [ref=f1e455]:
+    - generic [ref=f1e457]:
+      - paragraph [ref=f1e460]:
+        - generic [ref=f1e461]: Chính sách giao hàng
+        - generic [ref=f1e462]: nhận hàng và thanh toán tại nhà
+      - paragraph [ref=f1e465]:
+        - generic [ref=f1e466]: đổi trả dễ dàng
+        - generic [ref=f1e467]: 1 đổi 1 trong 15 ngày
+      - paragraph [ref=f1e470]:
+        - generic [ref=f1e471]: thanh toán tiện lợi
+        - generic [ref=f1e472]: tiền mặt, CK, trả góp 0%
+      - paragraph [ref=f1e475]:
+        - generic [ref=f1e476]: hỗ trợ nhiệt tình
+        - generic [ref=f1e477]: tư vấn, giải đáp mọi thắc mắc
+    - generic [ref=f1e478]:
+      - generic [ref=f1e481]:
+        - generic [ref=f1e483]:
+          - paragraph [ref=f1e484]:
+            - generic [ref=f1e485]: "1"
+            - text: Cơ sở Hà Nội - Hà Kế Tấn
+          - img "cs1" [ref=f1e486]
+          - list [ref=f1e487]:
+            - listitem [ref=f1e488]:
+              - generic [ref=f1e489]: 
+              - generic [ref=f1e490]:
+                - text: Số 17 phố Hà Kế Tấn, Phường Phường Liệt, TP. Hà Nội
+                - link "[ Xem đường đi ]" [ref=f1e491] [cursor=pointer]:
+                  - /url: https://maps.app.goo.gl/FiEvsc7YHjvKhJep8
+            - listitem [ref=f1e492]:
+              - generic [ref=f1e493]: 
+              - generic [ref=f1e494]:
+                - text: "Hotline:"
+                - link "089.9999.191" [ref=f1e495] [cursor=pointer]:
+                  - /url: tel:0899999191
+                - text: "-"
+                - link "0812.666.665" [ref=f1e496] [cursor=pointer]:
+                  - /url: tel:0812666665
+            - listitem [ref=f1e497]:
+              - generic [ref=f1e498]: 
+              - generic [ref=f1e499]:
+                - text: "Email:"
+                - link "nguyenluc@nguyencongpc.vn" [ref=f1e500] [cursor=pointer]:
+                  - /url: mailto:nguyenluc@nguyencongpc.vn
+            - listitem [ref=f1e501]: "Giờ mở cửa: 08:30 - 20:30"
+        - generic [ref=f1e503]:
+          - paragraph [ref=f1e504]:
+            - generic [ref=f1e505]: "2"
+            - text: Cơ sở Hà Nội - Trần Thái Tông
+          - img "cs2" [ref=f1e506]
+          - list [ref=f1e507]:
+            - listitem [ref=f1e508]:
+              - generic [ref=f1e509]: 
+              - generic [ref=f1e510]:
+                - text: Số 10 ngõ 93 Trần Thái Tông, Phường Cầu Giấy, TP. Hà Nội
+                - link "[ Xem đường đi ]" [ref=f1e511] [cursor=pointer]:
+                  - /url: https://maps.app.goo.gl/ngdoiZXJMKfNFd8j8
+            - listitem [ref=f1e512]:
+              - generic [ref=f1e513]: 
+              - generic [ref=f1e514]:
+                - text: "Hotline:"
+                - link "089.9999.191" [ref=f1e515] [cursor=pointer]:
+                  - /url: tel:0899999191
+                - text: "-"
+                - link "0812.666.665" [ref=f1e516] [cursor=pointer]:
+                  - /url: tel:0812666665
+            - listitem [ref=f1e517]:
+              - generic [ref=f1e518]: 
+              - generic [ref=f1e519]:
+                - text: "Email:"
+                - link "nguyenluc@nguyencongpc.vn" [ref=f1e520] [cursor=pointer]:
+                  - /url: mailto:nguyenluc@nguyencongpc.vn
+            - listitem [ref=f1e521]: "Giờ mở cửa: 08:00 - 20:30"
+        - generic [ref=f1e523]:
+          - paragraph [ref=f1e524]:
+            - generic [ref=f1e525]: "3"
+            - text: Cơ sở Hồ Chí Minh
+          - img "cs3" [ref=f1e526]
+          - list [ref=f1e527]:
+            - listitem [ref=f1e528]:
+              - generic [ref=f1e529]: 
+              - generic [ref=f1e530]:
+                - text: 249 Lý Thường Kiệt, Phường Phú Thọ, TP. Hồ Chí Minh
+                - link "[ Xem đường đi ]" [ref=f1e531] [cursor=pointer]:
+                  - /url: https://maps.app.goo.gl/2qWwwEZpTLhP7vVU8
+            - listitem [ref=f1e532]:
+              - generic [ref=f1e533]: 
+              - generic [ref=f1e534]:
+                - text: "Hotline:"
+                - link "089.9999.191" [ref=f1e535] [cursor=pointer]:
+                  - /url: tel:0899999191
+                - text: "-"
+                - link "0812.666.665" [ref=f1e536] [cursor=pointer]:
+                  - /url: tel:0812666665
+            - listitem [ref=f1e537]:
+              - generic [ref=f1e538]: 
+              - generic [ref=f1e539]:
+                - text: "Email:"
+                - link "nguyenluc@nguyencongpc.vn" [ref=f1e540] [cursor=pointer]:
+                  - /url: mailto:nguyenluc@nguyencongpc.vn
+            - listitem [ref=f1e541]: "Giờ mở cửa: 08:30 - 20:30"
+        - generic [ref=f1e543]:
+          - paragraph [ref=f1e544]:
+            - generic [ref=f1e545]: "4"
+            - text: Phòng kinh doanh doanh nghiệp Hà Kế Tấn, HN
+          - img "cs1" [ref=f1e546]
+          - list [ref=f1e547]:
+            - listitem [ref=f1e548]:
+              - generic [ref=f1e549]: 
+              - generic [ref=f1e550]:
+                - text: Số 17 phố Hà Kế Tấn, Phường Phường Liệt, TP. Hà Nội
+                - link "[ Xem đường đi ]" [ref=f1e551] [cursor=pointer]:
+                  - /url: https://maps.app.goo.gl/FiEvsc7YHjvKhJep8
+            - listitem [ref=f1e552]:
+              - generic [ref=f1e553]: 
+              - generic [ref=f1e554]:
+                - text: "Hotline:"
+                - link "098.741.4899" [ref=f1e555] [cursor=pointer]:
+                  - /url: tel:0987414899
+            - listitem [ref=f1e556]:
+              - generic [ref=f1e557]: 
+              - generic [ref=f1e558]:
+                - text: "Email:"
+                - link "nguyenluc@nguyencongpc.vn" [ref=f1e559] [cursor=pointer]:
+                  - /url: mailto:nguyenluc@nguyencongpc.vn
+            - listitem [ref=f1e560]: "Giờ mở cửa: 08:00 - 17:30"
+        - generic [ref=f1e562]:
+          - paragraph [ref=f1e563]:
+            - generic [ref=f1e564]: "5"
+            - text: Phòng kinh doanh doanh nghiệp CG - HN
+          - img "cs2" [ref=f1e565]
+          - list [ref=f1e566]:
+            - listitem [ref=f1e567]:
+              - generic [ref=f1e568]: 
+              - generic [ref=f1e569]:
+                - text: Số 10 ngõ 93 Trần Thái Tông, Phường Cầu Giấy, TP. Hà Nội
+                - link "[ Xem đường đi ]" [ref=f1e570] [cursor=pointer]:
+                  - /url: https://maps.app.goo.gl/ngdoiZXJMKfNFd8j8
+            - listitem [ref=f1e571]:
+              - generic [ref=f1e572]: 
+              - generic [ref=f1e573]:
+                - text: "Hotline:"
+                - link "098.122.6969" [ref=f1e574] [cursor=pointer]:
+                  - /url: tel:0981226969
+            - listitem [ref=f1e575]:
+              - generic [ref=f1e576]: 
+              - generic [ref=f1e577]:
+                - text: "Email:"
+                - link "tuyetpham@nguyencongpc.vn" [ref=f1e578] [cursor=pointer]:
+                  - /url: mailto:tuyetpham@nguyencongpc.vn
+            - listitem [ref=f1e579]: "Giờ mở cửa: 08:00 - 17:30"
+        - generic [ref=f1e581]:
+          - paragraph [ref=f1e582]:
+            - generic [ref=f1e583]: "6"
+            - text: Phòng kinh doanh doanh nghiệp HCM
+          - img "cs3" [ref=f1e584]
+          - list [ref=f1e585]:
+            - listitem [ref=f1e586]:
+              - generic [ref=f1e587]: 
+              - generic [ref=f1e588]:
+                - text: 249 Lý Thường Kiệt, Phường Phú Thọ, TP. Hồ Chí Minh
+                - link "[ Xem đường đi ]" [ref=f1e589] [cursor=pointer]:
+                  - /url: https://maps.app.goo.gl/2qWwwEZpTLhP7vVU8
+            - listitem [ref=f1e590]:
+              - generic [ref=f1e591]: 
+              - generic [ref=f1e592]:
+                - text: "Hotline:"
+                - link "0707.08.6666" [ref=f1e593] [cursor=pointer]:
+                  - /url: tel:0707086666
+            - listitem [ref=f1e594]:
+              - generic [ref=f1e595]: 
+              - generic [ref=f1e596]:
+                - text: "Email:"
+                - link "nguyenluc@nguyencongpc.vn" [ref=f1e597] [cursor=pointer]:
+                  - /url: mailto:nguyenluc@nguyencongpc.vn
+            - listitem [ref=f1e598]: "Giờ mở cửa: 08:00 - 17:30"
+      - generic [ref=f1e599]:
+        - generic [ref=f1e600]:
+          - paragraph [ref=f1e601]: Giới thiệu nguyễn công
+          - link "Giới thiệu công ty" [ref=f1e602] [cursor=pointer]:
+            - /url: https://nguyencongpc.vn
+          - link "Thông tin liên hệ" [ref=f1e603] [cursor=pointer]:
+            - /url: /lien-he
+          - link "Tin tức" [ref=f1e604] [cursor=pointer]:
+            - /url: /tin-tuc
+          - link "Tuyển dụng" [ref=f1e605] [cursor=pointer]:
+            - /url: /tuyen-dung
+          - link "Hệ thống cửa hàng" [ref=f1e606] [cursor=pointer]:
+            - /url: "#fancybox-showroom"
+          - generic [ref=f1e607]:
+            - link "Insta" [ref=f1e608] [cursor=pointer]:
+              - /url: javascript:;
+            - link "Face Book" [ref=f1e610] [cursor=pointer]:
+              - /url: https://www.facebook.com/MAY.TINH.NGUYEN.CONG
+            - link "Youtube" [ref=f1e612] [cursor=pointer]:
+              - /url: https://www.youtube.com/c/NGUYENCONGPC
+            - link "Tiktok" [ref=f1e614] [cursor=pointer]:
+              - /url: javascript:;
+          - paragraph [ref=f1e616]:
+            - link [ref=f1e617] [cursor=pointer]:
+              - /url: http://online.gov.vn/searchProfile/IndexTimKiem?btnRadioSearch=opt-mst&KeySearch=0107568451
+              - img "bộ công thương" [ref=f1e618]
+            - link [ref=f1e619] [cursor=pointer]:
+              - /url: https://www.dmca.com/compliance/nguyencongpc.vn
+              - img "DMCA compliant image" [ref=f1e620]
+          - paragraph
+        - generic [ref=f1e621]:
+          - paragraph [ref=f1e622]: Hỗ trợ khách hàng
+          - link "Hướng dẫn mua hàng trực tuyến" [ref=f1e623] [cursor=pointer]:
+            - /url: /huong-dan-mua-hang-truc-tuyen
+          - link "Hướng dẫn thanh toán" [ref=f1e624] [cursor=pointer]:
+            - /url: /pages/chinh-sach-thanh-toan.html
+          - link "Gửi yêu cầu bảo hành" [ref=f1e625] [cursor=pointer]:
+            - /url: /lien-he
+          - link "Góp ý, Khiếu Nại" [ref=f1e626] [cursor=pointer]:
+            - /url: /lien-he
+        - generic [ref=f1e627]:
+          - paragraph [ref=f1e628]: Chính sách chung
+          - link "Chính sách, quy định chung" [ref=f1e629] [cursor=pointer]:
+            - /url: /pages/chinh-sach-chung.html
+          - link "Chính sách vận chuyển" [ref=f1e630] [cursor=pointer]:
+            - /url: /pages/chinh-sach-van-chuyen.html
+          - link "Chính sách bảo hành" [ref=f1e631] [cursor=pointer]:
+            - /url: /pages/chinh-sach-bao-hanh.html
+          - link "Dịch vụ tính phí" [ref=f1e632] [cursor=pointer]:
+            - /url: /pages/dich-vu-tinh-phi.html
+          - link "Chính sách nhập lại tính phí" [ref=f1e633] [cursor=pointer]:
+            - /url: /chinh-sach-nhap-lai
+          - link "Chính sách cho doanh nghiệp" [ref=f1e634] [cursor=pointer]:
+            - /url: /pages/chinh-sach-doanh-nghiep.html
+          - link "Chính sách bảo mật" [ref=f1e635] [cursor=pointer]:
+            - /url: /bao-mat-thong-tin-khach-hang
+        - generic [ref=f1e636]:
+          - paragraph [ref=f1e637]: Thông tin khuyến mại
+          - link "Thông tin khuyến mại" [ref=f1e638] [cursor=pointer]:
+            - /url: https://khuyenmai.nguyencongpc.vn
+          - link "Sản phẩm khuyến mại" [ref=f1e639] [cursor=pointer]:
+            - /url: /san-pham-xa-hang
+          - link "Sản phẩm bán chạy" [ref=f1e640] [cursor=pointer]:
+            - /url: /san-pham-ban-chay
+          - link "Sản phẩm mới" [ref=f1e641] [cursor=pointer]:
+            - /url: /san-pham-moi
+      - generic [ref=f1e644]:
+        - paragraph [ref=f1e645]: WEBSITE ĐƯỢC SỞ HỮU VÀ QUẢN LÝ BỞI NGUYỄN VIẾT CÔNG
+        - text: CÔNG TY TNHH MÁY TÍNH NGUYỄN CÔNG
+        - paragraph [ref=f1e646]: "Địa chỉ: 17 Hà Kế Tấn - Phường Phương Liệt - Hà Nội"
+        - paragraph [ref=f1e647]: "Mã số thuế: 0107568451 do Sở Kế Hoạch và Đầu Tư TP.Hà Nội (17/09/2016)"
+        - paragraph [ref=f1e648]:
+          - text: "Mua hàng:"
+          - link "089.9999.191" [ref=f1e649] [cursor=pointer]:
+            - /url: tel:0866666166
+          - text: "-"
+          - link "0812.666.665" [ref=f1e650] [cursor=pointer]:
+            - /url: tel:0812666665
+        - paragraph [ref=f1e651]:
+          - generic [ref=f1e652]:
+            - text: "GÓP Ý :"
+            - link "097.9999.191" [ref=f1e653] [cursor=pointer]:
+              - /url: tel:0979999191
+            - text: "-"
+            - link "098.33333.88" [ref=f1e654] [cursor=pointer]:
+              - /url: tel:0983333388
+            - text: .
+          - generic [ref=f1e655]:
+            - text: "Email:"
+            - link "info@nguyencongpc.vn" [ref=f1e656] [cursor=pointer]:
+              - /url: mailTo:info@nguyencongpc.vn
+            - text: .
+          - generic [ref=f1e657]:
+            - text: "Website:"
+            - link "nguyencongpc.vn" [ref=f1e658] [cursor=pointer]:
+              - /url: /
+            - text: .
+          - generic [ref=f1e659]:
+            - text: "Fanpage:"
+            - link "www.facebook.com/MAY.TINH.NGUYEN.CONG" [ref=f1e660] [cursor=pointer]:
+              - /url: www.facebook.com/MAY.TINH.NGUYEN.CONG
+            - text: .
+  - generic:
+    - generic:
+      - link:
+        - /url: /ad.php?id=286
+    - generic:
+      - link:
+        - /url: /ad.php?id=285
+  - generic:
+    - link "Face Book" [ref=f1e661] [cursor=pointer]:
+      - /url: https://www.facebook.com/NGUYENCONGPC.VN
+      - generic [ref=f1e662]: 
+    - link "Youtube" [ref=f1e663] [cursor=pointer]:
+      - /url: https://www.youtube.com/c/NGUYENCONGPC
+      - generic [ref=f1e664]: 
+    - text: 
+    - link "mes Chat Facebook (8h-22h30)" [ref=f1e665] [cursor=pointer]:
+      - /url: https://m.me/nguyencongpc.vn
+      - img "mes" [ref=f1e666]
+      - generic [ref=f1e667]:
+        - generic [ref=f1e668]: Chat Facebook
+        - text: (8h-22h30)
+    - link "mes Chat Zalo (8h-22h30)" [ref=f1e669] [cursor=pointer]:
+      - /url: https://zalo.me/nguyencongpc
+      - img "mes" [ref=f1e670]
+      - generic [ref=f1e671]:
+        - generic [ref=f1e672]: Chat Zalo
+        - text: (8h-22h30)

@@ -19,6 +19,7 @@ import {
   queryTokens,
   rowMatchesTokens,
   filterRows,
+  productMatchesSmartQuery,
 } from "../ui/src/lib/pricing.ts";
 
 /* ------------------------------ searchNorm ------------------------------- */
@@ -166,4 +167,47 @@ test("filterRows: query không khớp gì -> mảng rỗng, không phải toàn 
 test("filterRows: đầu vào không phải mảng -> []", () => {
   assert.deepEqual(filterRows(null, { query: "ram" }), []);
   assert.deepEqual(filterRows(undefined, {}), []);
+});
+
+/* ----------------------- productMatchesSmartQuery ------------------------ */
+
+const RTX_PRODUCT = {
+  name: "Card màn hình ASUS Dual GeForce RTX 3060 OC 12GB GDDR6",
+  price: 10200000,
+  buildPrice: 9500000,
+  category: "Card màn hình",
+  brand: "ASUS",
+  source: "nguyencong",
+  sourceName: "Nguyễn Công",
+  sku: "DUAL-RTX3060-O12G",
+  warranty: "36 tháng",
+};
+
+const MAIN_PRODUCT = {
+  name: "Bo mạch chủ MSI B760M Mortar WIFI DDR5",
+  price: 3890000,
+  category: "Mainboard",
+  brand: "MSI",
+  sourceName: "An Phát",
+};
+
+test("productMatchesSmartQuery: tìm mềm bỏ dấu, sai thứ tự và thêm sku/source", () => {
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "asus 3060"), true);
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "3060 nguyen"), true);
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "dual rtx3060"), true);
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "36 thang"), true);
+});
+
+test("productMatchesSmartQuery: hiểu đồng nghĩa nhóm linh kiện", () => {
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "vga 3060"), true);
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "gpu 3060"), true);
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "card do hoa 3060"), true);
+  assert.equal(productMatchesSmartQuery(MAIN_PRODUCT, "main b760"), true);
+  assert.equal(productMatchesSmartQuery(MAIN_PRODUCT, "bo mach chu b760"), true);
+});
+
+test("productMatchesSmartQuery: chịu được typo 1 ký tự cho token dài", () => {
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "geforc 3060"), true);
+  assert.equal(productMatchesSmartQuery(MAIN_PRODUCT, "morter b760"), true);
+  assert.equal(productMatchesSmartQuery(RTX_PRODUCT, "geforxxx 3060"), false);
 });

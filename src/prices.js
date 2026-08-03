@@ -171,12 +171,17 @@ function normalizeItems(json, source) {
     // khối khuyến mãi (m.retailOffer), đọc đúng các dòng có nhãn:
     //   - "Giá bán lẻ rời ... : X" -> X là giá bán lẻ thực (ưu tiên dùng cho price)
     //   - "Giá Build PC : Y"       -> Y là giá build (lưu riêng vào buildPrice)
-    // Không có nhãn bán lẻ rời -> giữ field "price" (trường hợp An Phát).
+    // HACOM lại đảo nghĩa ngay trong API: giaBuildPcKoVga là giá bán lẻ/public,
+    // còn unitSellingPrice là giá build PC. Không có nhãn bán lẻ rời -> giữ
+    // field "price" (trường hợp An Phát).
     let price = parsePrice(pick(item, "price"));
     let buildPrice = null;
+    if (m.priceFallback && (price == null || price <= 0)) {
+      price = parsePrice(pick(item, m.priceFallback));
+    }
     if (m.buildPrice) {
-      // HACOM: giá build PC là field RIÊNG (giaBuildPcKoVga) -> lấy thẳng,
-      // KHÔNG suy đoán theo "thấp nhất" (giá build có thể cao HOẶC thấp hơn lẻ).
+      // HACOM: build PC là field RIÊNG unitSellingPrice, không suy đoán theo
+      // mức thấp nhất. retail/public là giaBuildPcKoVga.
       buildPrice = parsePrice(pick(item, "buildPrice"));
     }
     if (m.retailOffer) {
@@ -516,11 +521,11 @@ const SEED_PRICE_SOURCES = [
     mapping: {
       productId: "itemCode",
       name: "itemName",
-      // unitSellingPrice = giá bán lẻ thực; giaBuildPcKoVga = giá khi build PC
-      // (không gồm VGA). Hai field RIÊNG trên mỗi SP -> lấy thẳng, KHÔNG suy đoán
-      // theo "thấp nhất" như Hura (HACOM giá build có thể cao HOẶC thấp hơn lẻ).
-      price: "unitSellingPrice",
-      buildPrice: "giaBuildPcKoVga",
+      // HACOM: giaBuildPcKoVga là giá bán lẻ/public; unitSellingPrice là giá build
+      // PC. marketPrice chỉ là mốc niêm yết cao hơn, dùng làm fallback nếu cần.
+      price: "giaBuildPcKoVga",
+      priceFallback: "marketPrice",
+      buildPrice: "unitSellingPrice",
       list: "marketPrice",
       brand: "brandName",
       url: "url",
@@ -650,7 +655,8 @@ async function pruneLegacySources() {
 // Thêm/cập nhật các nguồn seed. Nguồn người dùng đã xoá thì tôn trọng (không
 // thêm lại). Nguồn đã tồn tại: LÀM MỚI cấu hình crawl (urls[]/mapping/phân
 // trang...) theo bản seed mới nhất để vá các bản đời cũ bị thiếu (vd HACOM cũ
-// chỉ có url CPU đơn lẻ, thiếu urls[] nên chỉ lấy được mỗi danh mục CPU).
+// chỉ có url CPU đơn lẻ, thiếu urls[] nên chỉ lấy được mỗi danh mục CPU; Hura
+// cũ thiếu mapping.retailOffer nên lấy nhầm field price = giá build PC).
 // Giữ nguyên metadata runtime (lastSyncAt/lastCount...) và công tắc enabled
 // mà người dùng đã chỉnh.
 async function seedPriceSources() {

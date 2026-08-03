@@ -42,6 +42,7 @@ import {
   COND_LABEL,
   canonCat,
   isSellable,
+  productMatchesSmartQuery,
   resolveProductUrl,
   clusterProducts,
   bestOffersPerStore,
@@ -79,6 +80,32 @@ interface GroupsResponse extends BgResponse {
 }
 interface SourcesResponse extends BgResponse {
   sources?: Source[];
+}
+interface SourceSyncResponse extends BgResponse {
+  fetched?: number;
+  added?: number;
+  updated?: number;
+  partialError?: string;
+}
+interface SyncAllResponse extends BgResponse {
+  synced?: number;
+  total?: number;
+}
+interface AutoSyncConfig {
+  enabled?: boolean;
+  intervalHours?: number;
+}
+interface AutoSyncResponse extends BgResponse {
+  config?: AutoSyncConfig;
+}
+interface SyncProgress {
+  id?: string;
+  name?: string;
+  status?: string;
+  page?: number;
+  pagesFetched?: number;
+  fetched?: number;
+  total?: number | null;
 }
 interface ExtractionResponse extends BgResponse {
   processed?: number;
@@ -139,6 +166,8 @@ interface SheetConfigResponse extends BgResponse {
 
 // Khớp SHEET_INTERVALS trong src/sheets.js — service worker sẽ ép về mốc hợp lệ.
 const SHEET_INTERVALS = [1, 3, 6, 12, 24];
+// Khớp AUTOSYNC_INTERVALS trong src/crawl.js — lịch đồng bộ giá website.
+const MARKET_SYNC_INTERVALS = [6, 12, 24];
 
 const TABS: { id: TabId; label: string; icon: typeof Tag }[] = [
   { id: "group", label: "Giá Group", icon: Tag },
@@ -643,17 +672,33 @@ function CatalogTab({ flash }: { flash: FlashFn }) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [smartCat, setSmartCat] = useState("");
+  const [smartSource, setSmartSource] = useState("");
+  const [priceBand, setPriceBand] = useState<"all" | "budget" | "mid" | "high">("all");
+  const [sortMode, setSortMode] = useState<"relevance" | "priceAsc" | "priceDesc" | "spreadDesc" | "storesDesc">("relevance");
   const [mode, setMode] = useState<CatalogMode>("compare");
   const [confirmClear, setConfirmClear] = useState(false);
+  const [syncing, setSyncing] = useState<string | null>(null);
+  const [syncProgress, setSyncProgress] = useState<Record<string, SyncProgress>>({});
+  const [autoSync, setAutoSync] = useState<AutoSyncConfig>({ enabled: false, intervalHours: 12 });
+  const [autoSaving, setAutoSaving] = useState(false);
+  const [sourcesOpen, setSourcesOpen] = useState(true);
 
   async function load() {
     setLoading(true);
     setLoadError(null);
-    const [pRes, sRes] = await Promise.all([
+    const [pRes, sRes, aRes] = await Promise.all([
       bg<ProductsResponse>("GET_PRODUCTS"),
       bg<SourcesResponse>("GET_SOURCES"),
+      bg<AutoSyncResponse>("GET_AUTOSYNC"),
     ]);
     setSources((sRes && sRes.sources) || []);
+    if (aRes && aRes.ok && aRes.config) {
+      setAutoSync({
+        enabled: !!aRes.config.enabled,
+        intervalHours: aRes.config.intervalHours || 12,
+      });
+    }
     if (!pRes || !pRes.ok) {
       setLoadError(pRes?.error || "Không nạp được kho sản phẩm.");
       setAll([]);
@@ -667,6 +712,78 @@ function CatalogTab({ flash }: { flash: FlashFn }) {
     void load();
   }, []);
 
+  useEffect(() => {
+    const handler = (msg: SyncProgress & { type?: string }) => {
+      if (!msg || msg.type !== "SYNC_PROGRESS" || !msg.id) return;
+      setSyncProgress((prev) => ({ ...prev, [String(msg.id)]: msg }));
+    };
+    try {
+      chrome.runtime.onMessage.addListener(handler);
+    } catch {
+      return;
+    }
+    return () => {
+      try {
+        chrome.runtime.onMessage.removeListener(handler);
+      } catch {}
+    };
+  }, []);
+
+  async function syncOne(source: Source) {
+    if (!source.id || syncing) return;
+    setSyncing(source.id);
+    setSyncProgress((prev) => ({
+      ...prev,
+      [source.id]: { id: source.id, name: source.name || source.id, status: "started", fetched: 0 },
+    }));
+    const res = await bg<SourceSyncResponse>("SYNC_SOURCE", { id: source.id });
+    setSyncing(null);
+    await load();
+    if (!res || !res.ok) {
+      flash("err", res?.error || "Đồng bộ nguồn thất bại.", 6000);
+      return;
+    }
+    const warn = res.partialError ? ` · cảnh báo: ${res.partialError}` : "";
+    flash(
+      "ok",
+      `Đã đồng bộ ${source.name || source.id}: ${res.fetched || 0} SP (mới ${res.added || 0}, cập nhật ${res.updated || 0}).${warn}`,
+      5000,
+    );
+  }
+
+  async function syncAllMarketSources() {
+    if (syncing) return;
+    setSyncing("__all");
+    const res = await bg<SyncAllResponse>("SYNC_ALL_SOURCES");
+    setSyncing(null);
+    await load();
+    if (!res || !res.ok) {
+      flash("err", res?.error || "Đồng bộ tất cả nguồn thất bại.", 6000);
+      return;
+    }
+    flash("ok", `Đã đồng bộ ${res.synced || 0}/${res.total || 0} nguồn giá website.`, 5000);
+  }
+
+  async function deleteSource(source: Source) {
+    if (!source.id || syncing) return;
+    const res = await bg("DELETE_SOURCE", { id: source.id });
+    await load();
+    flash(res && res.ok ? "ok" : "err", res && res.ok ? "Đã xoá nguồn giá." : res?.error || "Không xoá được nguồn.", 5000);
+  }
+
+  async function saveAutoSync(next: AutoSyncConfig) {
+    setAutoSync(next);
+    setAutoSaving(true);
+    const res = await bg<AutoSyncResponse>("SET_AUTOSYNC", { config: next });
+    setAutoSaving(false);
+    if (!res || !res.ok) {
+      flash("err", res?.error || "Không lưu được lịch đồng bộ giá.", 6000);
+      return;
+    }
+    if (res.config) setAutoSync(res.config);
+    flash("ok", next.enabled ? `Đã bật tự động đồng bộ giá mỗi ${next.intervalHours || 12} giờ.` : "Đã tắt tự động đồng bộ giá.", 3500);
+  }
+
   async function clearAll() {
     setConfirmClear(false);
     const res = await bg<BgResponse & { deleted?: number }>("CLEAR_PRODUCTS", {});
@@ -674,29 +791,54 @@ function CatalogTab({ flash }: { flash: FlashFn }) {
     flash("ok", `Đã xóa ${(res && res.deleted) || 0} sản phẩm.`);
   }
 
-  // Filter to sellable + search terms.
-  const products = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const sellable = all.filter(isSellable);
-    if (!q) return sellable;
-    const terms = q.split(/\s+/).filter(Boolean);
-    return sellable.filter((p) => {
-      const hay = (
-        (p.name || "") +
-        " " +
-        (p.category || "") +
-        " " +
-        canonCat(p.category) +
-        " " +
-        (p.brand || "")
-      ).toLowerCase();
-      return terms.every((t) => hay.includes(t));
-    });
-  }, [all, query]);
+  const sellableProducts = useMemo(() => all.filter(isSellable), [all]);
 
-  const clusters = useMemo(() => clusterProducts(products), [products]);
+  const smartCategories = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const p of sellableProducts) {
+      const key = canonCat(p.category) || "Khác";
+      map.set(key, (map.get(key) || 0) + 1);
+    }
+    return [...map.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "vi"));
+  }, [sellableProducts]);
+
+  const smartSources = useMemo(() => sourceBreakdown(sellableProducts), [sellableProducts]);
+
+  const smartFilterActive = !!query.trim() || !!smartCat || !!smartSource || priceBand !== "all" || sortMode !== "relevance";
+
+  // Filter to sellable + flexible search + practical inventory facets.
+  const products = useMemo(() => {
+    const filtered = sellableProducts.filter((p) => {
+      if (!productMatchesSmartQuery(p, query)) return false;
+      if (smartCat && (canonCat(p.category) || "Khác") !== smartCat) return false;
+      if (smartSource && (p.sourceName || p.source || "(không rõ)") !== smartSource) return false;
+      const price = Number(p.price);
+      if (priceBand === "budget" && !(Number.isFinite(price) && price < 3_000_000)) return false;
+      if (priceBand === "mid" && !(Number.isFinite(price) && price >= 3_000_000 && price < 10_000_000)) return false;
+      if (priceBand === "high" && !(Number.isFinite(price) && price >= 10_000_000)) return false;
+      return true;
+    });
+    if (sortMode === "priceAsc" || sortMode === "priceDesc") {
+      return [...filtered].sort((a, b) => {
+        const ap = Number(a.price);
+        const bp = Number(b.price);
+        const av = Number.isFinite(ap) ? ap : Infinity;
+        const bv = Number.isFinite(bp) ? bp : Infinity;
+        return sortMode === "priceAsc" ? av - bv : bv - av;
+      });
+    }
+    return filtered;
+  }, [priceBand, query, sellableProducts, smartCat, smartSource, sortMode]);
+
+  const clusters = useMemo(() => {
+    const grouped = clusterProducts(products);
+    if (sortMode === "priceAsc") return [...grouped].sort((a, b) => (a.minPrice ?? Infinity) - (b.minPrice ?? Infinity));
+    if (sortMode === "priceDesc") return [...grouped].sort((a, b) => (b.maxPrice ?? -Infinity) - (a.maxPrice ?? -Infinity));
+    if (sortMode === "spreadDesc") return [...grouped].sort((a, b) => b.spread - a.spread || b.storeCount - a.storeCount);
+    if (sortMode === "storesDesc") return [...grouped].sort((a, b) => b.storeCount - a.storeCount || b.spread - a.spread);
+    return grouped;
+  }, [products, sortMode]);
   const multi = useMemo(() => clusters.filter((c) => c.storeCount >= 2), [clusters]);
-  const breakdown = useMemo(() => sourceBreakdown(products), [products]);
   const single = clusters.length - multi.length;
 
   // Windowing: compare mode paginates clusters, list mode paginates products.
@@ -705,6 +847,171 @@ function CatalogTab({ flash }: { flash: FlashFn }) {
 
   return (
     <div className="flex flex-col gap-4">
+      {/* Website source sync */}
+      <section className="flex flex-col gap-3 rounded-lg border border-line bg-surface p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <button
+            type="button"
+            onClick={() => setSourcesOpen((v) => !v)}
+            className="group flex min-w-0 flex-1 items-start gap-2 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+            aria-expanded={sourcesOpen}
+            aria-controls="market-source-panel"
+          >
+            <ChevronDown className={cn("mt-0.5 size-4 shrink-0 text-ink-faint transition-transform", !sourcesOpen && "-rotate-90")} />
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-sm font-semibold text-ink group-hover:text-accent">Nguồn giá website</h2>
+                <span className="rounded-sm bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-ink-faint">
+                  {sources.length} nguồn
+                </span>
+                {!sourcesOpen && autoSync.enabled && (
+                  <span className="rounded-sm bg-green-soft/20 px-1.5 py-0.5 text-[10px] font-semibold text-green">
+                    Auto {autoSync.intervalHours || 12}h
+                  </span>
+                )}
+              </div>
+              <p className="mt-1 max-w-[72ch] text-xs leading-relaxed text-ink-faint">
+                {sourcesOpen
+                  ? "Các URL/API trong nguồn sẽ được background fetch, chuẩn hoá rồi lưu vào kho sản phẩm để so giá."
+                  : "Đã thu nhỏ — bấm để mở danh sách nguồn và điều khiển đồng bộ."}
+              </p>
+            </div>
+          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="inline-flex items-center gap-2 rounded-md border border-line bg-bg px-2.5 py-1.5 text-xs text-ink-soft">
+              <input
+                type="checkbox"
+                checked={!!autoSync.enabled}
+                disabled={autoSaving}
+                onChange={(e) =>
+                  void saveAutoSync({
+                    ...autoSync,
+                    enabled: e.target.checked,
+                    intervalHours: autoSync.intervalHours || 12,
+                  })
+                }
+                className="size-3.5 accent-[var(--accent)]"
+              />
+              Tự động
+            </label>
+            <select
+              value={autoSync.intervalHours || 12}
+              disabled={autoSaving || !autoSync.enabled}
+              onChange={(e) =>
+                void saveAutoSync({
+                  ...autoSync,
+                  enabled: !!autoSync.enabled,
+                  intervalHours: Number(e.target.value),
+                })
+              }
+              className="rounded-md border border-line bg-bg px-2.5 py-1.5 text-xs text-ink-soft focus:border-accent/60 focus-visible:outline-none disabled:opacity-50"
+              aria-label="Chu kỳ tự động đồng bộ giá website"
+            >
+              {MARKET_SYNC_INTERVALS.map((h) => (
+                <option key={h} value={h}>
+                  Mỗi {h} giờ
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => void syncAllMarketSources()}
+              disabled={loading || syncing != null || sources.length === 0}
+              className="inline-flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-xs font-semibold text-on-accent transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              <RefreshCw className={cn("size-3.5", syncing === "__all" && "animate-spin")} />
+              Đồng bộ tất cả
+            </button>
+          </div>
+        </div>
+
+        {sourcesOpen && (sources.length === 0 ? (
+          <div id="market-source-panel" className="rounded-md border border-dashed border-line bg-bg px-3 py-3 text-xs text-ink-faint">
+            Chưa có nguồn giá website. Nguồn seed sẽ được tạo khi extension khởi động, hoặc cấu hình thêm qua luồng nguồn dữ liệu.
+          </div>
+        ) : (
+          <div id="market-source-panel" className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+            {sources.map((source) => {
+              const urls = [
+                ...(Array.isArray(source.urls) ? source.urls.filter(Boolean) : []),
+                ...(!source.urls?.length && source.url ? [source.url] : []),
+              ];
+              const primaryUrl = urls[0] || source.url || "";
+              const progress = source.id ? syncProgress[source.id] : undefined;
+              const isSyncing = syncing === source.id || progress?.status === "started" || progress?.status === "page";
+              const last = source.lastSyncAt ? `Đồng bộ ${timeAgo(source.lastSyncAt)}` : "Chưa đồng bộ";
+              const stats = [
+                `${source.lastCount || 0} SP`,
+                source.lastPages ? `${source.lastPages} trang` : "",
+                source.lastTotal ? `total ${source.lastTotal}` : "",
+              ]
+                .filter(Boolean)
+                .join(" · ");
+              const progressText = progress
+                ? [
+                    progress.pagesFetched != null ? `${progress.pagesFetched} trang` : "",
+                    progress.fetched != null ? `${progress.fetched} SP` : "",
+                    progress.total != null ? `/${progress.total}` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")
+                : "";
+              return (
+                <article key={source.id} className="flex min-w-0 flex-col gap-2 rounded-md border border-line bg-bg p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Dot name={source.name || source.id} />
+                        <h3 className="truncate text-sm font-semibold text-ink">{source.name || source.id}</h3>
+                        {source.enabled === false && (
+                          <span className="rounded-sm bg-red-soft/30 px-1.5 py-0.5 text-[10px] font-semibold text-red">
+                            Tắt
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-1 truncate font-mono text-[11px] text-ink-faint" title={primaryUrl}>
+                        {urls.length > 1 ? `${urls.length} URL · ${primaryUrl}` : primaryUrl || "Chưa cấu hình URL"}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => void syncOne(source)}
+                        disabled={syncing != null || loading || !source.id}
+                        className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface-2 px-2 py-1 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-50"
+                      >
+                        <RefreshCw className={cn("size-3", syncing === source.id && "animate-spin")} />
+                        Đồng bộ
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void deleteSource(source)}
+                        disabled={syncing != null || loading || !source.id}
+                        className="inline-flex items-center gap-1 rounded-sm border border-line px-2 py-1 text-xs font-medium text-ink-faint transition-colors hover:border-red-soft hover:text-red disabled:opacity-50"
+                        title="Xóa nguồn giá"
+                      >
+                        <Trash2 className="size-3" />
+                        Xóa
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ink-faint">
+                    <span className="inline-flex items-center gap-1">
+                      <Clock className="size-3" />
+                      {last}
+                    </span>
+                    {stats && <span className="font-mono text-ink-soft">{stats}</span>}
+                    {progressText && (
+                      <span className={cn("font-mono", isSyncing ? "text-accent" : "text-ink-faint")}>{progressText}</span>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ))}
+      </section>
+
       {/* Toolbar */}
       <div className="flex flex-col gap-3 rounded-lg border border-line bg-surface p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -713,9 +1020,19 @@ function CatalogTab({ flash }: { flash: FlashFn }) {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Tìm sản phẩm (tên / hãng / loại)…"
-              className="w-full rounded-md border border-line bg-bg py-2 pl-9 pr-3 text-sm text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
+              placeholder="Tìm mềm: vga 3060, man hinh lg, psu 650w, sai 1 ký tự vẫn được…"
+              className="w-full rounded-md border border-line bg-bg py-2 pl-9 pr-8 text-sm text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
             />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded-sm p-1 text-ink-faint hover:bg-surface-2 hover:text-ink"
+                aria-label="Xoá tìm kiếm"
+              >
+                <X className="size-3.5" />
+              </button>
+            )}
           </div>
           <div className="flex items-center gap-1 rounded-md border border-line bg-surface-2 p-0.5">
             <button
@@ -756,13 +1073,79 @@ function CatalogTab({ flash }: { flash: FlashFn }) {
           </button>
         </div>
 
-        {mode === "compare" && products.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 border-t border-line-soft pt-3">
+          <SlidersHorizontal className="size-3.5 text-ink-faint" />
+          <select
+            value={smartCat}
+            onChange={(e) => setSmartCat(e.target.value)}
+            className="min-w-[150px] rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink focus:border-accent/60 focus-visible:outline-none"
+            aria-label="Lọc nhóm sản phẩm"
+          >
+            <option value="">Mọi nhóm ({sellableProducts.length})</option>
+            {smartCategories.map(([name, count]) => (
+              <option key={name} value={name}>{name} ({count})</option>
+            ))}
+          </select>
+          <select
+            value={smartSource}
+            onChange={(e) => setSmartSource(e.target.value)}
+            className="min-w-[150px] rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink focus:border-accent/60 focus-visible:outline-none"
+            aria-label="Lọc nguồn giá"
+          >
+            <option value="">Mọi nguồn ({smartSources.length})</option>
+            {smartSources.map(([name, count]) => (
+              <option key={name} value={name}>{name} ({count})</option>
+            ))}
+          </select>
+          <select
+            value={priceBand}
+            onChange={(e) => setPriceBand(e.target.value as typeof priceBand)}
+            className="rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink focus:border-accent/60 focus-visible:outline-none"
+            aria-label="Lọc khoảng giá"
+          >
+            <option value="all">Mọi mức giá</option>
+            <option value="budget">Dưới 3 triệu</option>
+            <option value="mid">3–10 triệu</option>
+            <option value="high">Từ 10 triệu</option>
+          </select>
+          <select
+            value={sortMode}
+            onChange={(e) => setSortMode(e.target.value as typeof sortMode)}
+            className="min-w-[150px] rounded-md border border-line bg-bg px-2 py-1.5 text-xs text-ink focus:border-accent/60 focus-visible:outline-none"
+            aria-label="Sắp xếp sản phẩm"
+          >
+            <option value="relevance">Sắp xếp liên quan</option>
+            <option value="priceAsc">Giá thấp → cao</option>
+            <option value="priceDesc">Giá cao → thấp</option>
+            <option value="spreadDesc">Chênh giá nhiều nhất</option>
+            <option value="storesDesc">Nhiều cửa hàng nhất</option>
+          </select>
+          {smartFilterActive && (
+            <button
+              type="button"
+              onClick={() => {
+                setQuery("");
+                setSmartCat("");
+                setSmartSource("");
+                setPriceBand("all");
+                setSortMode("relevance");
+              }}
+              className="inline-flex items-center gap-1 rounded-md border border-line px-2.5 py-1.5 text-xs font-medium text-ink-faint hover:border-accent/50 hover:text-ink"
+            >
+              <X className="size-3.5" />
+              Bỏ lọc
+            </button>
+          )}
+        </div>
+
+        {products.length > 0 && (
           <p className="text-xs leading-relaxed text-ink-faint">
-            Tổng {products.length} SP từ {breakdown.length} nguồn (
-            {breakdown.map(([n, c]) => `${n}: ${c}`).join(" · ")}). Gom thành{" "}
-            {clusters.length} sản phẩm, {multi.length} có ở từ 2 cửa hàng trở lên
-            (đang hiển thị). {single} sản phẩm chỉ có 1 cửa hàng được ẩn — xem chế
-            độ "Danh sách" để thấy tất cả.
+            Đang lọc {products.length}/{sellableProducts.length} SP bằng tìm kiếm mềm và sắp xếp theo {sortMode === "priceAsc" ? "giá thấp → cao" : sortMode === "priceDesc" ? "giá cao → thấp" : sortMode === "spreadDesc" ? "chênh giá nhiều nhất" : sortMode === "storesDesc" ? "nhiều cửa hàng nhất" : "độ liên quan"}: bỏ dấu, sai thứ tự từ,
+            hiểu từ đồng nghĩa như VGA/GPU/card, main/mainboard, màn hình/monitor. {mode === "compare" ? (
+              <>Gom thành {clusters.length} sản phẩm, {multi.length} có ở từ 2 cửa hàng trở lên. {single} sản phẩm chỉ có 1 cửa hàng được ẩn — xem chế độ "Danh sách" để thấy tất cả.</>
+            ) : (
+              <>Hiển thị dạng danh sách đầy đủ theo bộ lọc hiện tại.</>
+            )}
           </p>
         )}
       </div>
@@ -1391,6 +1774,7 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
   const [query, setQuery] = useState("");
   const [cat, setCat] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -1434,6 +1818,17 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
     } finally {
       setExcelImporting(false);
     }
+  }
+
+  async function clearAllMyStore() {
+    const ok = await bg<BgResponse>("CLEAR_PRODUCTS", { source: "mystore" });
+    setConfirmClearAll(false);
+    if (!ok || !ok.ok) {
+      flash("err", ok?.error || "Không xoá được dữ liệu kho của tôi.", 5000);
+      return;
+    }
+    flash("ok", `Đã xoá ${ok.deleted || 0} sản phẩm khỏi kho của tôi.`);
+    await load();
   }
 
   const groups = useMemo(() => productGroupOptions(all), [all]);
@@ -1513,15 +1908,49 @@ function MyStoreTab({ flash }: { flash: FlashFn }) {
               className="w-full rounded-md border border-line bg-bg py-2 pl-9 pr-3 text-sm text-ink placeholder:text-ink-faint focus:border-accent/60 focus-visible:outline-none"
             />
           </div>
-          <button
-            type="button"
-            onClick={() => void load()}
-            disabled={loading}
-            className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-3 py-2 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-60"
-          >
-            <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
-            Làm mới
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            {confirmClearAll ? (
+              <div className="flex items-center gap-2 rounded-md border border-red-soft bg-red-soft/20 px-3 py-2">
+                <span className="text-xs font-medium text-red">
+                  Xoá toàn bộ dữ liệu kho của tôi?
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setConfirmClearAll(false)}
+                  className="inline-flex items-center gap-1 rounded-sm border border-line bg-surface px-2.5 py-1 text-xs font-medium text-ink-soft hover:text-ink"
+                >
+                  <X className="size-3.5" />
+                  Hủy
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void clearAllMyStore()}
+                  className="inline-flex items-center gap-1 rounded-sm bg-red px-2.5 py-1 text-xs font-semibold text-on-accent hover:opacity-90"
+                >
+                  <Trash2 className="size-3.5" />
+                  Xóa hết
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmClearAll(true)}
+                className="inline-flex items-center gap-1.5 rounded-md border border-red-soft bg-red-soft/10 px-3 py-2 text-xs font-medium text-red transition-colors hover:bg-red-soft/15"
+              >
+                <Trash2 className="size-3.5" />
+                Xóa data kho
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void load()}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-3 py-2 text-xs font-medium text-ink-soft transition-colors hover:border-accent/50 hover:text-ink disabled:opacity-60"
+            >
+              <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+              Làm mới
+            </button>
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2 border-t border-line-soft pt-3">

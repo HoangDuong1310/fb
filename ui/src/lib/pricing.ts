@@ -49,8 +49,12 @@ export interface Source {
   id: string;
   name?: string;
   url?: string;
+  urls?: string[];
+  enabled?: boolean;
   lastSyncAt?: number;
   lastCount?: number;
+  lastTotal?: number;
+  lastPages?: number;
 }
 
 export interface ProductGroup {
@@ -131,6 +135,34 @@ export function searchNorm(s?: string | null): string {
 export function queryTokens(query?: string | null): string[] {
   const q = searchNorm(query);
   return q ? q.split(" ").filter(Boolean) : [];
+}
+
+function compactSearch(s?: string | null): string {
+  return searchNorm(s).replace(/[^a-z0-9]+/g, "");
+}
+
+function levenshteinWithinOne(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      i += 1;
+      j += 1;
+      continue;
+    }
+    edits += 1;
+    if (edits > 1) return false;
+    if (a.length > b.length) i += 1;
+    else if (b.length > a.length) j += 1;
+    else {
+      i += 1;
+      j += 1;
+    }
+  }
+  return edits + (a.length - i) + (b.length - j) <= 1;
 }
 
 // A row matches when EVERY token appears somewhere in its searchable text.
@@ -233,6 +265,34 @@ export const COND_LABEL: Record<string, string> = {
 
 /* ================= SẢN PHẨM (store product compare) ============= */
 
+const PRODUCT_QUERY_ALIASES: Record<string, string[]> = {
+  amd: ["ryzen"],
+  build: ["pc"],
+  card: ["vga", "gpu", "do hoa"],
+  cpu: ["chip", "processor", "core", "ryzen"],
+  gpu: ["vga", "card", "do hoa"],
+  hdd: ["o cung"],
+  lcd: ["man hinh", "monitor"],
+  main: ["mainboard", "bo mach", "motherboard"],
+  mainboard: ["main", "bo mach", "motherboard"],
+  monitor: ["man hinh", "lcd"],
+  nguon: ["psu", "power"],
+  nvme: ["ssd", "m2", "m 2"],
+  psu: ["nguon", "power"],
+  ssd: ["nvme", "m2", "m 2", "o cung"],
+  tan: ["tan nhiet", "cooler"],
+  vga: ["gpu", "card", "do hoa"],
+};
+
+const PRODUCT_PHRASE_ALIASES: Array<[string, string[]]> = [
+  ["card do hoa", ["vga", "gpu", "card man hinh"]],
+  ["card man hinh", ["vga", "gpu", "card do hoa"]],
+  ["bo mach chu", ["mainboard", "main"]],
+  ["man hinh", ["monitor", "lcd"]],
+  ["o cung", ["ssd", "hdd", "nvme"]],
+  ["tan nhiet", ["cooler", "fan"]],
+];
+
 // Merge synonymous category names into a single canonical label so filtering/
 // display doesn't fragment. Unknown names are kept as-is.
 export function canonCat(c?: string): string {
@@ -260,6 +320,68 @@ export function isSellable(p?: Product): boolean {
   if (p && p.inStock === false) return false;
   const price = Number(p && p.price);
   return Number.isFinite(price) && price > 0;
+}
+
+function productSearchFields(p: Product): string[] {
+  return [
+    p.name,
+    p.category,
+    canonCat(p.category),
+    p.brand,
+    p.source,
+    p.sourceName,
+    p.sku,
+    p.barcode,
+    p.warranty,
+    p.condition,
+    p.itemType,
+    p.businessStatus,
+    p.description,
+    p.price == null ? "" : String(p.price),
+    p.buildPrice == null ? "" : String(p.buildPrice),
+  ].filter(Boolean).map(String);
+}
+
+export function productSearchHaystack(p: Product): string {
+  const base = productSearchFields(p).join(" ");
+  const norm = searchNorm(base);
+  const canonical = [canonCat(p.category), ...productSignature(p.name)].join(" ");
+  return searchNorm(`${norm} ${canonical}`);
+}
+
+function productQueryVariants(token: string, allTokens: string[], queryNorm: string): string[] {
+  const out = new Set<string>([token]);
+  const compactToken = compactSearch(token);
+  if (compactToken) out.add(compactToken);
+  for (const alias of PRODUCT_QUERY_ALIASES[token] || []) out.add(searchNorm(alias));
+  for (const [phrase, aliases] of PRODUCT_PHRASE_ALIASES) {
+    if (queryNorm.includes(phrase)) aliases.forEach((alias) => out.add(searchNorm(alias)));
+  }
+  if (token === "m" && allTokens.includes("2")) out.add("m2");
+  if (token === "16" && allTokens.includes("gb")) out.add("16gb");
+  if (token === "32" && allTokens.includes("gb")) out.add("32gb");
+  return [...out].filter(Boolean);
+}
+
+function tokenMatchesProductHaystack(token: string, variants: string[], hay: string): boolean {
+  if (variants.some((v) => hay.includes(v))) return true;
+  const hayCompact = compactSearch(hay);
+  if (variants.some((v) => hayCompact.includes(compactSearch(v)))) return true;
+  if (token.length < 4) return false;
+  const words = hay.split(/\s+/).filter((w) => w.length >= 4);
+  return words.some((w) => levenshteinWithinOne(token, w));
+}
+
+export function productMatchesSmartQuery(p: Product, query?: string | null): boolean {
+  const tokens = queryTokens(query);
+  if (!tokens.length) return true;
+  const queryNorm = searchNorm(query);
+  const hay = productSearchHaystack(p);
+  return tokens.every((token) => {
+    if (token.length <= 1) return true;
+    const variants = productQueryVariants(token, tokens, queryNorm);
+    return tokenMatchesProductHaystack(token, variants, hay);
+  });
 }
 
 // Build an absolute URL for the "View" link. Legacy records may store relative
