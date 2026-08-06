@@ -206,6 +206,12 @@ async function dispatchCommand(cmd) {
       // phân biệt được lệnh từ server với lịch tự động / bấm tay / hàng loạt.
       options.trigger = "remote";
       options.method = method;
+      // ĐỢI tab cào xong (awaitDone) rồi mới báo về server. Lệnh này được gọi từ
+      // alarm/WebSocket chứ KHÔNG qua kênh chrome.runtime.sendMessage nên giữ
+      // promise mở vài phút là an toàn. Không đợi thì reportResult("completed")
+      // bắn về ngay khi tab vừa mở: dashboard báo lệnh xong trong lúc nhóm còn
+      // chưa cào được bài nào, và kết quả kèm theo luôn là newCount = 0.
+      options.awaitDone = true;
       const res =
         method === "dom"
           ? await crawlGroupInTab(payload.groupId, options)

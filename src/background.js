@@ -63,6 +63,7 @@ import {
   removeCrawlTab,
   getCrawlBlockState,
   noteCrawlDoneReason,
+  settleCrawlTab,
   runJob,
   executeDeletePost,
   scanInbox,
@@ -1543,6 +1544,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, closed: false });
         return true;
       }
+      // ĐÁNH THỨC người đang đợi tab này cào xong (crawlGroupInTab /
+      // crawlGroupApiInTab). Phải gọi TRƯỚC khi đóng tab: chỉ khi lượt chờ được
+      // giải phóng thì vòng lặp auto-crawl mới đi tiếp sang nhóm sau, thay vì
+      // mở chồng lên tab đang chạy.
+      try {
+        settleCrawlTab(tabId, msg && msg.result);
+      } catch (e) {}
       // removeCrawlTab trả true nếu tabId đúng là tab do background tự mở.
       // Đọc từ chrome.storage.session nên vẫn đúng dù SW vừa khởi động lại.
       removeCrawlTab(tabId)

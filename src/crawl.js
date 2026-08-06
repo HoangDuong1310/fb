@@ -12,7 +12,7 @@ import {
   fetchWithTimeout,
 } from "./util.js";
 import { syncAllSources } from "./prices.js";
-import { extractPostsFromChunks, hashStr } from "./gql-parse.js";
+import { extractPostsFromChunks, hashStr, isGroupFeedRequest } from "./gql-parse.js";
 import { API_BASE_URL } from "./config.js";
 import { assertFbMatch, MATCH_MISMATCH, MATCH_FB_ABSENT } from "./fb-identity.js";
 import { recordTelemetry } from "./client-telemetry.js";
@@ -327,9 +327,122 @@ async function stopCrawlInActiveTab() {
   }
 }
 
+/* ------------- CHỜ TAB CRAWL BÁO XONG (CRAWL_DONE) ---------------------- */
+//
+// VÌ SAO CẦN: hai hàm mở-tab bên dưới (crawlGroupInTab / crawlGroupApiInTab) chỉ
+// GỬI lệnh START_CRAWL rồi trả về. Phía content.js, handler START_CRAWL gọi
+// runCrawl() KHÔNG await rồi sendResponse ngay (xem content.js) — đúng thiết kế,
+// vì kênh message của Chrome không giữ nổi một tác vụ dài hàng phút.
+//
+// Hệ quả nếu người gọi coi giá trị trả về là "đã crawl xong": hàm resolve chỉ
+// vài giây sau khi mở tab, trong khi tab đó còn cào tiếp 1–5 phút. Vòng lặp
+// auto-crawl (processAutoCrawl) vì thế tưởng nhóm đã xong, ngủ jitter 20–90s rồi
+// MỞ TIẾP nhóm sau — chồng lên tab trước vẫn đang chạy. Đó chính là lý do quan
+// sát được "2 nhóm ghi bài trong cùng một giây dù threads = 1", và cũng là vì sao
+// crawl hàng loạt hay hụt bài: nhiều tab foreground cùng sống thì cướp focus của
+// nhau, tab mất focus bị Chrome đóng băng lazy-load nên ngừng cào giữa chừng.
+//
+// CÁCH SỬA: đăng ký một chờ-đợi theo tabId TRƯỚC khi gửi lệnh, rồi await nó.
+// Message CRAWL_DONE do content.js gửi được background.js chuyển tiếp vào đây
+// qua settleCrawlTab(). Có TIMEOUT để một tab treo không giữ vòng lặp mãi mãi.
+
+// tabId -> { resolve, timer }. Chỉ sống trong RAM: nếu service worker bị kill
+// giữa chừng thì cả vòng lặp auto-crawl lẫn map này cùng biến mất, nên không có
+// chờ-đợi mồ côi. Tab rác trong tình huống đó do sweepOrphanCrawlTabs dọn.
+const _crawlDoneWaiters = new Map();
+
+/**
+ * Đăng ký chờ CRAWL_DONE của một tab. Gọi TRƯỚC khi gửi START_CRAWL để không lỡ
+ * message của tab cào rất nhanh (feed rỗng xong gần như tức thì).
+ *
+ * `onHeartbeat` (tuỳ chọn) được gọi định kỳ trong lúc chờ. Cần thiết vì một lượt
+ * cào có thể dài hơn FOREGROUND_LOCK_TTL_MS (5 phút): không gia hạn thì lock bị
+ * coi là rác và một scheduler khác chiếm mất giữa chừng.
+ *
+ * @param {number} tabId
+ * @param {number} timeoutMs Quá hạn coi như tab treo, resolve với timedOut:true.
+ * @param {() => any} [onHeartbeat]
+ * @returns {Promise<{result: any, timedOut: boolean}>}
+ */
+function waitForCrawlDone(tabId, timeoutMs, onHeartbeat) {
+  return new Promise((resolve) => {
+    let beat = null;
+    const settle = (payload) => {
+      const entry = _crawlDoneWaiters.get(tabId);
+      if (entry) {
+        clearTimeout(entry.timer);
+        _crawlDoneWaiters.delete(tabId);
+      }
+      if (beat) clearInterval(beat);
+      resolve(payload);
+    };
+    const timer = setTimeout(() => settle({ result: null, timedOut: true }), timeoutMs);
+    if (typeof onHeartbeat === "function") {
+      beat = setInterval(() => {
+        try {
+          onHeartbeat();
+        } catch (e) {}
+      }, CRAWL_WAIT_HEARTBEAT_MS);
+    }
+    // Một tabId chỉ có thể có MỘT chờ-đợi; lượt cũ (nếu có) được giải phóng để
+    // không rò rỉ promise treo.
+    const prev = _crawlDoneWaiters.get(tabId);
+    if (prev) {
+      clearTimeout(prev.timer);
+      prev.resolve({ result: null, timedOut: true });
+    }
+    _crawlDoneWaiters.set(tabId, { resolve: settle, timer });
+  });
+}
+
+/**
+ * Đánh thức chờ-đợi của một tab khi CRAWL_DONE về. background.js gọi hàm này
+ * trong handler CRAWL_DONE. Trả true nếu thực sự có ai đang đợi tab đó.
+ */
+function settleCrawlTab(tabId, result) {
+  const entry = _crawlDoneWaiters.get(tabId);
+  if (!entry) return false;
+  entry.resolve({ result: result || null, timedOut: false });
+  return true;
+}
+
+/**
+ * Huỷ chờ-đợi của một tab (gửi lệnh thất bại => CRAWL_DONE sẽ không bao giờ tới).
+ * Không gọi hàm này thì promise chờ treo tới hết CRAWL_DONE_TIMEOUT_MS.
+ */
+function cancelCrawlWait(tabId) {
+  const entry = _crawlDoneWaiters.get(tabId);
+  if (!entry) return;
+  entry.resolve({ result: null, timedOut: true });
+}
+
+// Trần thời gian chờ một tab crawl báo xong. Phải LỚN HƠN thời gian cào thực tế
+// của một nhóm rất nhiều bài (cuộn DOM chậm hơn API), nhưng đủ nhỏ để một tab
+// treo không chặn cả chu kỳ auto-crawl. Quá hạn thì vòng lặp đi tiếp và
+// sweepOrphanCrawlTabs sẽ đóng tab rác theo CRAWL_TAB_MAX_AGE_MS.
+const CRAWL_DONE_TIMEOUT_MS = 6 * 60 * 1000;
+
+// Nhịp gia hạn lock trong lúc chờ tab cào xong. Phải NHỎ HƠN HẲN
+// FOREGROUND_LOCK_TTL_MS (5 phút) để lock không bao giờ chạm hạn giữa hai nhịp.
+const CRAWL_WAIT_HEARTBEAT_MS = 45 * 1000;
+
 /* ---------------------------- CRAWL THEO NHÓM --------------------------- */
 
-/** Mở tab nhóm rồi khởi động crawl trong tab đó (tiến độ phát qua broadcast). */
+/**
+ * Mở tab nhóm rồi khởi động crawl trong tab đó (tiến độ phát qua broadcast).
+ *
+ * `options.awaitDone` (mặc định FALSE) quyết định hàm có ĐỢI tab cào xong không:
+ *
+ *  - FALSE (mặc định — dùng cho lệnh từ UI/popup): trả về ngay sau khi gửi lệnh,
+ *    giữ nguyên hành vi cũ. BẮT BUỘC với đường đi từ dashboard, vì lời gọi đó
+ *    nằm trên một kênh chrome.runtime.sendMessage: giữ kênh mở hàng phút sẽ
+ *    chạm "message port closed", và lớp bg() của UI coi đó là lỗi tạm thời rồi
+ *    GỬI LẠI lệnh — tức là crawl lại nhóm đó lần nữa. UI tự theo dõi tiến độ qua
+ *    broadcast CRAWL_PROGRESS/CRAWL_DONE nên không cần giá trị trả về.
+ *
+ *  - TRUE (auto-crawl nền gọi trực tiếp, không qua kênh message): đợi đúng tab
+ *    này gửi CRAWL_DONE. Xem waitForCrawlDone để hiểu vì sao cần.
+ */
 async function crawlGroupInTab(groupId, options) {
   if (!groupId) return { ok: false, error: "Thiếu groupId." };
   await recordCrawlTrigger("groupInTab", groupId, options);
@@ -350,15 +463,34 @@ async function crawlGroupInTab(groupId, options) {
     });
   } catch (e) {}
   try {
+    // Chỉ đăng ký chờ khi caller yêu cầu (auto-crawl nền). Đăng ký TRƯỚC khi gửi
+    // lệnh vì nhóm ít bài mới có thể cào xong và bắn CRAWL_DONE gần như tức thì.
+    const awaitDone = !!(options && options.awaitDone);
+    const done = awaitDone
+      ? waitForCrawlDone(tab.id, CRAWL_DONE_TIMEOUT_MS, options && options.onWaitHeartbeat)
+      : null;
     const res = await chrome.tabs.sendMessage(tab.id, {
       type: "START_CRAWL",
       options: options || {},
     });
-    return { ok: true, tabId: tab.id, started: !!(res && res.ok) };
+    if (!done) return { ok: true, tabId: tab.id, started: !!(res && res.ok) };
+    // ĐỢI TAB CÀO XONG THẬT SỰ. content.js trả lời sendMessage ngay lập tức
+    // ({started:true}) rồi mới chạy runCrawl, nên nếu trả về ở đây thì người gọi
+    // (auto-crawl) sẽ mở tiếp nhóm sau chồng lên tab này.
+    const { result, timedOut } = await done;
+    return {
+      ok: true,
+      tabId: tab.id,
+      started: !!(res && res.ok),
+      timedOut,
+      newCount: (result && result.newCount) || 0,
+      reason: (result && result.reason) || (timedOut ? "Tab crawl không báo xong (quá hạn chờ)." : ""),
+    };
   } catch (e) {
     // Gửi START_CRAWL lỗi => content.js sẽ KHÔNG BAO GIỜ gửi CRAWL_DONE, tức
     // không còn ai đóng tab handoff này. Tự đóng + gỡ khỏi registry ngay để
     // không bỏ lại tab rác (đúng lỗi "xong việc mà không đóng tab").
+    cancelCrawlWait(tab.id);
     try { await removeCrawlTab(tab.id); } catch (_) {}
     try { await chrome.tabs.remove(tab.id); } catch (_) {}
     return {
@@ -501,14 +633,37 @@ async function crawlGroupApiInTab(groupId, options, active = true) {
     });
   } catch (e) {}
   try {
+    // Chỉ đăng ký chờ khi caller yêu cầu (xem awaitDone ở crawlGroupInTab).
+    const awaitDone = !!(options && options.awaitDone);
+    const done = awaitDone
+      ? waitForCrawlDone(tab.id, CRAWL_DONE_TIMEOUT_MS, options && options.onWaitHeartbeat)
+      : null;
     const res = await chrome.tabs.sendMessage(tab.id, {
       type: "START_API_CRAWL",
       options: options || {},
     });
-    return { ok: true, tabId: tab.id, started: !!(res && res.ok), mode: "api" };
+    if (!done) {
+      return { ok: true, tabId: tab.id, started: !!(res && res.ok), mode: "api" };
+    }
+    // ĐỢI TAB CÀO XONG THẬT SỰ — xem chú thích cùng chỗ trong crawlGroupInTab.
+    // Với nhánh API điều này còn quan trọng hơn: pha bắt khuôn GraphQL cần tab
+    // FOREGROUND, mà focus là tài nguyên singleton. Trả về sớm khiến nhóm sau mở
+    // tab foreground cướp focus của tab này, và tab mất focus bị Chrome đóng băng
+    // lazy-load nên ngừng cào giữa chừng.
+    const { result, timedOut } = await done;
+    return {
+      ok: true,
+      tabId: tab.id,
+      started: !!(res && res.ok),
+      mode: "api",
+      timedOut,
+      newCount: (result && result.newCount) || 0,
+      reason: (result && result.reason) || (timedOut ? "Tab crawl API không báo xong (quá hạn chờ)." : ""),
+    };
   } catch (e) {
     // Gửi START_API_CRAWL lỗi => không có CRAWL_DONE về sau, tab handoff này sẽ
     // không ai đóng. Tự đóng + gỡ registry để không bỏ lại tab rác.
+    cancelCrawlWait(tab.id);
     try { await removeCrawlTab(tab.id); } catch (_) {}
     try { await chrome.tabs.remove(tab.id); } catch (_) {}
     return {
@@ -582,13 +737,50 @@ async function crawlGroupApiSmart(groupId, options) {
 
 /* ----------------------- CRAWL KHÔNG-TAB (Mức B) ------------------------- */
 
+/**
+ * Khuôn GQL đã lưu có phải khuôn FEED NHÓM thật không?
+ *
+ * VÌ SAO CẦN KIỂM TRA LẠI LÚC ĐỌC: trước khi isGroupFeedRequest được siết
+ * (xem gql-parse.js), hook nhận nhầm gói bình luận / gói xem-một-bài là feed
+ * nhóm và GHI ĐÈ khuôn vào chrome.storage.local. Khuôn hỏng đó nằm lại vĩnh
+ * viễn — bản sửa ở gql-parse chỉ chặn việc ghi đè MỚI, không dọn cái đã lưu.
+ * Máy nào từng dính sẽ tiếp tục replay bằng doc_id sai và cào về rác cho tới khi
+ * bắt được khuôn mới. Vì vậy đọc tới đâu thẩm định tới đó: khuôn không đạt bị
+ * coi như KHÔNG CÓ, buộc bắt lại khuôn sạch một lần rồi mọi thứ trở lại bình
+ * thường.
+ */
+function isUsableGqlTemplate(tpl) {
+  if (!tpl || !tpl.doc_id || !tpl.raw) return false;
+  // Dùng chính bộ lọc đã siết để thẩm định — một nguồn sự thật duy nhất.
+  return isGroupFeedRequest(tpl.friendly, tpl.variables);
+}
+
 /** Đọc khuôn GQL đã được content.js lưu vào chrome.storage.local. */
 function getStoredGqlTemplate() {
   return new Promise((resolve) => {
     try {
-      chrome.storage.local.get("fbcGqlTemplate", (o) =>
-        resolve((o && o.fbcGqlTemplate) || null)
-      );
+      chrome.storage.local.get("fbcGqlTemplate", (o) => {
+        const tpl = (o && o.fbcGqlTemplate) || null;
+        if (tpl && !isUsableGqlTemplate(tpl)) {
+          // Khuôn rác từ bản cũ: xoá hẳn để lần crawl tới bắt lại khuôn sạch,
+          // thay vì âm thầm replay sai và đổ bài rác vào kho.
+          try {
+            console.warn(
+              "[FBC] Khuôn GQL đã lưu KHÔNG phải feed nhóm (friendly=" +
+                String(tpl.friendly || "") +
+                ") — xoá để bắt lại khuôn sạch."
+            );
+          } catch (_) {}
+          try {
+            chrome.storage.local.remove("fbcGqlTemplate", () => {
+              void chrome.runtime.lastError;
+            });
+          } catch (_) {}
+          resolve(null);
+          return;
+        }
+        resolve(tpl);
+      });
     } catch (e) {
       resolve(null);
     }
@@ -733,6 +925,15 @@ async function crawlGroupApiTabless(groupId, options) {
   const apiReport = (extra = {}) =>
     broadcast("CRAWL_PROGRESS", { progress: { groupId, mode: "api", ...extra } });
 
+  // KHAI BÁO NGOÀI try để khối catch đọc được. Nằm trong try thì catch buộc phải
+  // báo `newCount: 0` dù đã cào được hàng chục bài, và không thể lưu phần batch
+  // còn dư — bài đã bóc tách xong nhưng chưa kịp gửi bị mất trắng mỗi khi có lỗi
+  // giữa chừng (mạng chớp, FB đổi hình dạng response).
+  const seenThisRun = new Set();
+  let newCount = 0;
+  let pages = 0;
+  let batch = [];
+
   try {
     // Làm mới token từ HTML nhóm (cookie phiên tự đính theo host_permissions).
     let fb_dtsg = tpl.fb_dtsg || "";
@@ -756,10 +957,6 @@ async function crawlGroupApiTabless(groupId, options) {
     const known = new Set(await DB.getKnownIds(groupId, KNOWN_IDS_LIMIT));
     apiReport({ status: "started", newCount: 0, pages: 0 });
 
-    const seenThisRun = new Set();
-    let newCount = 0;
-    let pages = 0;
-    let batch = [];
     // Bộ đếm cho DỪNG SỚM (cào TĂNG DẦN, đồng bộ ngữ nghĩa với runApiCrawl/DOM
     // crawl). Feed sắp xếp MỚI→CŨ nên khi gặp nhiều bài ĐÃ-BIẾT hoặc CŨ-hơn-mốc
     // LIÊN TIẾP nghĩa là đã chạm phần cào lần trước / ngoài khoảng ngày => dừng,
@@ -982,10 +1179,22 @@ async function crawlGroupApiTabless(groupId, options) {
     broadcast("CRAWL_DONE", { result: { newCount, reason, diag: lastDiag } });
     return { ok: true, newCount, reason, mode: "api-tabless", diag: lastDiag };
   } catch (err) {
+    // LƯU phần bài đã bóc tách nhưng chưa kịp gửi, và báo ĐÚNG số bài (trước
+    // đây cứng 0) để UI phân biệt "lỗi mà chẳng cào được gì" với "lỗi ở cuối,
+    // dữ liệu đã có".
+    if (batch.length > 0) {
+      const toSave = batch;
+      batch = [];
+      try {
+        await DB.savePosts(toSave);
+      } catch (e) {
+        // Lưu hụt ở đường xử lý lỗi thì đành chịu — cào lại lần sau.
+      }
+    }
     broadcast("CRAWL_DONE", {
-      result: { newCount: 0, reason: "Lỗi API không-tab: " + String(err) },
+      result: { newCount, reason: "Lỗi API không-tab: " + String(err) },
     });
-    return { ok: false, error: String(err) };
+    return { ok: false, error: String(err), newCount };
   } finally {
     // Luôn gỡ rule DNR sau khi crawl xong (kể cả khi lỗi) để không sót rule.
     await removeFbGqlHeaderRule();
@@ -3170,12 +3379,12 @@ async function processAutoCrawl() {
         const g = order[idx];
         const gid = g && (g.groupId || g.id);
         if (!gid) continue;
-        // Nhánh in-tab (API cần capture template) resolve gần NGAY khi mở tab —
-        // block thật (nếu có) chỉ lộ ra SAU, qua message CRAWL_DONE mà
-        // background.js relay vào setCrawlBlock(). Vì vậy kiểm tra lại trạng
-        // thái ngắt mạch SAU MỖI nhóm (không chỉ dựa vào giá trị trả về của
-        // crawlFn) để dừng cả chu kỳ ngay khi phát hiện block, kể cả khi nó tới
-        // từ nhóm trước đó qua đường bất đồng bộ.
+        // Nhánh in-tab bàn giao việc cào cho content script trong tab vừa mở.
+        // crawlFn nay ĐỢI tab đó gửi CRAWL_DONE (xem waitForCrawlDone) nên khi
+        // nó trả về thì nhóm đã cào xong thật — không còn cảnh mở chồng nhóm sau
+        // lên tab trước đang chạy. Vẫn kiểm tra lại trạng thái ngắt mạch SAU MỖI
+        // nhóm vì block có thể tới từ nhóm trước qua đường bất đồng bộ
+        // (background.js relay reason của CRAWL_DONE vào setCrawlBlock).
         const blk = await getCrawlBlockState();
         if (blk.blocked) break;
         // HEARTBEAT trước mỗi nhóm: (a) gia hạn lock để chu kỳ dài không bị coi
@@ -3183,7 +3392,19 @@ async function processAutoCrawl() {
         // DỪNG ngay — đúng chỗ ngăn 2 nhóm cùng chạy sau khi SW restart.
         if (!(await touchForegroundLock(token))) break;
         try {
-          await crawlFn(gid, opts);
+          // awaitDone: ĐỢI tab cào xong rồi mới sang nhóm sau. Chỉ bật ở đây —
+          // lệnh crawl từ dashboard đi qua kênh chrome.runtime.sendMessage nên
+          // không được giữ kênh mở hàng phút (xem chú thích ở crawlGroupInTab).
+          //
+          // onWaitHeartbeat: gia hạn lock ĐỊNH KỲ trong lúc đợi. Một nhóm nhiều
+          // bài có thể mất vài phút — dài hơn TTL 5 phút của lock nếu chỉ gia hạn
+          // ở đầu mỗi nhóm, và lock hết hạn giữa chừng sẽ bị scheduler khác
+          // (warming / reply-watch) chiếm mất.
+          await crawlFn(gid, {
+            ...opts,
+            awaitDone: true,
+            onWaitHeartbeat: () => touchForegroundLock(token),
+          });
         } catch (e) {
           // bỏ qua nhóm lỗi, tiếp tục nhóm sau
         }
@@ -6270,6 +6491,12 @@ export {
   stopCrawlInActiveTab,
   crawlGroupInTab,
   crawlGroupApiInTab,
+  // Chờ tab crawl báo xong: background.js gọi settleCrawlTab() trong handler
+  // CRAWL_DONE để đánh thức crawlGroupInTab/crawlGroupApiInTab đang đợi.
+  settleCrawlTab,
+  waitForCrawlDone,
+  cancelCrawlWait,
+  CRAWL_DONE_TIMEOUT_MS,
   crawlGroupApiTabless,
   crawlGroupApiSmart,
   scanJoinedGroups,

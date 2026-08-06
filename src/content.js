@@ -945,17 +945,34 @@
 
     const groupInfo = getGroupInfo();
 
-    // Lấy tập ID đã biết để lọc bài mới. Chỉ tải cửa sổ ID gần nhất
-    // (KNOWN_IDS_LIMIT) thay vì toàn bộ kho bài: crawl tăng tiến dừng sau vài
-    // bài đã-biết liên tiếp nên chỉ cần nhận ra phần đầu feed.
-    const knownRes = await send("GET_KNOWN_IDS", {
-      groupId: groupInfo.groupId,
-      limit: KNOWN_IDS_LIMIT,
-    });
-    const known = new Set((knownRes && knownRes.ok && knownRes.ids) || []);
+    // PHẢI bọc try: hai lời gọi dưới đây đi qua service worker (chrome.runtime
+    // .sendMessage). Nếu SW vừa bị kill, backend trả lỗi, hoặc kênh message đứt
+    // thì chúng NÉM — mà lúc này ta đã đặt state.running = true và CHƯA vào khối
+    // try chính. Hệ quả cũ: cờ running kẹt true vĩnh viễn (mọi lệnh crawl sau
+    // trong tab này bị từ chối "Đang chạy crawl rồi"), và CRAWL_DONE không bao
+    // giờ được gửi nên background đợi hết timeout rồi mới đi tiếp, tab thì nằm
+    // lại tới lượt quét tab mồ côi.
+    let known;
+    let selectors;
+    try {
+      // Lấy tập ID đã biết để lọc bài mới. Chỉ tải cửa sổ ID gần nhất
+      // (KNOWN_IDS_LIMIT) thay vì toàn bộ kho bài: crawl tăng tiến dừng sau vài
+      // bài đã-biết liên tiếp nên chỉ cần nhận ra phần đầu feed.
+      const knownRes = await send("GET_KNOWN_IDS", {
+        groupId: groupInfo.groupId,
+        limit: KNOWN_IDS_LIMIT,
+      });
+      known = new Set((knownRes && knownRes.ok && knownRes.ids) || []);
 
-    // Nạp bộ selector AI một lần cho cả phiên (nếu đã khám phá trước đó).
-    const selectors = await loadSelectors();
+      // Nạp bộ selector AI một lần cho cả phiên (nếu đã khám phá trước đó).
+      selectors = await loadSelectors();
+    } catch (err) {
+      state.running = false;
+      send("CRAWL_DONE", {
+        result: { newCount: 0, reason: "Lỗi chuẩn bị crawl: " + String(err) },
+      });
+      return { ok: false, error: String(err), newCount: 0 };
+    }
 
     const seenThisRun = new Set();
     let newCount = 0;
@@ -1432,6 +1449,16 @@
       send("CRAWL_PROGRESS", { progress });
     };
 
+    // KHAI BÁO NGOÀI try để khối catch đọc được. Trước đây chúng nằm TRONG try
+    // nên catch buộc phải báo `newCount: 0` dù đã cào được hàng chục bài, và
+    // KHÔNG thể flush phần batch còn dư — số bài đã bóc tách xong nhưng chưa kịp
+    // gửi đi bị mất trắng mỗi khi có lỗi giữa chừng (mạng chớp, FB đổi response).
+    // Giữ ngoài try thì lỗi vẫn báo đúng số bài và vẫn lưu được phần dư.
+    const seenThisRun = new Set();
+    let newCount = 0;
+    let pages = 0;
+    let batch = [];
+
     try {
       const mod = await loadGqlModule();
 
@@ -1491,48 +1518,65 @@
             }
           });
           if (stored && stored.doc_id && stored.raw) {
-            // Làm mới fb_dtsg/lsd từ HTML trang hiện tại (regex giống
-            // crawl.js extractTokensFromHtml). DOM có sẵn dù tab nền.
-            let freshDtsg = stored.fb_dtsg;
-            let freshLsd = stored.lsd;
-            try {
-              const html = document.documentElement
-                ? document.documentElement.outerHTML
-                : "";
-              const dtsg =
-                html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/) ||
-                html.match(/name="fb_dtsg"\s+value="([^"]+)"/) ||
-                html.match(/"dtsg":\{"token":"([^"]+)"/);
-              if (dtsg && dtsg[1]) freshDtsg = dtsg[1];
-              const lsd =
-                html.match(/"LSD",\[\],\{"token":"([^"]+)"/) ||
-                html.match(/"lsd":\{"token":"([^"]+)"/);
-              if (lsd && lsd[1]) freshLsd = lsd[1];
-            } catch (_) {}
+            // THẨM ĐỊNH khuôn trước khi dùng. Bản cũ của isGroupFeedRequest nhận
+            // nhầm gói bình luận / gói xem-một-bài là feed nhóm rồi GHI ĐÈ khuôn
+            // vào storage. Khuôn hỏng đó nằm lại vĩnh viễn: replay bằng doc_id
+            // sai trả về cây comment, và bộ bóc tách biến các node trong đó thành
+            // bài "fp:" không permalink — đúng đống rác quan sát được khi người
+            // dùng lướt Facebook ở tab khác lúc tab crawl đang chạy. Khuôn không
+            // đạt bị coi như KHÔNG CÓ để nhánh (c) bắt lại khuôn sạch.
+            if (!mod.isGroupFeedRequest(stored.friendly, stored.variables)) {
+              dlog(
+                `[API] BỎ khuôn đã lưu vì không phải feed nhóm` +
+                  ` (friendly=${stored.friendly || "?"}) — sẽ bắt lại khuôn sạch.`
+              );
+              try {
+                chrome.storage.local.remove("fbcGqlTemplate");
+              } catch (_) {}
+            } else {
+              // Làm mới fb_dtsg/lsd từ HTML trang hiện tại (regex giống
+              // crawl.js extractTokensFromHtml). DOM có sẵn dù tab nền.
+              let freshDtsg = stored.fb_dtsg;
+              let freshLsd = stored.lsd;
+              try {
+                const html = document.documentElement
+                  ? document.documentElement.outerHTML
+                  : "";
+                const dtsg =
+                  html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/) ||
+                  html.match(/name="fb_dtsg"\s+value="([^"]+)"/) ||
+                  html.match(/"dtsg":\{"token":"([^"]+)"/);
+                if (dtsg && dtsg[1]) freshDtsg = dtsg[1];
+                const lsd =
+                  html.match(/"LSD",\[\],\{"token":"([^"]+)"/) ||
+                  html.match(/"lsd":\{"token":"([^"]+)"/);
+                if (lsd && lsd[1]) freshLsd = lsd[1];
+              } catch (_) {}
 
-            // Ghi token tươi vào body thô (raw) để replay dùng token mới nhất.
-            let freshRaw = stored.raw;
-            try {
-              const p = new URLSearchParams(stored.raw || "");
-              if (freshDtsg) p.set("fb_dtsg", freshDtsg);
-              if (freshLsd) p.set("lsd", freshLsd);
-              freshRaw = p.toString();
-            } catch (_) {}
+              // Ghi token tươi vào body thô (raw) để replay dùng token mới nhất.
+              let freshRaw = stored.raw;
+              try {
+                const p = new URLSearchParams(stored.raw || "");
+                if (freshDtsg) p.set("fb_dtsg", freshDtsg);
+                if (freshLsd) p.set("lsd", freshLsd);
+                freshRaw = p.toString();
+              } catch (_) {}
 
-            apiSniff.template = {
-              url: stored.url,
-              raw: freshRaw,
-              friendly: stored.friendly,
-              fb_dtsg: freshDtsg,
-              doc_id: stored.doc_id,
-              lsd: freshLsd,
-              variables: stored.variables,
-            };
-            seededFromStorage = true;
-            dlog(
-              `[API] SEED khuôn từ storage (tab nền) | doc_id=${stored.doc_id}` +
-                ` dtsg=${freshDtsg ? "tươi" : "cũ"} lsd=${freshLsd ? "tươi" : "cũ"}`
-            );
+              apiSniff.template = {
+                url: stored.url,
+                raw: freshRaw,
+                friendly: stored.friendly,
+                fb_dtsg: freshDtsg,
+                doc_id: stored.doc_id,
+                lsd: freshLsd,
+                variables: stored.variables,
+              };
+              seededFromStorage = true;
+              dlog(
+                `[API] SEED khuôn từ storage (tab nền) | doc_id=${stored.doc_id}` +
+                  ` dtsg=${freshDtsg ? "tươi" : "cũ"} lsd=${freshLsd ? "tươi" : "cũ"}`
+              );
+            }
           }
         } catch (e) {}
       }
@@ -1584,10 +1628,6 @@
         return { ok: false, error: "no template" };
       }
 
-      const seenThisRun = new Set();
-      let newCount = 0;
-      let pages = 0;
-      let batch = [];
       // Bộ đếm cho DỪNG SỚM (cào TĂNG DẦN, đồng bộ ngữ nghĩa với DOM crawl).
       // Feed sắp xếp MỚI→CŨ nên khi gặp nhiều bài ĐÃ-BIẾT hoặc CŨ-hơn-mốc LIÊN
       // TIẾP nghĩa là đã chạm phần cào lần trước / ngoài khoảng ngày => dừng,
@@ -1809,8 +1849,24 @@
       return { ok: true, newCount, reason };
     } catch (err) {
       apiSniff.apiRunning = false;
-      send("CRAWL_DONE", { result: { newCount: 0, reason: "Lỗi API: " + String(err) } });
-      return { ok: false, error: String(err) };
+      // LƯU phần bài đã bóc tách nhưng chưa kịp gửi. Không làm việc này thì mỗi
+      // lỗi giữa chừng (mạng chớp, FB đổi hình dạng response) đều đánh mất trọn
+      // batch đang dở — người dùng thấy "+0 bài" dù đã cào được hàng chục.
+      if (batch.length > 0) {
+        const toSave = batch;
+        batch = [];
+        try {
+          await send("SAVE_POSTS", { posts: toSave });
+        } catch (e) {
+          // Lưu hụt ở đường xử lý lỗi thì đành chịu — cào lại lần sau.
+        }
+      }
+      // Báo ĐÚNG số bài đã lưu (trước đây luôn cứng 0) để UI và cơ chế chẩn đoán
+      // phân biệt được "lỗi mà chẳng cào được gì" với "lỗi ở cuối, đã có dữ liệu".
+      send("CRAWL_DONE", {
+        result: { newCount, reason: "Lỗi API: " + String(err) },
+      });
+      return { ok: false, error: String(err), newCount };
     }
   }
 

@@ -71,6 +71,64 @@ mà chưa có khuôn). Có khuôn rồi thì các lần/nhóm sau tự chuyển 
 trang FB, header sinh ra y như FB tự gọi. Chỉ TIER-3 (tabless) mới dựng lại
 header thủ công qua DNR — đó là lý do TIER-3 rủi ro hơn và không dùng mặc định.
 
+## Khuôn GQL là tài nguyên DÙNG CHUNG — đừng nới lỏng bộ lọc
+
+`isGroupFeedRequest` (src/gql-parse.js) quyết định gói GraphQL nào được coi là
+"feed nhóm". Gói nào lọt qua sẽ **ghi đè** `apiSniff.template` **và**
+`chrome.storage.local.fbcGqlTemplate` — khuôn dùng chung cho MỌI nhóm, MỌI lần
+crawl sau. Nhận nhầm một gói là hỏng khuôn trên diện rộng.
+
+Đây không phải rủi ro lý thuyết. Hook chạy ở `document_start` trên **mọi** tab
+`facebook.com/groups/*`, nên trong lúc tab crawl chạy mà người dùng lướt Facebook
+ở tab khác, mọi request FB tự bắn đều đi qua hook. Điều kiện lỏng ban đầu
+(`JSON.stringify(variables)` chứa `"group"` và `"feed"|"stories"`) khớp cả:
+
+| Truy vấn | Vì sao lọt | Hậu quả |
+|---|---|---|
+| `CometUFICommentsProviderQuery` | `feedback_source: "group_feed"` | replay trả về cây **bình luận** |
+| `CometSinglePostContentQuery` | có `groupID` + `feedLocation` | replay trả về **một bài** |
+
+Khuôn feed đang tốt bị ghi đè giữa chừng → trang kế replay bằng `doc_id` sai →
+`mapEdgeToPost` nhặt các node trong response đó thành bài `fp:` không permalink.
+Đúng triệu chứng **"lướt tab khác thì tab crawl cào về một đống bài rác"**.
+
+Bộ lọc hiện tại theo ba tầng, **thứ tự quan trọng**:
+
+1. **DENY theo friendly name trước** (`comment`, `ufi`, `singlepost`,
+   `permalink`, `discussionroot`, `reaction`, `reels`, `story`, `search`…).
+   Tầng này thắng mọi luật nhận bên dưới: truy vấn đã tự khai tên là comment thì
+   dù `variables` trông giống feed đến đâu cũng không được nhận. Lưu ý `story` có
+   ngoại lệ cho `stories` (số nhiều) vì feed thật tên là
+   `GroupsCometFeedRegularStoriesPaginationQuery`.
+2. **ACCEPT theo friendly name** (`groupsfeed`, `groupscometfeed`…) — đường tin
+   cậy nhất, FB đặt tên rất ổn định.
+3. **Chỉ khi KHÔNG có friendly name** mới xét `variables`, và xét theo **đúng
+   khoá** (`groupID`/`group_id`/`id` + `count`/`cursor`/`after`/`feedType`) chứ
+   **không quét chuỗi JSON**. Quét chuỗi chính là lỗ hổng cũ.
+
+Khuôn đã lưu còn được **thẩm định lại lúc đọc** ở cả hai đầu —
+`getStoredGqlTemplate` (src/crawl.js) và nhánh SEED trong `runApiCrawl`
+(src/content.js) — rồi **xoá nếu không đạt**. Lý do: bản sửa chỉ chặn ghi đè
+MỚI; máy nào đã dính khuôn hỏng từ trước sẽ mang nó vĩnh viễn. Thẩm định lúc đọc
+buộc bắt lại khuôn sạch một lần rồi mọi thứ trở lại bình thường.
+
+Regression test: `test/gql-feed-guard.test.js`.
+
+## Response feed còn chứa thứ KHÔNG phải bài viết
+
+`mapEdgeToPost` phải qua `looksLikePostNode` / `looksLikeGroupCard` trước khi bóc
+tách. FB nhét thẻ nhóm gợi ý, rail "Khám phá", ô mời tham gia vào giữa `edges`.
+Các node đó có `name` + `url` nên `looksLikeUser` khớp, và `extractTextFromNode`
+nhặt được chuỗi mô tả dài ("Có 3,4K người theo dõi · 40K thành viên · 10+ bài
+viết/ngày") — đủ để vượt cửa "có tác giả" rồi thành bài `fp:` rác.
+
+Bài THẬT luôn có ít nhất một trong: `__typename` Story, `creation_time`, khối
+`feedback`, hoặc `message.text`. Thẻ gợi ý không có cái nào.
+
+Điểm dễ sai khi sửa: node mang `__typename: "Group"` **không** đương nhiên là thẻ
+quảng bá — bài đăng *trong* nhóm cũng tham chiếu tới nhóm. Vì vậy
+`looksLikeGroupCard` chỉ loại khi node **đồng thời** không có dấu hiệu bài thật.
+
 ## Lưu ý crawl hàng loạt
 
 Dashboard vẫn ở foreground khi tab crawl chạy ngầm => `setTimeout` của hàng đợi

@@ -79,9 +79,56 @@ export function parseGqlRequestBody(bodyStr) {
   return out;
 }
 
-/** Có phải request feed của NHÓM không? (để chọn template replay phân trang). */
+/**
+ * Có phải request FEED CỦA NHÓM không? (để chọn template replay phân trang).
+ *
+ * PHẢI CHẶT: khuôn bắt được ở đây bị ghi đè lên `apiSniff.template` VÀ lưu vào
+ * `chrome.storage.local.fbcGqlTemplate` — khuôn dùng chung cho MỌI nhóm và mọi
+ * lần crawl sau. Nhận nhầm một gói KHÁC (bình luận, xem 1 bài, feed trang cá
+ * nhân) nghĩa là khuôn hỏng: replay sau đó trả về response không phải feed
+ * nhóm, và bộ bóc tách sẽ nhặt bừa các node trong đó thành "bài".
+ *
+ * Đây KHÔNG phải rủi ro lý thuyết. Hook GraphQL chạy trên MỌI tab facebook.com,
+ * nên trong lúc tab crawl đang chạy mà người dùng lướt Facebook ở tab khác, mọi
+ * request FB tự bắn đều đi qua đây. Điều kiện lỏng trước đây
+ * (`variables` chứa "group" VÀ ("feed" HOẶC "stories")) khớp cả:
+ *   - CometUFICommentsProviderQuery  (feedback_source: "group_feed")  -> gói BÌNH LUẬN
+ *   - CometSinglePostContentQuery    (groupID + feedLocation)         -> xem MỘT bài
+ * Khuôn feed đang tốt bị hai gói này ghi đè giữa chừng => trang kế replay bằng
+ * doc_id của truy vấn bình luận => trả về cây comment, và mapEdgeToPost biến các
+ * node trong đó thành bài "fp:" không có permalink. Đúng triệu chứng "lướt tab
+ * khác thì tab crawl cào về một đống bài rác".
+ */
 export function isGroupFeedRequest(friendly, variables) {
   const f = String(friendly || "").toLowerCase();
+
+  // (1) LOẠI TRỪ TRƯỚC theo friendly name — thắng mọi luật nhận bên dưới.
+  // Các họ truy vấn này chắc chắn KHÔNG phải feed phân trang của nhóm, dù
+  // variables của chúng có nhắc tới group/feed.
+  const DENY = [
+    "comment",      // CometUFIComments*, ...CommentsListQuery
+    "ufi",          // CometUFI* (khối like/comment dưới bài)
+    "singlepost",   // CometSinglePostContentQuery (mở 1 bài)
+    "permalink",    // ...PermalinkQuery
+    "discussionroot", // GroupsCometDiscussionRoot* (mở 1 bài trong nhóm)
+    "reaction",     // danh sách người thả cảm xúc
+    "reels",        // reels không phải feed bài
+    "story",        // *StoryQuery đơn lẻ (khác *StoriesPagination* của feed)
+    "composer",     // ô soạn bài
+    "member",       // danh sách thành viên
+    "search",       // tìm kiếm trong nhóm
+    "notification",
+    "messenger",
+    "mailbox",
+  ];
+  for (const bad of DENY) {
+    // "story" phải cho phép dạng số nhiều "stories" của feed thật
+    // (GroupsCometFeedRegularStoriesPaginationQuery).
+    if (bad === "story" && f.includes("stories")) continue;
+    if (f.includes(bad)) return false;
+  }
+
+  // (2) NHẬN theo friendly name — đường tin cậy nhất vì FB đặt tên rất ổn định.
   if (
     f.includes("groupsfeed") ||
     f.includes("group_feed") ||
@@ -90,8 +137,29 @@ export function isGroupFeedRequest(friendly, variables) {
   ) {
     return true;
   }
-  const s = JSON.stringify(variables || {}).toLowerCase();
-  return s.includes("group") && (s.includes("feed") || s.includes("stories"));
+
+  // (3) Chỉ khi KHÔNG có friendly name mới xét tới variables, và xét theo ĐÚNG
+  // KHOÁ chứ không phải quét chuỗi JSON. Quét chuỗi làm mọi gói có chữ
+  // "group_feed" nằm bất kỳ đâu (kể cả feedback_source của gói bình luận) đều
+  // khớp — chính là lỗ hổng cũ.
+  if (f) return false;
+  const v = variables && typeof variables === "object" ? variables : null;
+  if (!v) return false;
+  // Feed nhóm luôn định danh nhóm bằng một trong các khoá này.
+  const hasGroupId =
+    typeof v.groupID === "string" ||
+    typeof v.group_id === "string" ||
+    typeof v.id === "string";
+  if (!hasGroupId) return false;
+  // ...và mang dấu hiệu của FEED nhóm: hoặc là tham số phân trang (count/cursor/
+  // after), hoặc khai báo feedType tường minh. Gói bình luận / xem-một-bài không
+  // có cái nào ở cấp cao nhất — chúng chỉ nhắc tới group qua feedback_source,
+  // vốn KHÔNG còn được xét từ khi bỏ lối quét chuỗi JSON.
+  const hasFeedPaging =
+    v.count !== undefined || v.cursor !== undefined || v.after !== undefined;
+  const feedType = typeof v.feedType === "string" ? v.feedType.toLowerCase() : "";
+  const hasFeedType = feedType === "stories" || feedType === "chronological";
+  return hasFeedPaging || hasFeedType;
 }
 
 // ---- Tiện ích tìm-kiếm-sâu (deep search) --------------------------------
@@ -369,12 +437,81 @@ function extractTimestampFromNode(node) {
 }
 
 /**
+ * Node này có phải MỘT BÀI VIẾT (story) thật không?
+ *
+ * Một response feed nhóm KHÔNG chỉ chứa bài. FB nhét kèm thẻ nhóm gợi ý, rail
+ * "Khám phá", ô mời tham gia, banner sự kiện... Các node đó vẫn có `name` +
+ * `url` nên `looksLikeUser` khớp, và `extractTextFromNode` nhặt được chuỗi mô tả
+ * dài (kiểu "Có 3,4K người theo dõi · 40K thành viên"). Kết quả: chúng vượt qua
+ * điều kiện "có tác giả" rồi biến thành bài `fp:` không permalink — đúng thứ
+ * hiện lên Feed thành "Không rõ" + "thiếu link gốc nên chưa bình luận được".
+ *
+ * Bài THẬT luôn mang ít nhất một trong các dấu hiệu dưới đây. Thẻ gợi ý thì
+ * không có cái nào — chúng không có thời điểm đăng, không có khối feedback
+ * (like/comment), và __typename không phải Story.
+ */
+function looksLikePostNode(node) {
+  if (!node || typeof node !== "object") return false;
+
+  // (1) __typename Story ở bất kỳ đâu trong node => chắc chắn là bài.
+  const hasStoryType = deepFind(
+    node,
+    (v, k) => k === "__typename" && (v === "Story" || v === "GroupCometFeedStory")
+  );
+  if (hasStoryType) return true;
+
+  // (2) Có thời điểm đăng: thẻ gợi ý/quảng bá không mang creation_time.
+  if (extractTimestampFromNode(node) != null) return true;
+
+  // (3) Có khối feedback (like/comment) — chỉ bài viết mới có.
+  const hasFeedback = deepFind(
+    node,
+    (v, k) =>
+      (k === "feedback" || k === "comet_feedback_data") && v && typeof v === "object"
+  );
+  if (hasFeedback) return true;
+
+  // (4) Có message.text — khối nội dung do người dùng viết.
+  const hasMessage = deepFind(
+    node,
+    (v, k) => k === "message" && v && typeof v === "object" && typeof v.text === "string"
+  );
+  if (hasMessage) return true;
+
+  return false;
+}
+
+/**
+ * Node này là THẺ NHÓM / ô gợi ý trá hình? Bắt theo __typename để chặn sớm ngay
+ * cả khi FB có gắn kèm vài field giống bài.
+ */
+function looksLikeGroupCard(node) {
+  const t = deepFind(
+    node,
+    (v, k) =>
+      k === "__typename" &&
+      typeof v === "string" &&
+      /^(Group|GroupSuggestion|GroupsSuggestion|GroupCometMemberInvite)/.test(v)
+  );
+  if (!t) return false;
+  // Nếu ĐỒNG THỜI có dấu hiệu bài thật (story/feedback) thì đó là bài ĐƯỢC ĐĂNG
+  // TRONG nhóm chứ không phải thẻ quảng bá nhóm — không được loại.
+  return !looksLikePostNode(node);
+}
+
+/**
  * Map MỘT node (story) -> object bài chuẩn. Trả null nếu không đủ định danh.
  * ctx = { groupId, groupName, origin }
  */
 export function mapEdgeToPost(node, ctx) {
   if (!node || typeof node !== "object") return null;
   const groupId = ctx.groupId;
+
+  // CỬA CHẶN SỚM: loại các ô KHÔNG phải bài viết trước khi bóc tách. Xem
+  // looksLikePostNode / looksLikeGroupCard để biết vì sao cần cả hai.
+  if (looksLikeGroupCard(node)) return null;
+  if (!looksLikePostNode(node)) return null;
+
   const author = extractAuthorFromNode(node);
   const text = extractTextFromNode(node);
   const images = extractImagesFromNode(node);
