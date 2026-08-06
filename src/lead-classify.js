@@ -52,6 +52,10 @@ const BATCH_SIZE = 12;
 // nhiều request lên API cùng lúc.
 const AI_CONCURRENCY = 4;
 
+// Số bài gửi trong MỘT request bulk-update khi ghi nhãn. Đủ lớn để cắt gần hết
+// số round-trip, đủ nhỏ để tiến độ trên UI còn nhúc nhích và body không phình.
+const SAVE_CHUNK = 500;
+
 // Ngưỡng "chắc chắn" của RULE: nhãn thắng phải có điểm >= CONF_MIN và vượt nhãn
 // nhì tối thiểu CONF_MARGIN. Dưới ngưỡng -> coi là MƠ HỒ, nhường cho AI.
 const CONF_MIN = 1.5;
@@ -351,7 +355,16 @@ export async function runLeadClassification(deps = {}) {
   const getAllPosts = deps.getAllPosts || DB.getAllPosts;
   const aiCall = deps.aiCall || defaultAiCall;
   const leadVer = Number.isFinite(Number(deps.leadVer)) ? Number(deps.leadVer) : LEAD_VER;
-  const savePost = deps.savePost || defaultSavePost(apiFetch, leadVer);
+  // Ghi nhãn theo LÔ. deps.savePost vẫn được tôn trọng (test cũ tiêm hàm một-bài)
+  // — khi có nó, saveBatch gọi lần lượt như trước. Đường CHẠY THẬT không truyền
+  // savePost nên đi nhánh bulk: cả lô vào MỘT request.
+  const saveBatch = deps.savePost
+    ? async (items) => {
+        for (const it of items) {
+          await deps.savePost(it.post.postId, it.label, it.source);
+        }
+      }
+    : defaultSaveBatch(apiFetch, leadVer);
   // onProgress(info): best-effort, để UI hiện tiến độ THỰC (không phải spinner
   // đứng im). Các phase: "select" | "ai" | "save" | "done".
   const emit = (info) => {
@@ -406,33 +419,28 @@ export async function runLeadClassification(deps = {}) {
     }
   }
 
-  // 4) Lưu nhãn cho từng bài. Chạy SONG SONG qua hồ luồng (tối đa SAVE_CONCURRENCY
-  //    request cùng lúc) thay vì tuần tự 1 bài/lần — với ~1000 bài, lưu tuần tự
-  //    là nút thắt lớn. Mỗi lần lưu bọc try/catch: 1 bài lỗi không kéo sập cả mẻ.
+  // 4) Lưu nhãn cho cả mẻ. Gửi theo LÔ qua POST /api/posts/bulk-update: server
+  //    gom mỗi lô thành một câu UPDATE ... CASE, nên ~1000 bài chỉ còn vài
+  //    request thay vì ~1000. Trước đây chạy 4 luồng PATCH song song — vẫn là
+  //    một vòng HTTP đầy đủ cho MỖI bài và là nút thắt lớn nhất của luồng này.
   let ruleCount = 0;
   let aiCount = 0;
   let saved = 0;
   const totalSave = labeled.length;
-  let nextSave = 0;
-  const saveWorker = async () => {
-    while (nextSave < totalSave) {
-      const it = labeled[nextSave++];
-      try {
-        await savePost(it.post.postId, it.label, it.source);
-      } catch (_) {
-        /* best-effort: 1 bài lưu lỗi không dừng cả mẻ */
-      }
-      if (it.source === "rule") ruleCount++;
-      else aiCount++;
-      saved++;
-      // Nhịp báo mỗi ~20 bài để tránh spam broadcast nhưng vẫn thấy nhúc nhích.
-      if (saved % 20 === 0 || saved === totalSave) {
-        emit({ phase: "save", done: saved, total: totalSave });
-      }
+  for (const it of labeled) {
+    if (it.source === "rule") ruleCount++;
+    else aiCount++;
+  }
+  for (let i = 0; i < labeled.length; i += SAVE_CHUNK) {
+    const slice = labeled.slice(i, i + SAVE_CHUNK);
+    try {
+      await saveBatch(slice);
+    } catch (_) {
+      /* best-effort: một lô lưu lỗi không dừng cả mẻ (lần sau xử lại) */
     }
-  };
-  const savePool = Math.min(AI_CONCURRENCY, totalSave);
-  await Promise.all(Array.from({ length: savePool }, () => saveWorker()));
+    saved += slice.length;
+    emit({ phase: "save", done: saved, total: totalSave });
+  }
 
   // 5) VÒNG HỌC: đào cụm từ đặc trưng từ các bài vừa gán nhãn chắc chắn.
   const minedPosts = labeled
@@ -513,18 +521,31 @@ function candRow(c, label, source) {
 }
 
 /**
- * defaultSavePost(apiFetch, leadVer) — THIN CALL lưu nhãn lead vào bài qua
- * PATCH /api/posts/:id. Nuốt lỗi để không chặn luồng (bài sẽ được xử lại lần sau).
+ * defaultSaveBatch(apiFetch, leadVer) — ghi nhãn lead cho CẢ MỘT LÔ bài bằng
+ * MỘT request POST /api/posts/bulk-update.
+ *
+ * Trước đây mỗi bài là một PATCH /api/posts/:id riêng. Với ~1000 bài đó là
+ * ~1000 vòng HTTP (TLS + auth + query cho từng bài) và là phần chiếm gần hết
+ * thời gian của luồng phân loại. Server gom mỗi lô thành một câu
+ * UPDATE ... CASE nên chi phí gần như không đổi theo số bài trong lô.
+ *
+ * Lỗi được ném ra để caller quyết định (caller bọc try/catch theo lô, một lô
+ * hỏng không dừng cả mẻ — bài trong lô đó sẽ được xử lại ở lần chạy sau).
  */
-function defaultSavePost(apiFetch, leadVer) {
-  return async (postId, label, source) => {
-    try {
-      await apiFetch("/api/posts/" + encodeURIComponent(postId), {
-        method: "PATCH",
-        body: JSON.stringify({ leadLabel: label, leadSource: source, leadVer }),
-      });
-    } catch (_) {
-      /* best-effort */
-    }
+function defaultSaveBatch(apiFetch, leadVer) {
+  return async (items) => {
+    const updates = items.map((it) => ({
+      postId: it.post.postId,
+      leadLabel: it.label,
+      leadSource: it.source,
+      leadVer,
+    }));
+    if (updates.length === 0) return;
+    await apiFetch("/api/posts/bulk-update", {
+      method: "POST",
+      body: JSON.stringify({ updates }),
+      // Ghi đè cùng giá trị nên gửi lại an toàn khi mạng chập chờn.
+      idempotent: true,
+    });
   };
 }

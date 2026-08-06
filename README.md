@@ -32,6 +32,19 @@ Bộ công cụ cho người bán hàng / chủ shop nhỏ (chủ yếu mảng l
 - Tự chuyển nhóm về chế độ **"Bài viết mới"** (`?sorting_setting=CHRONOLOGICAL`) để cơ chế lấy-bài-mới chạy đúng.
 - Lưu đầy đủ mỗi bài: `postId`, `permalink`, tác giả, thời gian, nội dung (tự bấm "Xem thêm"), ảnh/video/link, reaction/comment, nhóm.
 
+### Hiệu năng đường ghi/đọc dữ liệu
+
+Các đường nóng của crawler đều đi theo lô, không phải từng bản ghi:
+
+| Việc | Cách làm |
+|---|---|
+| Lưu bài crawl được | `POST /api/posts` gộp cả lô vào một `INSERT` nhiều-dòng (không phải một query mỗi bài). |
+| Ghi nhãn lead / đánh dấu đã-parse | `POST /api/posts/bulk-update` — server gom mỗi lô thành một `UPDATE ... CASE`. Thay cho `PATCH /api/posts/:id` từng bài. |
+| Lưu giá trích được | `POST /api/group-prices` cũng dùng `INSERT` nhiều-dòng. |
+| Danh sách "bài đã biết" | `GET /api/posts/known-ids?limit=` chỉ trả cửa sổ ID gần nhất (client dùng 5000), phục vụ bằng covering index. |
+| Truyền tải | Response JSON đủ lớn được nén gzip (`server/web/compress.js`). |
+| Lỗi mạng tạm thời | `apiFetch` có timeout (30s, endpoint AI 180s) và tự thử lại với backoff cho lỗi 5xx/mất mạng trên request an toàn. |
+
 ### Lọc thông minh (không tốn token AI)
 - Chấm điểm ngay trên máy để phân loại bài: **cần mua** / **cần hỗ trợ** / **người bán** / **khác**.
 - Phân biệt người MUA với người BÁN bằng tín hiệu đối nghịch, tránh gom nhầm.

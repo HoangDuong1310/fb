@@ -42,6 +42,19 @@ const CRAWL_TABS_KEY = "crawlTabs";
 // kỳ (sweepOrphanCrawlTabs, chạy theo jobTick) cưỡng chế đóng tab treo quá hạn.
 const CRAWL_TAB_MAX_AGE_MS = 10 * 60 * 1000; // 10 phút: quá hạn => coi là tab rác
 
+// Số postId "đã biết" tải về trước mỗi lần crawl một nhóm.
+//
+// Crawl tăng tiến dừng ngay khi gặp `stopAfterKnown` (mặc định 8) bài đã-biết
+// LIÊN TIẾP trên feed sắp xếp mới→cũ, nên nó chỉ cần nhận diện được phần ĐẦU
+// feed. 5000 phủ dư sức cửa sổ đó kể cả với nhóm rất sôi động. Ngược lại, danh
+// sách KHÔNG giới hạn phình theo thời gian (kho bài chỉ tăng) và phải truyền lại
+// trước MỖI lần crawl MỖI nhóm — với vài chục nghìn ID thì riêng bước chuẩn bị
+// đã tốn vài giây trước khi cào được bài đầu tiên.
+//
+// An toàn khi bài cũ hơn cửa sổ lọt lại: nó được upsert đè theo khoá
+// (post_id, user) chứ không sinh bản trùng — chỉ tốn một lượt ghi thừa.
+const KNOWN_IDS_LIMIT = 5000;
+
 // Đọc RAW entries của registry. TƯƠNG THÍCH NGƯỢC: định dạng cũ là mảng số id;
 // định dạng mới là mảng { id, ts }. Chuẩn hoá hết về { id, ts } để xử lý đồng nhất.
 async function getCrawlTabEntries() {
@@ -735,7 +748,12 @@ async function crawlGroupApiTabless(groupId, options) {
       if (tok.lsd) lsd = tok.lsd;
     } catch (e) {}
 
-    const known = new Set(await DB.getKnownIds(groupId));
+    // Chỉ tải cửa sổ ID gần nhất thay vì toàn bộ kho bài của nhóm: crawl tăng
+    // tiến dừng ngay khi gặp opts.stopAfterKnown (mặc định 8) bài đã-biết LIÊN
+    // TIẾP, nên nó chỉ cần nhận ra phần đầu feed. Vài nghìn ID phủ dư sức cửa sổ
+    // đó, trong khi danh sách đầy đủ tăng không giới hạn theo thời gian và phải
+    // truyền lại trước MỖI lần crawl MỖI nhóm.
+    const known = new Set(await DB.getKnownIds(groupId, KNOWN_IDS_LIMIT));
     apiReport({ status: "started", newCount: 0, pages: 0 });
 
     const seenThisRun = new Set();

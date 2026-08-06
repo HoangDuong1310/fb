@@ -698,12 +698,25 @@ export async function runGroupPriceExtraction(deps = {}) {
     await markParsed(processedIds);
   }
 
-  // 7) Học từ khóa bán mới do AI phát hiện.
-  for (const kw of newKeywordSet) {
-    await apiFetch("/api/keywords", {
-      method: "POST",
-      body: JSON.stringify({ keyword: kw, type: "sell", addedBy: "ai", enabled: true }),
-    });
+  // 7) Học từ khóa bán mới do AI phát hiện. Chạy song song có giới hạn: số
+  //    keyword mới mỗi mẻ thường nhỏ nhưng gửi tuần tự vẫn cộng dồn độ trễ vô
+  //    ích ở cuối luồng, sau khi mọi việc thật đã xong.
+  const newKeywords = [...newKeywordSet];
+  if (newKeywords.length > 0) {
+    const CONCURRENCY = 6;
+    let next = 0;
+    const worker = async () => {
+      while (next < newKeywords.length) {
+        const kw = newKeywords[next++];
+        await apiFetch("/api/keywords", {
+          method: "POST",
+          body: JSON.stringify({ keyword: kw, type: "sell", addedBy: "ai", enabled: true }),
+        });
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, newKeywords.length) }, () => worker())
+    );
   }
 
   return {
@@ -716,27 +729,29 @@ export async function runGroupPriceExtraction(deps = {}) {
 }
 
 /**
- * defaultMarkParsed(apiFetch) — THIN CALL đánh dấu parsedAt.
+ * defaultMarkParsed(apiFetch) — đánh dấu parsedAt cho CẢ MẺ bài bằng
+ * POST /api/posts/bulk-update (một request cho mỗi lô 500 bài).
  *
- * GHI CHÚ THIẾT KẾ: db.js hiện KHÔNG xuất helper cập nhật parsedAt, và backend
- * `POST /api/group-prices` đã tự set `parsed_at = NOW()` trên hàng group_prices
- * khi insert. Việc đánh dấu parsedAt trên CHÍNH bản ghi `posts` (để tầng 2 bỏ
- * qua lần sau) cần một endpoint cập nhật posts chưa có trong contract Task 5.
- * Vì task này KHÔNG được sửa web/routes.js, để lại một thin call best-effort:
- * thử PATCH /api/posts/:id { parsedAt } nếu backend hỗ trợ; nuốt lỗi để không
- * chặn luồng. Test tiêm markParsed riêng nên không phụ thuộc endpoint này.
+ * Trước đây gọi PATCH /api/posts/:id lần lượt cho từng bài; một mẻ trích giá
+ * vài trăm bài nghĩa là vài trăm vòng HTTP nối tiếp, chạy sau khi công việc
+ * thật đã xong. Nuốt lỗi như cũ để không chặn luồng trích giá chính — bài chưa
+ * đánh dấu được sẽ được xử lại ở lần sau (insert giá vốn idempotent).
  */
 function defaultMarkParsed(apiFetch) {
+  const CHUNK = 500;
   return async (postIds) => {
-    for (const id of postIds) {
+    const ids = (postIds || []).filter(Boolean);
+    const parsedAt = new Date().toISOString();
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const updates = ids.slice(i, i + CHUNK).map((postId) => ({ postId, parsedAt }));
       try {
-        await apiFetch("/api/posts/" + encodeURIComponent(id), {
-          method: "PATCH",
-          body: JSON.stringify({ parsedAt: new Date().toISOString() }),
+        await apiFetch("/api/posts/bulk-update", {
+          method: "POST",
+          body: JSON.stringify({ updates }),
+          idempotent: true,
         });
       } catch (e) {
-        // Best-effort: bài vẫn có thể được tái xử lý lần sau nếu endpoint thiếu.
-        // Không chặn luồng trích giá chính.
+        // Best-effort: bài vẫn có thể được tái xử lý lần sau.
       }
     }
   };

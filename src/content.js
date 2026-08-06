@@ -23,6 +23,16 @@
     stopRequested: false,
   };
 
+  // Số postId "đã biết" tải về trước mỗi lần crawl một nhóm. GIỮ ĐỒNG BỘ với
+  // KNOWN_IDS_LIMIT trong crawl.js (content script là IIFE riêng, không import
+  // được module của service worker nên phải khai báo lại).
+  //
+  // Crawl tăng tiến dừng khi gặp vài bài đã-biết LIÊN TIẾP trên feed mới→cũ, nên
+  // nó chỉ cần nhận diện phần ĐẦU feed. Danh sách không giới hạn thì phình theo
+  // thời gian và phải truyền lại trước MỖI lần crawl MỖI nhóm. Bài cũ hơn cửa sổ
+  // mà lọt lại sẽ được upsert đè chứ không sinh bản trùng.
+  const KNOWN_IDS_LIMIT = 5000;
+
   // ---- Tiện ích ----------------------------------------------------------
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -935,8 +945,13 @@
 
     const groupInfo = getGroupInfo();
 
-    // Lấy tập ID đã biết để lọc bài mới.
-    const knownRes = await send("GET_KNOWN_IDS", { groupId: groupInfo.groupId });
+    // Lấy tập ID đã biết để lọc bài mới. Chỉ tải cửa sổ ID gần nhất
+    // (KNOWN_IDS_LIMIT) thay vì toàn bộ kho bài: crawl tăng tiến dừng sau vài
+    // bài đã-biết liên tiếp nên chỉ cần nhận ra phần đầu feed.
+    const knownRes = await send("GET_KNOWN_IDS", {
+      groupId: groupInfo.groupId,
+      limit: KNOWN_IDS_LIMIT,
+    });
     const known = new Set((knownRes && knownRes.ok && knownRes.ids) || []);
 
     // Nạp bộ selector AI một lần cho cả phiên (nếu đã khám phá trước đó).
@@ -1421,7 +1436,10 @@
       const mod = await loadGqlModule();
 
       // Lấy ID đã biết để lọc trùng (giống DOM crawl => lưu cùng pipeline).
-      const knownRes = await send("GET_KNOWN_IDS", { groupId: groupInfo.groupId });
+      const knownRes = await send("GET_KNOWN_IDS", {
+        groupId: groupInfo.groupId,
+        limit: KNOWN_IDS_LIMIT,
+      });
       const known = new Set((knownRes && knownRes.ok && knownRes.ids) || []);
 
       apiReport({ status: "started", newCount: 0, pages: 0 });

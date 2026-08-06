@@ -68,17 +68,61 @@ async function savePosts(posts) {
   const body = await apiFetch("/api/posts", {
     method: "POST",
     body: JSON.stringify({ posts }),
+    // Upsert theo (postId, user) nên gửi lại y hệt là vô hại — cho phép lớp
+    // client tự thử lại khi mạng chập chờn thay vì mất trắng cả lô bài vừa
+    // crawl được. Đây là đường ghi nóng nhất của crawler.
+    idempotent: true,
   });
   return { added: body?.added || 0, updated: body?.updated || 0 };
+}
+
+/**
+ * Cập nhật hàng loạt các trường vận hành của bài (leadLabel/leadSource/leadVer/
+ * leadAt/parsedAt) trong MỘT request.
+ *
+ * VÌ SAO CÓ HÀM NÀY: phân loại lead và trích giá group đều kết thúc bằng việc
+ * ghi vài field nhỏ lên hàng trăm–hàng nghìn bài. Làm bằng PATCH từng bài thì
+ * mỗi bài là một vòng HTTP đầy đủ; với ~1000 bài đó là ~1000 request và là lý do
+ * chính khiến hai luồng này chạy rất lâu. Server gom cả mẻ vào vài câu UPDATE.
+ *
+ * @param {Array<{postId: string} & Record<string, any>>} updates
+ * @returns {Promise<number>} số bài đã cập nhật.
+ */
+async function bulkUpdatePosts(updates) {
+  const list = Array.isArray(updates) ? updates.filter((u) => u && u.postId) : [];
+  if (list.length === 0) return 0;
+  // Chia lô ở client để một mẻ rất lớn không dựng nên request nhiều MB (server
+  // giới hạn body 25MB) và để tiến độ nhích đều thay vì đứng im tới lúc xong.
+  const CHUNK = 500;
+  let updated = 0;
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const body = await apiFetch("/api/posts/bulk-update", {
+      method: "POST",
+      body: JSON.stringify({ updates: list.slice(i, i + CHUNK) }),
+      // Ghi đè cùng giá trị nên gửi lại an toàn.
+      idempotent: true,
+    });
+    updated += body?.updated || 0;
+  }
+  return updated;
 }
 
 /**
  * Lấy danh sách postId đã lưu (toàn bộ hoặc theo nhóm) dưới dạng MẢNG string.
  * Dùng làm danh sách "đã thấy" để content script bỏ qua bài cũ (caller bọc
  * thành Set). GIỮ shape: trả về mảng.
+ *
+ * `limit` (tuỳ chọn) giới hạn ở N bài crawl gần nhất. Kho bài lớn dần theo thời
+ * gian, trong khi danh sách này được tải lại TRƯỚC MỖI lần crawl mỗi nhóm — với
+ * hàng chục nghìn ID thì riêng bước chuẩn bị đã tốn vài giây. Feed Facebook sắp
+ * xếp mới→cũ nên crawl tăng tiến chỉ thực sự cần phần ID gần đây; bài cũ hơn cửa
+ * sổ mà lọt lại sẽ được upsert đè chứ không sinh bản trùng.
  */
-async function getKnownIds(groupId) {
-  const body = await apiFetch("/api/posts/known-ids" + qs({ groupId }));
+async function getKnownIds(groupId, limit) {
+  const body = await apiFetch(
+    "/api/posts/known-ids" +
+      qs({ groupId, limit: Number(limit) > 0 ? Math.floor(Number(limit)) : undefined })
+  );
   return Array.isArray(body?.ids) ? body.ids : [];
 }
 
@@ -888,16 +932,34 @@ async function deleteAdvisory(postId) {
 
 /**
  * Xóa toàn bộ nháp tư vấn (hoặc theo status). Server không có endpoint xóa
- * hàng loạt nên ta liệt kê rồi xóa từng cái. Trả về số bản ghi đã xóa.
+ * hàng loạt nên ta liệt kê rồi xóa từng cái, nhưng chạy SONG SONG theo hồ luồng
+ * thay vì tuần tự: xoá 500 nháp nối tiếp là 500 vòng HTTP xếp hàng, đủ để service
+ * worker MV3 bị coi là treo. Trả về số bản ghi đã xóa THÀNH CÔNG.
  */
 async function clearAdvisories(status) {
   const list = await getAdvisories(status);
+  const ids = (list || []).map((a) => a && a.postId).filter(Boolean);
+  if (ids.length === 0) return 0;
+
+  // 6 request cùng lúc: đủ để rút ngắn đáng kể mà không dội quá nhiều kết nối
+  // lên backend (pool MySQL phía server chỉ có 10 connection).
+  const CONCURRENCY = 6;
+  let next = 0;
   let deleted = 0;
-  for (const a of list) {
-    if (!a || !a.postId) continue;
-    await deleteAdvisory(a.postId);
-    deleted += 1;
-  }
+  const worker = async () => {
+    while (next < ids.length) {
+      const id = ids[next++];
+      try {
+        await deleteAdvisory(id);
+        deleted += 1;
+      } catch (e) {
+        // Một nháp xoá lỗi không được kéo sập cả mẻ; lần dọn sau sẽ gặp lại nó.
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, ids.length) }, () => worker())
+  );
   return deleted;
 }
 
@@ -964,12 +1026,24 @@ async function getConversations(status) {
 }
 
 /**
- * Lấy một hội thoại theo id. Server không có endpoint lấy đơn lẻ nên ta liệt
- * kê rồi tìm theo id. Trả về bản ghi hoặc null.
+ * Lấy một hội thoại theo id qua GET /api/conversations/:id. Trả về bản ghi hoặc
+ * null (kể cả khi server trả 404).
+ *
+ * Trước đây hàm này GET cả danh sách rồi tự tìm theo id — nghĩa là mỗi lần đọc
+ * một hội thoại lại tải về toàn bộ hội thoại của tài khoản kèm post_text/draft
+ * của từng dòng. Luồng theo dõi reply gọi nó cho từng hội thoại nên chi phí tăng
+ * theo bình phương số hội thoại.
  */
 async function getConversation(id) {
-  const list = await getConversations();
-  return list.find((c) => c && c.id == id) || null; // eslint-disable-line eqeqeq
+  if (id == null || id === "") return null;
+  try {
+    const body = await apiFetch("/api/conversations/" + encodeURIComponent(id));
+    return body?.conversation || null;
+  } catch (e) {
+    // 404 -> không tồn tại: giữ hợp đồng cũ (trả null thay vì ném).
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
 }
 
 /**
@@ -1012,6 +1086,7 @@ async function deleteConversation(id) {
 export {
   // posts
   savePosts,
+  bulkUpdatePosts,
   getKnownIds,
   getAllPosts,
   getPostComments,

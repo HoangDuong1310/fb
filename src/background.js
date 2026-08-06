@@ -166,7 +166,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   switch (msg.type) {
     case "GET_KNOWN_IDS": {
-      DB.getKnownIds(msg.groupId)
+      // limit: content script truyền KNOWN_IDS_LIMIT để chỉ tải cửa sổ ID gần
+      // nhất thay vì toàn bộ kho bài của nhóm (xem chú thích ở db.js#getKnownIds).
+      DB.getKnownIds(msg.groupId, msg.limit)
         .then((ids) => sendResponse({ ok: true, ids }))
         .catch((err) => sendResponse({ ok: false, error: String(err) }));
       return true;
