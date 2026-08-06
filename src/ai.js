@@ -347,6 +347,9 @@ export function mergeSpinHttpChunks(content, count, chunkResults, chunkSizes) {
   let anyPartial = false;
   /** @type {string[]} */
   const notes = [];
+  /** Lý do thật do server trả về (hết key, sai model, provider chết...). Trước đây
+   *  bị nuốt mất nên người dùng chỉ thấy "không gọi được AI" mà không biết vì sao. */
+  const errors = [];
 
   const sizes = Array.isArray(chunkSizes) && chunkSizes.length
     ? chunkSizes
@@ -356,6 +359,9 @@ export function mergeSpinHttpChunks(content, count, chunkResults, chunkSizes) {
     const size = sizes[i];
     const result = chunkResults && chunkResults[i];
     if (result && result.ok && Array.isArray(result.variants) && result.variants.length) {
+      // Server trả về ít biến thể hơn số yêu cầu => phần thiếu bị đệm bằng bản gốc.
+      // Phải tính là partial để UI cảnh báo, tuyệt đối không im lặng nhân bản.
+      if (result.variants.length < size) anyPartial = true;
       for (let j = 0; j < size; j += 1) {
         variants.push(String(result.variants[j] || base).trim() || base);
       }
@@ -374,6 +380,7 @@ export function mergeSpinHttpChunks(content, count, chunkResults, chunkSizes) {
       if (result.note) notes.push(String(result.note));
     } else {
       failedChunks += 1;
+      if (result && result.error) errors.push(String(result.error).trim());
       for (let j = 0; j < size; j += 1) variants.push(base);
     }
   }
@@ -389,16 +396,24 @@ export function mergeSpinHttpChunks(content, count, chunkResults, chunkSizes) {
         ? "ai"
         : "original";
 
+  const reason = errors.find(Boolean) || "";
+
   return {
     ok: true,
     variants: variants.slice(0, safeCount),
     source,
+    // Giữ nguyên ok:true để preview vẫn hiện ra cho người dùng sửa tay; UI dựa vào
+    // `source` để hiện toast lỗi thay vì báo thành công giả.
+    error: reason || undefined,
     note:
       source === "fallback"
-        ? "Không thể gọi AI — trả về bản gốc."
+        ? `${reason ? `Không xào được nội dung: ${reason} ` : "Không gọi được AI nên "}` +
+          `cả ${safeCount} bài đang là bản gốc GIỐNG HỆT NHAU — đăng như vậy sẽ bị Facebook ` +
+          `gắn cờ trùng nội dung. Hãy sửa tay từng bài hoặc kiểm tra lại cấu hình AI trước khi đăng.`
         : source === "partial-ai"
-          ? notes[0] ||
-            "Một phần nội dung chưa xào nấu được bằng AI và đang dùng bản gốc."
+          ? reason ||
+            notes.find(Boolean) ||
+            "Một phần bài chưa xào được bằng AI và đang dùng lại bản gốc — sửa tay các bài bị trùng trước khi đăng."
           : undefined,
   };
 }

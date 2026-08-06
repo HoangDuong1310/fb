@@ -230,6 +230,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const p = msg.payload || {};
         const content = String(p.content || "").trim();
         const count = Math.max(1, Math.min(50, Number(p.count) || 1));
+        const tone = p.tone ? String(p.tone) : "";
         if (!content) {
           sendResponse({ ok: false, error: "No content provided." });
           return;
@@ -249,7 +250,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               method: "POST",
               body: JSON.stringify({
                 text: content,
-                options: { content, count: size },
+                options: { content, count: size, tone },
               }),
             });
             chunkResults.push(result);

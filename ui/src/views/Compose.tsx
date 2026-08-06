@@ -421,21 +421,33 @@ export function Compose() {
 
     if (spin && targets.length > 1) {
       setAiBusy(true);
+      // tone phải đi kèm: trước đây spin không nhận tone nên bài xào ra lệch giọng
+      // so với bài AI tự viết ở cùng màn hình này.
       const res = await bg<AiVariantsResponse>("AI_SPIN_CONTENT", {
-        payload: { content: text, count: targets.length },
+        payload: { content: text, count: targets.length, tone },
       });
       setAiBusy(false);
       if (res && res.ok && Array.isArray(res.variants) && res.variants.length) {
         variants = res.variants;
+        // "fallback"/"partial-ai" = có bài vẫn là bản gốc y hệt nhau → đăng lên là
+        // trùng nội dung. Đây là LỖI cần sửa tay, không phải cảnh báo nhẹ.
         if (res.source === "fallback" || res.source === "partial-ai") {
           note = {
-            kind: "warn",
-            text: res.note || "Một phần nội dung chưa xào nấu được bằng AI và đang dùng bản gốc.",
+            kind: "err",
+            text:
+              (res.note ||
+                "Một phần nội dung chưa xào nấu được bằng AI và đang dùng nguyên văn bản gốc.") +
+              " Sửa tay các bài trùng hoặc bấm Xem trước lại trước khi tạo hàng đợi.",
           };
         }
       } else {
         variants = targets.map(() => text);
-        note = { kind: "err", text: res?.error || "AI lỗi, dùng nội dung gốc cho mọi mục tiêu." };
+        note = {
+          kind: "err",
+          text:
+            (res?.error || "AI lỗi nên chưa xào được nội dung.") +
+            " Mọi mục tiêu đang dùng chung bài gốc — đăng nguyên trạng sẽ bị Facebook gắn cờ trùng nội dung.",
+        };
       }
     } else {
       variants = targets.map(() => text);
